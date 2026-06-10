@@ -45,19 +45,23 @@ payload, zero-padded to 4 KiB
 
 Raft carries **metadata only** — agent identity records and the mapping from
 cache keys to block ids. Raw tensors never enter the Raft log. The state
-machine (agents + bindings) is implemented with snapshot-based compaction;
-the current deployment is a single-voter cluster with a local-only network
-factory, and the multi-node gRPC transport replaces that factory without
-touching storage or the state machine. A lightweight witness process will
-provide the third vote so a two-box cluster keeps strict quorum without
-split brain.
+machine (agents + bindings) is implemented with snapshot-based compaction.
+The Raft log and vote are durable (JSON-lines log + atomic meta file,
+fsynced before the append callback, torn tails dropped on replay) and the
+state machine recovers from the log on restart. Inter-node RPCs travel as
+JSON over HTTP (`/raft/append|vote|snapshot`); membership is dynamic
+(init -> add-learner -> promote). A lightweight witness process gives a
+two-box cluster its third vote without split brain.
 
 ### Management plane (React dashboard + memory API)
 
 `kalpakdb serve` exposes the memory API (axum): block put/get, agent
-registration, prefix bind/lookup (longest-prefix probing of a key chain),
-`/v1/stats`, and a 1 Hz `/v1/ws` stats stream. The React dashboard in
-`dashboard/` renders both planes live over that WebSocket.
+registration, prefix bind/lookup (longest-prefix probing of a key chain,
+with speculative warm-tier prefetch of the hit's blocks), cluster
+management (`/v1/cluster/*`), `/v1/stats`, and a 1 Hz `/v1/ws` stats
+stream. `kalpak-client` is the Rust SDK. The React dashboard in
+`dashboard/` is optional tooling rendering both planes live over the
+WebSocket — the database core is engine + protocol + SDK.
 
 ## Key types (`kalpak-core`)
 
@@ -78,12 +82,13 @@ registration, prefix bind/lookup (longest-prefix probing of a key chain),
    store, write-through LRU) ✅, then: `io_uring` backend, cross-node
    tiering, importance-aware placement (IMPRESS-style).
 2. **Consensus** — `openraft` state machine for agent metadata and cache-key
-   bindings ✅ (single-voter); then: multi-node transport, durable Raft log,
-   partition/failure simulation.
-3. **Memory API & speculative retrieval** — HTTP/WS endpoints for
-   offload/retrieve ✅; then: gRPC, the background prefetcher streaming
-   predicted KV blocks from the storage node into the compute node's RAM
-   (cf. SpeCache, CXL-SpecKV's lookahead predictor).
+   bindings ✅, durable Raft log ✅, multi-node HTTP transport with dynamic
+   membership ✅ (3-node integration test); then: partition/failure
+   simulation, witness node, leader forwarding for writes on followers.
+3. **Memory API & speculative retrieval** — HTTP/WS endpoints ✅, Rust
+   client SDK ✅, lookup-triggered warm-tier prefetch ✅; then: gRPC,
+   cross-node block streaming, model-based lookahead prediction
+   (cf. SpeCache, CXL-SpecKV).
 4. **Dashboard** — React + WebSocket live metrics ✅; then: per-agent
    lineage views.
 

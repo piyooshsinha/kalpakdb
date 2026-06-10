@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/kalpak-core",
     "crates/kalpak-storage",
+    "crates/kalpak-client",
     "crates/kalpak-control",
     "crates/kalpakdb",
 ]

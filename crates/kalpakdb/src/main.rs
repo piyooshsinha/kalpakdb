@@ -1,11 +1,11 @@
 //! Kalpak node CLI.
 //!
-//!   kalpakdb serve <data-dir> [--addr 127.0.0.1:7411] [--warm-mb 256]
+//!   kalpakdb serve <data-dir> [--addr 127.0.0.1:7411] [--warm-mb 256] [--node-id 1] [--join]
 //!   kalpakdb put <data-dir>            reads payload from stdin, prints id
 //!   kalpakdb get <data-dir> <block-id> writes payload to stdout
 //!   kalpakdb stat <data-dir>           prints store statistics
 
-mod server;
+use kalpakdb::server;
 
 use std::io::{Read, Write};
 use std::process::ExitCode;
@@ -27,21 +27,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [cmd, dir, rest @ ..] if cmd == "serve" => {
-            let mut addr = "127.0.0.1:7411".to_string();
-            let mut warm_mb: u64 = 256;
+            let mut opts = server::ServeOpts {
+                data_dir: dir.clone(),
+                addr: "127.0.0.1:7411".to_string(),
+                warm_bytes: 256 * 1024 * 1024,
+                node_id: 1,
+                bootstrap: true,
+            };
             let mut it = rest.iter();
             while let Some(flag) = it.next() {
                 match flag.as_str() {
-                    "--addr" => addr = it.next().ok_or("--addr needs a value")?.clone(),
-                    "--warm-mb" => warm_mb = it.next().ok_or("--warm-mb needs a value")?.parse()?,
+                    "--addr" => opts.addr = it.next().ok_or("--addr needs a value")?.clone(),
+                    "--warm-mb" => {
+                        let mb: u64 = it.next().ok_or("--warm-mb needs a value")?.parse()?;
+                        opts.warm_bytes = mb * 1024 * 1024;
+                    }
+                    "--node-id" => {
+                        opts.node_id = it.next().ok_or("--node-id needs a value")?.parse()?
+                    }
+                    "--join" => opts.bootstrap = false,
                     other => return Err(format!("unknown flag: {other}").into()),
                 }
             }
-            tokio::runtime::Runtime::new()?.block_on(server::serve(
-                dir.clone(),
-                addr,
-                warm_mb * 1024 * 1024,
-            ))
+            tokio::runtime::Runtime::new()?.block_on(server::serve(opts))
         }
         [cmd, dir] if cmd == "put" => {
             let store = BlockStore::open(dir)?;
@@ -88,7 +96,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => {
             eprintln!(
-                "usage:\n  kalpakdb serve <data-dir> [--addr 127.0.0.1:7411] [--warm-mb 256]\n  kalpakdb put <data-dir>            (payload on stdin)\n  kalpakdb get <data-dir> <block-id>\n  kalpakdb stat <data-dir>"
+                "usage:\n  kalpakdb serve <data-dir> [--addr 127.0.0.1:7411] [--warm-mb 256] [--node-id 1] [--join]\n  kalpakdb put <data-dir>            (payload on stdin)\n  kalpakdb get <data-dir> <block-id>\n  kalpakdb stat <data-dir>"
             );
             Err("invalid arguments".into())
         }

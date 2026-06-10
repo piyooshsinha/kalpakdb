@@ -4,27 +4,35 @@
 //! `openraft`. Strictly metadata: tensors and blobs stay on the data plane
 //! and are referenced here by content address only.
 //!
-//! [`ControlPlane::start_single_node`] boots a one-voter cluster for the
-//! embedded/dev deployment; the multi-node transport (gRPC) replaces
-//! [`network::LocalOnlyNetwork`] without touching storage or the state
-//! machine.
+//! Topology is dynamic: boot a node with [`ControlPlane::start_node`],
+//! initialize a cluster on the first one, then grow it with
+//! [`ControlPlane::add_learner`] + [`ControlPlane::change_membership`].
+//! Inter-node RPCs travel as JSON over HTTP ([`network::HttpNetworkFactory`]);
+//! the node's API server wires `/raft/*` to the [`ControlPlane::handle_*`]
+//! methods. The Raft log and vote are durable when a data directory is given.
 
 mod log_store;
 mod network;
 mod state_machine;
 mod types;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::sync::Arc;
 
 use kalpak_core::{AgentId, BlockId, CacheKey};
+use openraft::error::{InstallSnapshotError, RaftError};
+use openraft::raft::{
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    VoteRequest, VoteResponse,
+};
 use openraft::{BasicNode, Config, Raft};
 
 pub use state_machine::{AgentRecord, BindingRecord, MetadataState};
 pub use types::{NodeId, Request, Response, TypeConfig};
 
 use log_store::LogStore;
-use network::LocalOnlyNetwork;
+use network::HttpNetworkFactory;
 use state_machine::{binding_key, StateMachineStore};
 
 #[derive(Debug, thiserror::Error)]
@@ -33,6 +41,8 @@ pub enum ControlError {
     Init(String),
     #[error("raft write: {0}")]
     Write(String),
+    #[error("raft membership: {0}")]
+    Membership(String),
 }
 
 pub struct ControlPlane {
@@ -41,8 +51,13 @@ pub struct ControlPlane {
 }
 
 impl ControlPlane {
-    /// Boot a single-voter cluster and wait for it to elect itself.
-    pub async fn start_single_node(node_id: NodeId) -> Result<Self, ControlError> {
+    /// Boot a Raft node. With `data_dir`, the log and vote are durable and
+    /// replayed on restart. The node joins no cluster by itself — call
+    /// [`Self::init_cluster`] on the first node, then grow membership.
+    pub async fn start_node(
+        node_id: NodeId,
+        data_dir: Option<&Path>,
+    ) -> Result<Self, ControlError> {
         let config = Config {
             heartbeat_interval: 250,
             election_timeout_min: 500,
@@ -55,20 +70,65 @@ impl ControlPlane {
                 .map_err(|e| ControlError::Init(e.to_string()))?,
         );
 
-        let log_store = LogStore::default();
+        let log_store = match data_dir {
+            Some(dir) => LogStore::open(dir.join("control"))
+                .map_err(|e| ControlError::Init(e.to_string()))?,
+            None => LogStore::in_memory(),
+        };
         let sm = StateMachineStore::default();
 
-        let raft = Raft::new(node_id, config, LocalOnlyNetwork, log_store, sm.clone())
-            .await
-            .map_err(|e| ControlError::Init(e.to_string()))?;
-
-        let mut members = BTreeMap::new();
-        members.insert(node_id, BasicNode::new("local"));
-        raft.initialize(members)
-            .await
-            .map_err(|e| ControlError::Init(e.to_string()))?;
+        let raft = Raft::new(
+            node_id,
+            config,
+            HttpNetworkFactory::default(),
+            log_store,
+            sm.clone(),
+        )
+        .await
+        .map_err(|e| ControlError::Init(e.to_string()))?;
 
         Ok(Self { raft, sm })
+    }
+
+    /// Single-voter cluster for embedded/dev use: start and self-elect.
+    pub async fn start_single_node(node_id: NodeId) -> Result<Self, ControlError> {
+        let cp = Self::start_node(node_id, None).await?;
+        cp.init_cluster(BTreeMap::from([(node_id, "local".to_string())]))
+            .await?;
+        Ok(cp)
+    }
+
+    /// Form a new cluster from this node with the given `id -> addr` voters.
+    pub async fn init_cluster(
+        &self,
+        members: BTreeMap<NodeId, String>,
+    ) -> Result<(), ControlError> {
+        let members: BTreeMap<NodeId, BasicNode> = members
+            .into_iter()
+            .map(|(id, addr)| (id, BasicNode::new(addr)))
+            .collect();
+        self.raft
+            .initialize(members)
+            .await
+            .map_err(|e| ControlError::Init(e.to_string()))
+    }
+
+    /// Add a node as a learner (it starts receiving the log immediately).
+    pub async fn add_learner(&self, id: NodeId, addr: String) -> Result<(), ControlError> {
+        self.raft
+            .add_learner(id, BasicNode::new(addr), true)
+            .await
+            .map(|_| ())
+            .map_err(|e| ControlError::Membership(e.to_string()))
+    }
+
+    /// Promote the given set to voters (must already be members/learners).
+    pub async fn change_membership(&self, voters: BTreeSet<NodeId>) -> Result<(), ControlError> {
+        self.raft
+            .change_membership(voters, false)
+            .await
+            .map(|_| ())
+            .map_err(|e| ControlError::Membership(e.to_string()))
     }
 
     pub async fn register_agent(
@@ -139,6 +199,40 @@ impl ControlPlane {
             .snapshot()
             .await
             .map_err(|e| ControlError::Write(e.to_string()))
+    }
+
+    // ---- Raft RPC handlers, exposed by the node's API server ----
+    //
+    // JSON-level so the API server never depends on openraft types; the
+    // serialized `Result<_, RaftError>` is exactly what HttpNetwork expects.
+
+    pub async fn handle_append_entries(
+        &self,
+        req: serde_json::Value,
+    ) -> Result<serde_json::Value, serde_json::Error> {
+        let req: AppendEntriesRequest<TypeConfig> = serde_json::from_value(req)?;
+        let res: Result<AppendEntriesResponse<NodeId>, RaftError<NodeId>> =
+            self.raft.append_entries(req).await;
+        serde_json::to_value(res)
+    }
+
+    pub async fn handle_vote(
+        &self,
+        req: serde_json::Value,
+    ) -> Result<serde_json::Value, serde_json::Error> {
+        let req: VoteRequest<NodeId> = serde_json::from_value(req)?;
+        let res: Result<VoteResponse<NodeId>, RaftError<NodeId>> = self.raft.vote(req).await;
+        serde_json::to_value(res)
+    }
+
+    pub async fn handle_install_snapshot(
+        &self,
+        req: serde_json::Value,
+    ) -> Result<serde_json::Value, serde_json::Error> {
+        let req: InstallSnapshotRequest<TypeConfig> = serde_json::from_value(req)?;
+        let res: Result<InstallSnapshotResponse<NodeId>, RaftError<NodeId, InstallSnapshotError>> =
+            self.raft.install_snapshot(req).await;
+        serde_json::to_value(res)
     }
 }
 
@@ -212,5 +306,37 @@ mod tests {
         let m = cp.metrics();
         assert_eq!(m.id, 42);
         assert_eq!(m.current_leader, Some(42));
+    }
+
+    #[tokio::test]
+    async fn durable_node_restarts_with_its_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = agent(4);
+        let k = key(&[5, 6]);
+        {
+            let cp = ControlPlane::start_node(1, Some(dir.path())).await.unwrap();
+            cp.init_cluster(BTreeMap::from([(1, "local".to_string())]))
+                .await
+                .unwrap();
+            cp.register_agent(a, "survivor").await.unwrap();
+            cp.bind_prefix(a, k.clone(), vec![kalpak_core::BlockId::of(b"kv")])
+                .await
+                .unwrap();
+        }
+        // Restart from the same directory: log replays, no re-init needed
+        // (membership is in the log), state machine catches up.
+        let cp = ControlPlane::start_node(1, Some(dir.path())).await.unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if cp.agent(&a).is_some() && cp.lookup(&k).is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "state machine did not recover from the durable log"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(cp.agent(&a).unwrap().display_name, "survivor");
     }
 }

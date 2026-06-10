@@ -27,30 +27,57 @@ pub struct AppState {
 
 type Shared = Arc<AppState>;
 
-pub async fn serve(
-    data_dir: String,
-    addr: String,
-    warm_bytes: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let store = TieredStore::open(&data_dir, warm_bytes)?;
-    let control = ControlPlane::start_single_node(1).await?;
+pub struct ServeOpts {
+    pub data_dir: String,
+    pub addr: String,
+    pub warm_bytes: u64,
+    pub node_id: u64,
+    /// Form a single-voter cluster on boot. Disable when this node will be
+    /// joined to an existing cluster via `/v1/cluster/*`.
+    pub bootstrap: bool,
+}
+
+pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
+    let store = TieredStore::open(&opts.data_dir, opts.warm_bytes)?;
+    let control =
+        ControlPlane::start_node(opts.node_id, Some(std::path::Path::new(&opts.data_dir))).await?;
+    if opts.bootstrap {
+        let members = std::collections::BTreeMap::from([(opts.node_id, opts.addr.clone())]);
+        // Re-initialization of an already-formed cluster fails benignly on
+        // restart: membership is already in the durable log.
+        if let Err(e) = control.init_cluster(members).await {
+            eprintln!("kalpakdb: cluster already initialized ({e})");
+        }
+    }
     let state = Arc::new(AppState { store, control });
 
-    let app = Router::new()
+    let app = router(state);
+    let listener = tokio::net::TcpListener::bind(&opts.addr).await?;
+    eprintln!(
+        "kalpakdb node {} listening on http://{} (data dir: {})",
+        opts.node_id, opts.addr, opts.data_dir
+    );
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+pub fn router(state: Shared) -> Router {
+    Router::new()
         .route("/v1/blocks", post(put_block))
         .route("/v1/blocks/{id}", get(get_block))
         .route("/v1/agents", post(register_agent))
         .route("/v1/manifest/bind", post(bind_prefix))
         .route("/v1/manifest/lookup", post(lookup_prefix))
+        .route("/v1/cluster/init", post(cluster_init))
+        .route("/v1/cluster/add-learner", post(cluster_add_learner))
+        .route("/v1/cluster/promote", post(cluster_promote))
         .route("/v1/stats", get(stats))
         .route("/v1/ws", get(ws_stats))
+        .route("/raft/append", post(raft_append))
+        .route("/raft/vote", post(raft_vote))
+        .route("/raft/snapshot", post(raft_snapshot))
         .layer(CorsLayer::permissive())
-        .with_state(state);
-
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    eprintln!("kalpakdb listening on http://{addr} (data dir: {data_dir})");
-    axum::serve(listener, app).await?;
-    Ok(())
+        .with_state(state)
 }
 
 struct ApiError(StatusCode, String);
@@ -154,15 +181,105 @@ async fn lookup_prefix(State(s): State<Shared>, Json(req): Json<LookupReq>) -> J
         }
     }
     match best {
-        Some((i, blocks)) => Json(LookupResp {
-            hit_depth: Some(i),
-            blocks: blocks.iter().map(|b| b.to_string()).collect(),
-        }),
+        Some((i, blocks)) => {
+            // Speculative retrieval: the client will fetch these blocks
+            // next, so promote them into the warm tier now, overlapping
+            // disk I/O with the client's round trip.
+            let warm = s.clone();
+            let prefetch = blocks.clone();
+            tokio::task::spawn_blocking(move || {
+                for id in &prefetch {
+                    let _ = warm.store.get(id);
+                }
+            });
+            Json(LookupResp {
+                hit_depth: Some(i),
+                blocks: blocks.iter().map(|b| b.to_string()).collect(),
+            })
+        }
         None => Json(LookupResp {
             hit_depth: None,
             blocks: vec![],
         }),
     }
+}
+
+// ---- Cluster management ----
+
+#[derive(Deserialize)]
+struct ClusterInitReq {
+    /// node id -> advertise address ("host:port") of every initial voter.
+    members: std::collections::BTreeMap<u64, String>,
+}
+
+async fn cluster_init(
+    State(s): State<Shared>,
+    Json(req): Json<ClusterInitReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    s.control.init_cluster(req.members).await?;
+    Ok(Json(json!({ "initialized": true })))
+}
+
+#[derive(Deserialize)]
+struct AddLearnerReq {
+    node_id: u64,
+    addr: String,
+}
+
+async fn cluster_add_learner(
+    State(s): State<Shared>,
+    Json(req): Json<AddLearnerReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    s.control.add_learner(req.node_id, req.addr).await?;
+    Ok(Json(json!({ "learner": req.node_id })))
+}
+
+#[derive(Deserialize)]
+struct PromoteReq {
+    voters: std::collections::BTreeSet<u64>,
+}
+
+async fn cluster_promote(
+    State(s): State<Shared>,
+    Json(req): Json<PromoteReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    s.control.change_membership(req.voters.clone()).await?;
+    Ok(Json(json!({ "voters": req.voters })))
+}
+
+// ---- Raft RPC passthrough (node-to-node) ----
+
+async fn raft_append(
+    State(s): State<Shared>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    s.control
+        .handle_append_entries(req)
+        .await
+        .map(Json)
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))
+}
+
+async fn raft_vote(
+    State(s): State<Shared>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    s.control
+        .handle_vote(req)
+        .await
+        .map(Json)
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))
+}
+
+async fn raft_snapshot(
+    State(s): State<Shared>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    s.control
+        .handle_install_snapshot(req)
+        .await
+        .map(Json)
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))
 }
 
 fn stats_payload(s: &AppState) -> serde_json::Value {

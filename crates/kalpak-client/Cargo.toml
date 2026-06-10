@@ -1,0 +1,21 @@
+[package]
+name = "kalpak-client"
+description = "Rust client SDK for KalpakDB: agent state, KV-cache blocks, prefix manifests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+kalpak-core.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+kalpakdb = { path = "../kalpakdb" }
+tokio = { version = "1", features = ["full"] }
+tempfile.workspace = true
+ed25519-dalek.workspace = true
