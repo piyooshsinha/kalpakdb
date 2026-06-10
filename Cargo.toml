@@ -10,7 +10,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/kalpakdb/kalpakdb"
+repository = "https://github.com/piyooshsinha/kalpakdb"
 rust-version = "1.96"
 
 [workspace.dependencies]
