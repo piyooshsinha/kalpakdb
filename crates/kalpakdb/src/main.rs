@@ -1,8 +1,8 @@
 //! Kalpak node CLI. For now: a local block-store smoke tool.
 //!
-//!   kalpakd put <data-dir>            reads payload from stdin, prints id
-//!   kalpakd get <data-dir> <block-id> writes payload to stdout
-//!   kalpakd stat <data-dir>           prints store statistics
+//!   kalpakdb put <data-dir>            reads payload from stdin, prints id
+//!   kalpakdb get <data-dir> <block-id> writes payload to stdout
+//!   kalpakdb stat <data-dir>           prints store statistics
 
 use std::io::{Read, Write};
 use std::process::ExitCode;
@@ -14,7 +14,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("kalpakd: {e}");
+            eprintln!("kalpakdb: {e}");
             ExitCode::FAILURE
         }
     }
@@ -49,7 +49,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => {
             eprintln!(
-                "usage:\n  kalpakd put <data-dir>            (payload on stdin)\n  kalpakd get <data-dir> <block-id>\n  kalpakd stat <data-dir>"
+                "usage:\n  kalpakdb put <data-dir>            (payload on stdin)\n  kalpakdb get <data-dir> <block-id>\n  kalpakdb stat <data-dir>"
             );
             Err("invalid arguments".into())
         }

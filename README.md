@@ -19,7 +19,7 @@ Early development. Working today:
 
 - `kalpak-core` — block identity, chained prefix cache keys, Ed25519 agent identity
 - `kalpak-storage` — append-only, content-addressed local block store with crash recovery (self-verifying records, torn-write truncation, index rebuild on open) and a pluggable I/O backend (portable positioned I/O now; Linux `io_uring`/`O_DIRECT` planned behind the `uring` feature)
-- `kalpakd` — minimal CLI: `put` / `get` / `stat` against a local store
+- `kalpakdb` — minimal CLI: `put` / `get` / `stat` against a local store
 
 Planned next: Raft control plane (`openraft`), the agent memory API (gRPC), speculative prefix prefetching, and the React observability dashboard. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -29,9 +29,9 @@ Planned next: Raft control plane (`openraft`), the agent memory API (gRPC), spec
 cargo test --workspace
 cargo build --release
 
-echo -n "the agent remembers" | ./target/release/kalpakd put /tmp/kalpak-data
-./target/release/kalpakd get /tmp/kalpak-data <block-id>
-./target/release/kalpakd stat /tmp/kalpak-data
+echo -n "the agent remembers" | ./target/release/kalpakdb put /tmp/kalpak-data
+./target/release/kalpakdb get /tmp/kalpak-data <block-id>
+./target/release/kalpakdb stat /tmp/kalpak-data
 ```
 
 ## License

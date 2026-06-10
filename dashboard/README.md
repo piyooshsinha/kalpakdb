@@ -9,5 +9,5 @@ Planned responsibilities:
 - Agent data lineage and memory-state inspection
 - Cluster health and tier-occupancy views
 
-Scaffolding (Vite + React + TypeScript) will land once `kalpakd` exposes its
+Scaffolding (Vite + React + TypeScript) will land once `kalpakdb` exposes its
 first metrics endpoint; a dashboard with nothing to observe is just a mockup.

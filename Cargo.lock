@@ -333,7 +333,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "kalpakd"
+name = "kalpakdb"
 version = "0.1.0"
 dependencies = [
  "kalpak-core",

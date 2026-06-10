@@ -1,5 +1,5 @@
 [package]
-name = "kalpakd"
+name = "kalpakdb"
 description = "Kalpak node daemon and CLI"
 version.workspace = true
 edition.workspace = true
