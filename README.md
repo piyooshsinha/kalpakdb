@@ -18,7 +18,7 @@ Kalpak is one substrate for agent state, built so the seams disappear.
 Early development. Working today:
 
 - `kalpak-core` — block identity, chained prefix cache keys, Ed25519 agent identity
-- `kalpak-storage` — append-only, content-addressed local block store with crash recovery (self-verifying records, torn-write truncation, index rebuild on open) and a pluggable I/O backend (portable positioned I/O now; Linux `io_uring`/`O_DIRECT` planned behind the `uring` feature)
+- `kalpak-storage` — append-only, content-addressed local block store with crash recovery (self-verifying records, torn-write truncation, index rebuild on open) and a pluggable I/O backend (portable positioned I/O now; Linux `io_uring`/`O_DIRECT` planned behind the `uring` feature), plus the durable prefix manifest (`CacheKey → block list`, longest-prefix probing for cache hits)
 - `kalpakdb` — minimal CLI: `put` / `get` / `stat` against a local store
 
 Planned next: Raft control plane (`openraft`), the agent memory API (gRPC), speculative prefix prefetching, and the React observability dashboard. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).

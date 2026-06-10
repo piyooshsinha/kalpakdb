@@ -11,9 +11,11 @@
 //! behind the `uring` feature without touching the engine.
 
 pub mod io;
+mod manifest;
 mod segment;
 mod store;
 
+pub use manifest::PrefixManifest;
 pub use store::{BlockStore, StoreStats};
 
 /// All records are aligned to this boundary so direct-I/O backends can read

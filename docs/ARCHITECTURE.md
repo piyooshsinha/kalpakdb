@@ -67,8 +67,8 @@ per-agent lineage. Lives in `dashboard/`.
 
 ## Phased roadmap
 
-1. **Storage engine (now)** — local block store ✅, then: prefix-chain
-   manifest (CacheKey → block list), `io_uring` backend, tier abstraction
+1. **Storage engine (now)** — local block store ✅, prefix-chain manifest
+   (CacheKey → block list) ✅, then: `io_uring` backend, tier abstraction
    (RAM warm buffer / SSD cold store), importance-aware placement
    (IMPRESS-style).
 2. **Consensus** — embed `openraft`; custom state machine for agent metadata
