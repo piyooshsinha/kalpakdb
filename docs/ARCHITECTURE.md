@@ -83,12 +83,13 @@ WebSocket — the database core is engine + protocol + SDK.
    tiering, importance-aware placement (IMPRESS-style).
 2. **Consensus** — `openraft` state machine for agent metadata and cache-key
    bindings ✅, durable Raft log ✅, multi-node HTTP transport with dynamic
-   membership ✅ (3-node integration test); then: partition/failure
-   simulation, witness node, leader forwarding for writes on followers.
+   membership ✅, leader forwarding (write to any node) ✅, leader-failover
+   survival ✅ (kill-the-leader integration test); then: witness node,
+   network-partition simulation.
 3. **Memory API & speculative retrieval** — HTTP/WS endpoints ✅, Rust
-   client SDK ✅, lookup-triggered warm-tier prefetch ✅; then: gRPC,
-   cross-node block streaming, model-based lookahead prediction
-   (cf. SpeCache, CXL-SpecKV).
+   client SDK ✅, lookup-triggered warm-tier prefetch ✅, cross-node block
+   fetch with replicate-on-read ✅; then: gRPC, proactive block placement,
+   model-based lookahead prediction (cf. SpeCache, CXL-SpecKV).
 4. **Dashboard** — React + WebSocket live metrics ✅; then: per-agent
    lineage views.
 

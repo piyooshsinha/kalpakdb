@@ -43,6 +43,9 @@ pub enum ControlError {
     Write(String),
     #[error("raft membership: {0}")]
     Membership(String),
+    /// This node is a follower; the caller should retry against the leader.
+    #[error("not the leader; leader is {leader_addr:?}")]
+    NotLeader { leader_addr: Option<String> },
 }
 
 pub struct ControlPlane {
@@ -160,8 +163,25 @@ impl ControlPlane {
             .raft
             .client_write(req)
             .await
-            .map_err(|e| ControlError::Write(e.to_string()))?;
+            .map_err(|e| match e.forward_to_leader() {
+                Some(fwd) => ControlError::NotLeader {
+                    leader_addr: fwd.leader_node.as_ref().map(|n| n.addr.clone()),
+                },
+                None => ControlError::Write(e.to_string()),
+            })?;
         Ok(resp.data)
+    }
+
+    /// Addresses of all current cluster members except this node.
+    pub fn peer_addrs(&self) -> Vec<String> {
+        let metrics = self.metrics();
+        let self_id = metrics.id;
+        metrics
+            .membership_config
+            .nodes()
+            .filter(|(id, _)| **id != self_id)
+            .map(|(_, node)| node.addr.clone())
+            .collect()
     }
 
     /// Look up a binding from the applied state machine.

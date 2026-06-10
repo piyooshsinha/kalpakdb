@@ -23,6 +23,8 @@ use tower_http::cors::CorsLayer;
 pub struct AppState {
     pub store: TieredStore,
     pub control: ControlPlane,
+    /// Client for node-to-node calls (leader forwarding, peer block fetch).
+    pub http: reqwest::Client,
 }
 
 type Shared = Arc<AppState>;
@@ -49,7 +51,11 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("kalpakdb: cluster already initialized ({e})");
         }
     }
-    let state = Arc::new(AppState { store, control });
+    let state = Arc::new(AppState {
+        store,
+        control,
+        http: reqwest::Client::new(),
+    });
 
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(&opts.addr).await?;
@@ -101,7 +107,53 @@ impl From<kalpak_core::Error> for ApiError {
 
 impl From<kalpak_control::ControlError> for ApiError {
     fn from(e: kalpak_control::ControlError) -> Self {
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        let code = match &e {
+            kalpak_control::ControlError::NotLeader { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        ApiError(code, e.to_string())
+    }
+}
+
+/// Marks node-to-node requests so they never cascade (a peer asked to help
+/// must answer from local state only).
+const INTERNAL_HEADER: &str = "x-kalpak-internal";
+
+/// If a write failed because this node is a follower, transparently retry it
+/// against the leader and relay the leader's response.
+async fn forward_to_leader(
+    s: &AppState,
+    err: kalpak_control::ControlError,
+    path: &str,
+    body: serde_json::Value,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let kalpak_control::ControlError::NotLeader {
+        leader_addr: Some(addr),
+    } = &err
+    else {
+        return Err(err.into());
+    };
+    let resp = s
+        .http
+        .post(format!("http://{addr}{path}"))
+        .header(INTERNAL_HEADER, "1")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("leader forward: {e}")))?;
+    let status = resp.status();
+    let value: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("leader response: {e}")))?;
+    if status.is_success() {
+        Ok(Json(value))
+    } else {
+        let msg = value["error"].as_str().unwrap_or("forwarded write failed");
+        Err(ApiError(
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            msg.to_string(),
+        ))
     }
 }
 
@@ -113,9 +165,44 @@ async fn put_block(
     Ok(Json(json!({ "id": id.to_string(), "bytes": body.len() })))
 }
 
-async fn get_block(State(s): State<Shared>, Path(id): Path<String>) -> Result<Vec<u8>, ApiError> {
+async fn get_block(
+    State(s): State<Shared>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<Vec<u8>, ApiError> {
     let id: BlockId = id.parse()?;
-    Ok(s.store.get(&id)?.as_ref().clone())
+    match s.store.get(&id) {
+        Ok(payload) => Ok(payload.as_ref().clone()),
+        Err(kalpak_core::Error::BlockNotFound(_)) if !headers.contains_key(INTERNAL_HEADER) => {
+            // Data plane is not (yet) proactively replicated: fetch the block
+            // from a peer, keep a local copy (replicate-on-read), and serve.
+            for peer in s.control.peer_addrs() {
+                let Ok(resp) = s
+                    .http
+                    .get(format!("http://{peer}/v1/blocks/{id}"))
+                    .header(INTERNAL_HEADER, "1")
+                    .send()
+                    .await
+                else {
+                    continue;
+                };
+                if !resp.status().is_success() {
+                    continue;
+                }
+                let Ok(bytes) = resp.bytes().await else {
+                    continue;
+                };
+                // Content addressing makes peer data self-verifying.
+                if BlockId::of(&bytes) != id {
+                    continue;
+                }
+                s.store.put(&bytes)?;
+                return Ok(bytes.to_vec());
+            }
+            Err(kalpak_core::Error::BlockNotFound(id).into())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -128,10 +215,13 @@ async fn register_agent(
     State(s): State<Shared>,
     Json(req): Json<RegisterAgentReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    s.control
-        .register_agent(req.agent, req.display_name)
-        .await?;
-    Ok(Json(json!({ "registered": req.agent.to_string() })))
+    match s.control.register_agent(req.agent, &req.display_name).await {
+        Ok(()) => Ok(Json(json!({ "registered": req.agent.to_string() }))),
+        Err(e) => {
+            let body = json!({ "agent": req.agent, "display_name": req.display_name });
+            forward_to_leader(&s, e, "/v1/agents", body).await
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -143,20 +233,33 @@ struct BindReq {
 
 async fn bind_prefix(
     State(s): State<Shared>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<BindReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    for b in &req.blocks {
-        if !s.store.contains(b) {
-            return Err(ApiError(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!("block {b} is not stored; upload blocks before binding"),
-            ));
+    // Validate block existence on the node the client talked to; a
+    // leader-forwarded bind skips this (the leader may not hold the blocks —
+    // the data plane is per-node until proactive replication lands).
+    if !headers.contains_key(INTERNAL_HEADER) {
+        for b in &req.blocks {
+            if !s.store.contains(b) {
+                return Err(ApiError(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("block {b} is not stored; upload blocks before binding"),
+                ));
+            }
         }
     }
-    s.control
-        .bind_prefix(req.agent, req.key, req.blocks)
-        .await?;
-    Ok(Json(json!({ "bound": true })))
+    match s
+        .control
+        .bind_prefix(req.agent, req.key.clone(), req.blocks.clone())
+        .await
+    {
+        Ok(()) => Ok(Json(json!({ "bound": true }))),
+        Err(e) => {
+            let body = json!({ "agent": req.agent, "key": req.key, "blocks": req.blocks });
+            forward_to_leader(&s, e, "/v1/manifest/bind", body).await
+        }
+    }
 }
 
 /// Probe a root-first chain of cache keys; returns the deepest bound prefix.

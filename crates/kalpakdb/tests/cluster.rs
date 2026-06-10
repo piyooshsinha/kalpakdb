@@ -97,11 +97,12 @@ async fn three_node_cluster_replicates_metadata() {
     )
     .await;
 
-    // Write metadata through the leader.
+    // Write metadata through a FOLLOWER: the node forwards to the leader
+    // transparently, so clients can talk to any node.
     let agent = "07".repeat(32);
     post(
         &client,
-        format!("http://{n1}/v1/agents"),
+        format!("http://{n2}/v1/agents"),
         json!({ "agent": agent, "display_name": "distributed-researcher" }),
     )
     .await;
@@ -173,4 +174,27 @@ async fn three_node_cluster_replicates_metadata() {
     .await;
     assert_eq!(lookup["hit_depth"].as_u64(), Some(0));
     assert_eq!(lookup["blocks"].as_array().unwrap().len(), 1);
+
+    // The block was uploaded to node 1 only; node 3 fetches it from a peer
+    // (replicate-on-read) and serves it.
+    let body = client
+        .get(format!("http://{n3}/v1/blocks/{block_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(body.status().is_success(), "peer block fetch failed");
+    assert_eq!(body.bytes().await.unwrap(), "kv-tensor-replicated");
+
+    // And now node 3 holds its own copy: an internal (non-cascading)
+    // request succeeds locally.
+    let local = client
+        .get(format!("http://{n3}/v1/blocks/{block_id}"))
+        .header("x-kalpak-internal", "1")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        local.status().is_success(),
+        "replicate-on-read did not stick"
+    );
 }
