@@ -101,7 +101,8 @@ impl<B: IoBackend> BlockStore<B> {
 
         if segs.tail + record.len() as u64 > SEGMENT_ROLL_BYTES && segs.tail > 0 {
             let seg_id = segs.files.len() as u32;
-            segs.files.push(self.backend.open(&segment_path(&self.dir, seg_id))?);
+            segs.files
+                .push(self.backend.open(&segment_path(&self.dir, seg_id))?);
             segs.tail = 0;
         }
 

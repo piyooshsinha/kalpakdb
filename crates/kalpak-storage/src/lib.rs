@@ -14,9 +14,11 @@ pub mod io;
 mod manifest;
 mod segment;
 mod store;
+mod tiered;
 
 pub use manifest::PrefixManifest;
 pub use store::{BlockStore, StoreStats};
+pub use tiered::{TierStats, TieredStore};
 
 /// All records are aligned to this boundary so direct-I/O backends can read
 /// them without bounce buffers.

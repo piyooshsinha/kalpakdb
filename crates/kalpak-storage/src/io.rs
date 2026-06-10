@@ -70,7 +70,11 @@ impl SegmentFile for File {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
         let mut done = 0;
         while done < buf.len() {
-            let n = std::os::windows::fs::FileExt::seek_read(self, &mut buf[done..], offset + done as u64)?;
+            let n = std::os::windows::fs::FileExt::seek_read(
+                self,
+                &mut buf[done..],
+                offset + done as u64,
+            )?;
             if n == 0 {
                 return Err(std::io::ErrorKind::UnexpectedEof.into());
             }
@@ -83,7 +87,11 @@ impl SegmentFile for File {
     fn write_at(&self, buf: &[u8], offset: u64) -> Result<()> {
         let mut done = 0;
         while done < buf.len() {
-            let n = std::os::windows::fs::FileExt::seek_write(self, &buf[done..], offset + done as u64)?;
+            let n = std::os::windows::fs::FileExt::seek_write(
+                self,
+                &buf[done..],
+                offset + done as u64,
+            )?;
             done += n;
         }
         Ok(())
