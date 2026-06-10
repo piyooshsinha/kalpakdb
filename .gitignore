@@ -1,0 +1,5 @@
+/target
+**/*.rs.bk
+dashboard/node_modules
+dashboard/dist
+.DS_Store

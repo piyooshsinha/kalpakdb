@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kalpak-core",
+    "crates/kalpak-storage",
+    "crates/kalpakd",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/kalpakdb/kalpak"
+rust-version = "1.96"
+
+[workspace.dependencies]
+kalpak-core = { path = "crates/kalpak-core" }
+kalpak-storage = { path = "crates/kalpak-storage" }
+blake3 = "1.5"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+hex = "0.4"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

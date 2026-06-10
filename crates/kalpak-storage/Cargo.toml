@@ -1,0 +1,23 @@
+[package]
+name = "kalpak-storage"
+description = "Kalpak local storage engine: append-only, content-addressed block segments"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+kalpak-core.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+# Linux-only io_uring backend (Phase 1.5). The default backend uses portable
+# positioned I/O so the engine runs on macOS dev machines too.
+uring = []

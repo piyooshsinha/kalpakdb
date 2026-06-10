@@ -1,0 +1,18 @@
+[package]
+name = "kalpak-core"
+description = "Core types for Kalpak: content-addressed block identifiers, agent identity, and cache keys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+blake3.workspace = true
+ed25519-dalek.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
