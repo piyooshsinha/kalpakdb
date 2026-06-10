@@ -8,5 +8,11 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+axum = { version = "0.8.9", features = ["ws"] }
+kalpak-control = { version = "0.1.0", path = "../kalpak-control" }
 kalpak-core.workspace = true
-kalpak-storage.workspace = true
+kalpak-storage = { version = "0.1.0", path = "../kalpak-storage" }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "1.52.3", features = ["full"] }
+tower-http = { version = "0.6.11", features = ["cors"] }

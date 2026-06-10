@@ -21,9 +21,11 @@ Early development. Working today:
 
 - `kalpak-core` — block identity, chained prefix cache keys, Ed25519 agent identity
 - `kalpak-storage` — append-only, content-addressed local block store with crash recovery (self-verifying records, torn-write truncation, index rebuild on open) and a pluggable I/O backend (portable positioned I/O now; Linux `io_uring`/`O_DIRECT` planned behind the `uring` feature), plus the durable prefix manifest (`CacheKey → block list`, longest-prefix probing for cache hits) and a two-tier store (byte-budgeted LRU warm buffer in RAM over the durable cold store, write-through, hit/miss accounting)
-- `kalpakdb` — minimal CLI: `put` / `get` / `stat` against a local store
+- `kalpak-control` — the Raft control plane (`openraft`): a replicated metadata state machine for agent registrations and prefix bindings, with snapshot-based log compaction. Strictly metadata — tensors never enter the Raft log
+- `kalpakdb` — the node binary: an HTTP + WebSocket memory API (`serve`) over both planes, plus local CLI tools (`put` / `get` / `stat` / `key`)
+- `dashboard/` — React control dashboard: live data-plane and Raft metrics over WebSocket
 
-Planned next: Raft control plane (`openraft`), the agent memory API (gRPC), speculative prefix prefetching, and the React observability dashboard. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Planned next: multi-node Raft transport, speculative prefix prefetching, the Linux `io_uring` backend. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Quick start
 
@@ -31,9 +33,24 @@ Planned next: Raft control plane (`openraft`), the agent memory API (gRPC), spec
 cargo test --workspace
 cargo build --release
 
-echo -n "the agent remembers" | ./target/release/kalpakdb put /tmp/kalpak-data
-./target/release/kalpakdb get /tmp/kalpak-data <block-id>
-./target/release/kalpakdb stat /tmp/kalpak-data
+# run a node
+./target/release/kalpakdb serve /tmp/kalpak-data --addr 127.0.0.1:7411 --warm-mb 256
+
+# store a KV block
+curl -X POST --data-binary @block.bin http://127.0.0.1:7411/v1/blocks
+# register an agent (Ed25519 public key, hex)
+curl -X POST -H 'content-type: application/json' \
+  -d '{"agent":"<pubkey-hex>","display_name":"researcher"}' http://127.0.0.1:7411/v1/agents
+# compute chained prefix keys for a token stream, chunked as you like
+./target/release/kalpakdb key meta-llama/Llama-3.1-8B tok-hash fp16/paged-16 1,2,3 4,5
+# bind a prefix to its blocks, then probe a chain for the longest cached prefix
+curl -X POST -H 'content-type: application/json' -d '{"agent":"…","key":…,"blocks":["…"]}' \
+  http://127.0.0.1:7411/v1/manifest/bind
+curl -X POST -H 'content-type: application/json' -d '{"chain":[…,…]}' \
+  http://127.0.0.1:7411/v1/manifest/lookup
+
+# dashboard (proxies /v1 to the node)
+cd dashboard && npm install && npm run dev
 ```
 
 ## License
