@@ -8,6 +8,14 @@ The industry currently duct-tapes traditional databases together to handle AI me
 
 KalpakDB is one substrate for agent state, built so the seams disappear.
 
+## Why "Kalpak"?
+
+The name draws on Sanskrit roots that describe exactly what this database is for:
+
+- **Kalpa (कल्प)** — an aeon in Hindu cosmology, a vast unit of cosmic time. Agent memory should endure across sessions, restarts, and infrastructure churn — state that persists on the scale of aeons, not requests.
+- **Kalpaka (कल्पक)** — derived from *kalpa*, meaning "conforming to a settled rule or standard." A distributed database is precisely that: every node applying the same ordered log to reach the same state. Consensus is the settled rule.
+- **Kalpavriksha (कल्पवृक्ष)** — the wish-fulfilling tree of Indian tradition, which grants what is asked of it. Ask Kalpak for a prefix, and it returns the longest cached one it holds — ideally before you finish asking (speculative prefetch).
+
 ## Core ideas
 
 - **Everything is an immutable, content-addressed block.** A block's identity is the BLAKE3 hash of its bytes. Deduplication, integrity verification, and cache coherence fall out of the design instead of being features.
