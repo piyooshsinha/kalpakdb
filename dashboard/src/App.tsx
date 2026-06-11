@@ -36,7 +36,7 @@ type AgentRow = {
   bindings: number;
 };
 
-type Binding = { key: unknown; blocks: string[] };
+type Binding = { key: unknown; blocks: string[]; extends?: string | null };
 
 function fmtBytes(n: number): string {
   if (n >= 1 << 30) return (n / (1 << 30)).toFixed(1) + " GiB";
@@ -159,6 +159,9 @@ function Agents() {
                   ? `prefix ${String((b.key as { prefix_hash?: string }).prefix_hash ?? "").slice(0, 16)}…`
                   : String(b.key)}
               </span>
+              {b.extends && (
+                <span className="lineage">extends {b.extends.slice(0, 12)}…</span>
+              )}
               <span className="detail">
                 → {b.blocks.length} block(s): {b.blocks.map((x) => x.slice(0, 12)).join(", ")}…
               </span>

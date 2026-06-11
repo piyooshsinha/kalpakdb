@@ -238,6 +238,19 @@ impl ControlPlane {
         v
     }
 
+    /// Child key -> parent key over the whole prefix tree (serialized
+    /// form), for lineage rendering.
+    pub fn parent_index(&self) -> std::collections::HashMap<String, String> {
+        let state = self.sm.state.read().unwrap();
+        let mut idx = std::collections::HashMap::new();
+        for (parent, kids) in &state.children {
+            for kid in kids {
+                idx.insert(kid.clone(), parent.clone());
+            }
+        }
+        idx
+    }
+
     /// All bindings owned by `agent`: (serialized cache key, blocks).
     pub fn bindings_of(&self, agent: &AgentId) -> Vec<(String, Vec<BlockId>)> {
         let state = self.sm.state.read().unwrap();

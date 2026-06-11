@@ -77,3 +77,5 @@ td { padding: 6px 10px; border-bottom: 1px solid var(--border); }
 .lag-warn { color: var(--warn); }
 .lag-bad { color: #f85149; }
 .lag-unknown { color: var(--muted); }
+
+.lineage { font-size: 11px; color: var(--warn); margin-right: 8px; border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px; }

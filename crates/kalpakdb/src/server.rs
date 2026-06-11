@@ -650,15 +650,23 @@ async fn agent_bindings(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let agent: AgentId = id.parse()?;
+    let parents = s.control.parent_index();
     let bindings: Vec<_> = s
         .control
         .bindings_of(&agent)
         .into_iter()
         .map(|(key, blocks)| {
+            let extends = parents.get(&key).map(|p| {
+                serde_json::from_str::<serde_json::Value>(p)
+                    .ok()
+                    .and_then(|v| v["prefix_hash"].as_str().map(String::from))
+                    .unwrap_or_default()
+            });
             json!({
                 "key": serde_json::from_str::<serde_json::Value>(&key)
                     .unwrap_or(serde_json::Value::String(key)),
                 "blocks": blocks.iter().map(|b| b.to_string()).collect::<Vec<_>>(),
+                "extends": extends,
             })
         })
         .collect();
