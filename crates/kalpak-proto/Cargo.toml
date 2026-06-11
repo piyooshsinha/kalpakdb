@@ -1,0 +1,17 @@
+[package]
+name = "kalpak-proto"
+description = "gRPC protocol definitions for KalpakDB's streaming data plane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+bytes = "1.11.1"
+
+[build-dependencies]
+tonic-prost-build = "0.14"

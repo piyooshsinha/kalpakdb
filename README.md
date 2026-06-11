@@ -31,6 +31,7 @@ The name draws on Sanskrit roots that describe exactly what this database is for
 | `kalpak-storage` | Append-only content-addressed segments, crash recovery, two-tier RAM/SSD store, prefix manifest, pluggable I/O backend |
 | `kalpak-control` | Raft control plane (`openraft`): durable log, dynamic membership, snapshot compaction, JSON-over-HTTP transport |
 | `kalpakdb` | Node binary: HTTP/WebSocket memory API, cluster management, speculative prefetch, local CLI tools |
+| `kalpak-proto` | gRPC streaming data plane (chunked block streams, group-committed) |
 | `kalpak-client` | Rust SDK for the full agent workflow |
 | `dashboard/` | Optional React observability UI (live metrics over WebSocket) |
 

@@ -5,6 +5,7 @@ members = [
     "crates/kalpak-storage",
     "crates/kalpak-client",
     "crates/kalpak-control",
+    "crates/kalpak-proto",
     "crates/kalpakdb",
 ]
 

@@ -27,6 +27,7 @@ fn spawn(node_id: u64, port: u16, dir: &std::path::Path, witness: bool) -> NodeP
         warm_bytes: 16 * 1024 * 1024,
         node_id,
         bootstrap: false,
+        grpc_addr: None,
     };
     let (kill, killed) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {

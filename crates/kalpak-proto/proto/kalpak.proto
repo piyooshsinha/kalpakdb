@@ -1,0 +1,41 @@
+// KalpakDB streaming data plane.
+//
+// gRPC carries ONLY data-plane traffic (block bytes). Metadata stays on the
+// Raft-backed HTTP path — the two-phase write: stream blocks here first,
+// then bind the returned content ids through consensus.
+
+syntax = "proto3";
+
+package kalpak.v1;
+
+service BlockService {
+  // Stream blocks in; the server stages the whole stream and commits it
+  // under a single fsync (group commit). Returns content ids in order.
+  rpc PutBlocks(stream PutBlockChunk) returns (PutBlocksResponse);
+
+  // Stream a block out in chunks.
+  rpc GetBlock(GetBlockRequest) returns (stream BlockChunk);
+}
+
+// One message per chunk; a block may span several chunks. `last_chunk`
+// closes the current block, so arbitrarily large tensors stream through
+// without ever forming one giant gRPC message.
+message PutBlockChunk {
+  bytes data = 1;
+  bool last_chunk = 2;
+}
+
+message PutBlocksResponse {
+  // Hex BLAKE3 content ids, in block order.
+  repeated string ids = 1;
+}
+
+message GetBlockRequest {
+  // Hex BLAKE3 content id.
+  string id = 1;
+}
+
+message BlockChunk {
+  bytes data = 1;
+  bool last_chunk = 2;
+}

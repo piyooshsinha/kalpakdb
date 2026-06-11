@@ -2,6 +2,8 @@
 # runtime image containing only the kalpakdb binary.
 
 FROM rust:1.96-slim-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates

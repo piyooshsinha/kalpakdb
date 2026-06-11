@@ -35,6 +35,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 warm_bytes: 256 * 1024 * 1024,
                 node_id: 1,
                 bootstrap: cmd == "serve",
+                grpc_addr: None,
             };
             let mut it = rest.iter();
             while let Some(flag) = it.next() {
@@ -48,6 +49,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         opts.node_id = it.next().ok_or("--node-id needs a value")?.parse()?
                     }
                     "--join" => opts.bootstrap = false,
+                    "--grpc-addr" => {
+                        opts.grpc_addr = Some(it.next().ok_or("--grpc-addr needs a value")?.clone())
+                    }
                     other => return Err(format!("unknown flag: {other}").into()),
                 }
             }

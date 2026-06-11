@@ -90,8 +90,11 @@ WebSocket — the database core is engine + protocol + SDK.
 3. **Memory API & speculative retrieval** — HTTP/WS endpoints ✅, Rust
    client SDK ✅, lookup-triggered warm-tier prefetch ✅, cross-node block
    fetch with replicate-on-read ✅, proactive block replication on put ✅,
-   `kalpakdb bench` ✅; then: gRPC, model-based lookahead prediction
-   (cf. SpeCache, CXL-SpecKV).
+   `kalpakdb bench` ✅, gRPC streaming data plane ✅ (chunked put streams
+   into one group commit; chunked get streams out as zero-copy `Bytes`
+   slices; opt-in via `--grpc-addr`); then: streaming straight into
+   group-commit buffers without reassembly, model-based lookahead
+   prediction (cf. SpeCache, CXL-SpecKV).
 4. **Dashboard** — React + WebSocket live metrics ✅; then: per-agent
    lineage views.
 
@@ -113,10 +116,12 @@ payloads always travel as raw binary bodies (never JSON-encoded), and
 `Bytes` bodies are reference-counted, so today's ingest costs exactly two
 copies: network buffer -> aligned segment record, and -> warm tier.
 
-The planned upgrade is gRPC (tonic) **streaming for the data plane only**:
-pipe socket bytes directly into group-commit buffers, eliminating the
-intermediate copy; pair with `io_uring` registered buffers on Linux NVMe
-nodes for the full zero-copy path. Metadata stays on the existing
+The gRPC (tonic) streaming data plane now exists (`kalpak-proto`,
+`kalpakdb --grpc-addr`): chunked `PutBlocks` streams commit under a single
+fsync, and `GetBlock` streams out reference-counted `Bytes` slices of one
+shared buffer. Remaining zero-copy work: feed arriving chunks straight into
+group-commit buffers without reassembly, and pair with `io_uring`
+registered buffers on Linux NVMe nodes. Metadata stays on the existing
 HTTP/JSON+Raft path — it is tiny by construction (the Raft log has no
 request variant that can carry payload bytes, which is what keeps the
 two-phase write honest: data to storage first, then a small bind through

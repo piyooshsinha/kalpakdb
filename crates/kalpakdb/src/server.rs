@@ -37,6 +37,8 @@ pub struct ServeOpts {
     /// Form a single-voter cluster on boot. Disable when this node will be
     /// joined to an existing cluster via `/v1/cluster/*`.
     pub bootstrap: bool,
+    /// Bind address for the gRPC streaming data plane (None disables it).
+    pub grpc_addr: Option<String>,
 }
 
 async fn boot_control(opts: &ServeOpts) -> Result<Arc<ControlPlane>, Box<dyn std::error::Error>> {
@@ -61,6 +63,21 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
         control,
         http: reqwest::Client::new(),
     });
+
+    if let Some(grpc_addr) = &opts.grpc_addr {
+        let svc = crate::grpc::service(state.clone());
+        let bind: std::net::SocketAddr = grpc_addr.parse()?;
+        eprintln!("kalpakdb node {} gRPC data plane on {bind}", opts.node_id);
+        tokio::spawn(async move {
+            if let Err(e) = tonic::transport::Server::builder()
+                .add_service(svc)
+                .serve(bind)
+                .await
+            {
+                eprintln!("kalpakdb: gRPC server exited: {e}");
+            }
+        });
+    }
 
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(&opts.addr).await?;
