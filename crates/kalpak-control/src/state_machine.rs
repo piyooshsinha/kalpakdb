@@ -30,6 +30,10 @@ pub struct MetadataState {
     /// CacheKey -> ordered blocks; HashMap with serde needs string keys, so
     /// bindings are stored under the serialized key.
     pub bindings: HashMap<String, BindingRecord>,
+    /// Prefix tree edges: parent key -> child keys. Fed by `BindPrefix`
+    /// requests that declare their parent; drives lookahead prefetch.
+    #[serde(default)]
+    pub children: HashMap<String, Vec<String>>,
     pub last_applied: Option<LogId>,
     pub membership: StoredMembership<NodeId, openraft::BasicNode>,
 }
@@ -70,14 +74,26 @@ impl StateMachineStore {
                 );
                 Response::Registered
             }
-            Request::BindPrefix { agent, key, blocks } => {
+            Request::BindPrefix {
+                agent,
+                key,
+                blocks,
+                parent,
+            } => {
+                let key_s = binding_key(key);
                 state.bindings.insert(
-                    binding_key(key),
+                    key_s.clone(),
                     BindingRecord {
                         agent: *agent,
                         blocks: blocks.clone(),
                     },
                 );
+                if let Some(parent) = parent {
+                    let kids = state.children.entry(binding_key(parent)).or_default();
+                    if !kids.contains(&key_s) {
+                        kids.push(key_s);
+                    }
+                }
                 Response::Bound
             }
         }

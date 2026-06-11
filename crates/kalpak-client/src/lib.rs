@@ -152,10 +152,33 @@ impl KalpakClient {
         key: CacheKey,
         blocks: Vec<BlockId>,
     ) -> Result<(), ClientError> {
+        self.bind(agent, key, blocks, None).await
+    }
+
+    /// Bind a key that extends `parent`, linking it into the server-side
+    /// prefix tree: a future lookup that hits `parent` will speculatively
+    /// warm this key's blocks too (one-step lookahead).
+    pub async fn bind_prefix_under(
+        &self,
+        agent: AgentId,
+        parent: CacheKey,
+        key: CacheKey,
+        blocks: Vec<BlockId>,
+    ) -> Result<(), ClientError> {
+        self.bind(agent, key, blocks, Some(parent)).await
+    }
+
+    async fn bind(
+        &self,
+        agent: AgentId,
+        key: CacheKey,
+        blocks: Vec<BlockId>,
+        parent: Option<CacheKey>,
+    ) -> Result<(), ClientError> {
         let resp = self
             .http
             .post(format!("{}/v1/manifest/bind", self.base))
-            .json(&json!({ "agent": agent, "key": key, "blocks": blocks }))
+            .json(&json!({ "agent": agent, "key": key, "blocks": blocks, "parent": parent }))
             .send()
             .await?;
         Self::check(resp).await.map(|_| ())

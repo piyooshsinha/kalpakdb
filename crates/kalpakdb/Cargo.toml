@@ -25,4 +25,6 @@ tonic = "0.14"
 tower-http = { version = "0.6.11", features = ["cors"] }
 
 [dev-dependencies]
+ed25519-dalek.workspace = true
+kalpak-client = { path = "../kalpak-client" }
 tempfile.workspace = true

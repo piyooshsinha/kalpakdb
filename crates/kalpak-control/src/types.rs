@@ -20,10 +20,14 @@ pub enum Request {
         display_name: String,
     },
     /// Bind a prefix cache key to the ordered blocks materializing it.
+    /// `parent` links the key into the prefix tree (the key this one
+    /// extends), enabling one-step-ahead speculative prefetch on lookup.
     BindPrefix {
         agent: AgentId,
         key: CacheKey,
         blocks: Vec<BlockId>,
+        #[serde(default)]
+        parent: Option<Box<CacheKey>>,
     },
 }
 

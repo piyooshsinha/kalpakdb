@@ -400,6 +400,8 @@ struct BindReq {
     agent: AgentId,
     key: CacheKey,
     blocks: Vec<BlockId>,
+    #[serde(default)]
+    parent: Option<CacheKey>,
 }
 
 async fn bind_prefix(
@@ -422,12 +424,22 @@ async fn bind_prefix(
     }
     match s
         .control
-        .bind_prefix(req.agent, req.key.clone(), req.blocks.clone())
+        .bind_prefix(
+            req.agent,
+            req.key.clone(),
+            req.blocks.clone(),
+            req.parent.clone(),
+        )
         .await
     {
         Ok(()) => Ok(Json(json!({ "bound": true }))),
         Err(e) => {
-            let body = json!({ "agent": req.agent, "key": req.key, "blocks": req.blocks });
+            let body = json!({
+                "agent": req.agent,
+                "key": req.key,
+                "blocks": req.blocks,
+                "parent": req.parent,
+            });
             forward_to_leader(&s, e, "/v1/manifest/bind", body).await
         }
     }
@@ -456,13 +468,15 @@ async fn lookup_prefix(State(s): State<Shared>, Json(req): Json<LookupReq>) -> J
     }
     match best {
         Some((i, blocks)) => {
-            // Speculative retrieval: the client will fetch these blocks
-            // next, so promote them into the warm tier now, overlapping
-            // disk I/O with the client's round trip.
+            // Speculative retrieval, two steps: warm the hit's own blocks
+            // (the client fetches them next), then warm the blocks of the
+            // hit's CHILDREN in the prefix tree — the prefixes the agent is
+            // most likely to extend into (cf. SpeCache / CXL-SpecKV).
+            let lookahead = s.control.child_blocks(&req.chain[i]);
             let warm = s.clone();
             let prefetch = blocks.clone();
             tokio::task::spawn_blocking(move || {
-                for id in &prefetch {
+                for id in prefetch.iter().chain(&lookahead) {
                     let _ = warm.store.get(id);
                 }
             });

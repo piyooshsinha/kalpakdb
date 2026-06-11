@@ -152,10 +152,29 @@ impl ControlPlane {
         agent: AgentId,
         key: CacheKey,
         blocks: Vec<BlockId>,
+        parent: Option<CacheKey>,
     ) -> Result<(), ControlError> {
-        self.write(Request::BindPrefix { agent, key, blocks })
-            .await
-            .map(|_| ())
+        self.write(Request::BindPrefix {
+            agent,
+            key,
+            blocks,
+            parent: parent.map(Box::new),
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// Blocks bound to the children of `key` in the prefix tree: the
+    /// one-step-ahead speculative prefetch set.
+    pub fn child_blocks(&self, key: &CacheKey) -> Vec<BlockId> {
+        let state = self.sm.state.read().unwrap();
+        let Some(kids) = state.children.get(&binding_key(key)) else {
+            return Vec::new();
+        };
+        kids.iter()
+            .filter_map(|k| state.bindings.get(k))
+            .flat_map(|rec| rec.blocks.iter().copied())
+            .collect()
     }
 
     async fn write(&self, req: Request) -> Result<Response, ControlError> {
@@ -305,7 +324,9 @@ mod tests {
             kalpak_core::BlockId::of(b"kv0"),
             kalpak_core::BlockId::of(b"kv1"),
         ];
-        cp.bind_prefix(a, k.clone(), blocks.clone()).await.unwrap();
+        cp.bind_prefix(a, k.clone(), blocks.clone(), None)
+            .await
+            .unwrap();
 
         let rec = cp.lookup(&k).unwrap();
         assert_eq!(rec.blocks, blocks);
@@ -323,6 +344,7 @@ mod tests {
                 a,
                 key(&[i]),
                 vec![kalpak_core::BlockId::of(&i.to_le_bytes())],
+                None,
             )
             .await
             .unwrap();
@@ -351,7 +373,7 @@ mod tests {
                 .await
                 .unwrap();
             cp.register_agent(a, "survivor").await.unwrap();
-            cp.bind_prefix(a, k.clone(), vec![kalpak_core::BlockId::of(b"kv")])
+            cp.bind_prefix(a, k.clone(), vec![kalpak_core::BlockId::of(b"kv")], None)
                 .await
                 .unwrap();
         }
