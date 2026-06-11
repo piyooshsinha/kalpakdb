@@ -19,6 +19,7 @@ type Stats = {
     last_applied: number | null;
     agents: number;
     bindings: number;
+    peers: string[];
   };
 };
 
@@ -138,6 +139,11 @@ export default function App() {
           />
           <Card label="Agents" value={c ? String(c.agents) : "—"} detail="registered identities" />
           <Card label="Prefix bindings" value={c ? String(c.bindings) : "—"} detail="CacheKey → blocks" />
+          <Card
+            label="Cluster"
+            value={c ? `${(c.peers?.length ?? 0) + 1} node(s)` : "—"}
+            detail={c && c.peers?.length ? `peers: ${c.peers.join(", ")}` : "single node"}
+          />
         </div>
       </section>
     </div>

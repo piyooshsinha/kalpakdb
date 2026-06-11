@@ -528,6 +528,7 @@ fn stats_payload(s: &AppState) -> serde_json::Value {
             "last_applied": raft.last_applied.map(|l| l.index),
             "agents": s.control.agent_count(),
             "bindings": s.control.binding_count(),
+            "peers": s.control.peer_addrs(),
         },
     })
 }
