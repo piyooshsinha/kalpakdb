@@ -77,6 +77,9 @@ db.bind_prefix(agent, k1, vec![id]).await?;
 ./target/release/kalpakdb serve /data/n2 --addr 10.0.0.2:7411 --node-id 2 --join
 ./target/release/kalpakdb serve /data/n3 --addr 10.0.0.3:7411 --node-id 3 --join
 
+# or, for a two-box deployment: a consensus-only witness as the third vote
+./target/release/kalpakdb witness /data/w --addr 10.0.0.3:7412 --node-id 3
+
 # from node 1: grow the cluster
 curl -X POST -H 'content-type: application/json' \
   -d '{"node_id":2,"addr":"10.0.0.2:7411"}' http://10.0.0.1:7411/v1/cluster/add-learner

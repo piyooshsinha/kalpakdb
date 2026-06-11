@@ -22,7 +22,7 @@ use tower_http::cors::CorsLayer;
 
 pub struct AppState {
     pub store: TieredStore,
-    pub control: ControlPlane,
+    pub control: Arc<ControlPlane>,
     /// Client for node-to-node calls (leader forwarding, peer block fetch).
     pub http: reqwest::Client,
 }
@@ -39,8 +39,7 @@ pub struct ServeOpts {
     pub bootstrap: bool,
 }
 
-pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
-    let store = TieredStore::open(&opts.data_dir, opts.warm_bytes)?;
+async fn boot_control(opts: &ServeOpts) -> Result<Arc<ControlPlane>, Box<dyn std::error::Error>> {
     let control =
         ControlPlane::start_node(opts.node_id, Some(std::path::Path::new(&opts.data_dir))).await?;
     if opts.bootstrap {
@@ -51,6 +50,12 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("kalpakdb: cluster already initialized ({e})");
         }
     }
+    Ok(Arc::new(control))
+}
+
+pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
+    let store = TieredStore::open(&opts.data_dir, opts.warm_bytes)?;
+    let control = boot_control(&opts).await?;
     let state = Arc::new(AppState {
         store,
         control,
@@ -67,23 +72,71 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Run a witness: a consensus-only node that votes and replicates metadata
+/// but stores no data-plane blocks. This is the lightweight third vote that
+/// gives a two-box deployment strict quorum without a third storage machine.
+pub async fn serve_witness(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
+    let control = boot_control(&opts).await?;
+    let app = witness_router(control.clone());
+    let listener = tokio::net::TcpListener::bind(&opts.addr).await?;
+    eprintln!(
+        "kalpakdb witness {} listening on http://{} (control dir: {})",
+        opts.node_id, opts.addr, opts.data_dir
+    );
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Consensus routes, shared by full nodes and witnesses.
+fn raft_router(control: Arc<ControlPlane>) -> Router {
+    Router::new()
+        .route("/raft/append", post(raft_append))
+        .route("/raft/vote", post(raft_vote))
+        .route("/raft/snapshot", post(raft_snapshot))
+        .route("/v1/cluster/init", post(cluster_init))
+        .route("/v1/cluster/add-learner", post(cluster_add_learner))
+        .route("/v1/cluster/promote", post(cluster_promote))
+        .with_state(control)
+}
+
 pub fn router(state: Shared) -> Router {
+    let raft = raft_router(state.control.clone());
     Router::new()
         .route("/v1/blocks", post(put_block))
         .route("/v1/blocks/{id}", get(get_block))
         .route("/v1/agents", post(register_agent))
         .route("/v1/manifest/bind", post(bind_prefix))
         .route("/v1/manifest/lookup", post(lookup_prefix))
-        .route("/v1/cluster/init", post(cluster_init))
-        .route("/v1/cluster/add-learner", post(cluster_add_learner))
-        .route("/v1/cluster/promote", post(cluster_promote))
         .route("/v1/stats", get(stats))
         .route("/v1/ws", get(ws_stats))
-        .route("/raft/append", post(raft_append))
-        .route("/raft/vote", post(raft_vote))
-        .route("/raft/snapshot", post(raft_snapshot))
-        .layer(CorsLayer::permissive())
         .with_state(state)
+        .merge(raft)
+        .layer(CorsLayer::permissive())
+}
+
+fn witness_router(control: Arc<ControlPlane>) -> Router {
+    let raft = raft_router(control.clone());
+    Router::new()
+        .route("/v1/stats", get(witness_stats))
+        .with_state(control)
+        .merge(raft)
+        .layer(CorsLayer::permissive())
+}
+
+async fn witness_stats(State(c): State<Arc<ControlPlane>>) -> Json<serde_json::Value> {
+    let raft = c.metrics();
+    Json(json!({
+        "role": "witness",
+        "control_plane": {
+            "node_id": raft.id,
+            "leader": raft.current_leader,
+            "term": raft.current_term,
+            "last_log_index": raft.last_log_index,
+            "last_applied": raft.last_applied.map(|l| l.index),
+            "agents": c.agent_count(),
+            "bindings": c.binding_count(),
+        },
+    }))
 }
 
 struct ApiError(StatusCode, String);
@@ -159,9 +212,28 @@ async fn forward_to_leader(
 
 async fn put_block(
     State(s): State<Shared>,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let id = s.store.put(&body)?;
+    // Proactive replication: push the block to every data peer in the
+    // background so reads anywhere are local. Witnesses simply reject the
+    // route. Internal pushes never fan out further.
+    if !headers.contains_key(INTERNAL_HEADER) {
+        let state = s.clone();
+        let payload = body.clone();
+        tokio::spawn(async move {
+            for peer in state.control.peer_addrs() {
+                let _ = state
+                    .http
+                    .post(format!("http://{peer}/v1/blocks"))
+                    .header(INTERNAL_HEADER, "1")
+                    .body(payload.clone())
+                    .send()
+                    .await;
+            }
+        });
+    }
     Ok(Json(json!({ "id": id.to_string(), "bytes": body.len() })))
 }
 
@@ -316,10 +388,10 @@ struct ClusterInitReq {
 }
 
 async fn cluster_init(
-    State(s): State<Shared>,
+    State(c): State<Arc<ControlPlane>>,
     Json(req): Json<ClusterInitReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    s.control.init_cluster(req.members).await?;
+    c.init_cluster(req.members).await?;
     Ok(Json(json!({ "initialized": true })))
 }
 
@@ -330,10 +402,10 @@ struct AddLearnerReq {
 }
 
 async fn cluster_add_learner(
-    State(s): State<Shared>,
+    State(c): State<Arc<ControlPlane>>,
     Json(req): Json<AddLearnerReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    s.control.add_learner(req.node_id, req.addr).await?;
+    c.add_learner(req.node_id, req.addr).await?;
     Ok(Json(json!({ "learner": req.node_id })))
 }
 
@@ -343,43 +415,40 @@ struct PromoteReq {
 }
 
 async fn cluster_promote(
-    State(s): State<Shared>,
+    State(c): State<Arc<ControlPlane>>,
     Json(req): Json<PromoteReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    s.control.change_membership(req.voters.clone()).await?;
+    c.change_membership(req.voters.clone()).await?;
     Ok(Json(json!({ "voters": req.voters })))
 }
 
 // ---- Raft RPC passthrough (node-to-node) ----
 
 async fn raft_append(
-    State(s): State<Shared>,
+    State(c): State<Arc<ControlPlane>>,
     Json(req): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    s.control
-        .handle_append_entries(req)
+    c.handle_append_entries(req)
         .await
         .map(Json)
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))
 }
 
 async fn raft_vote(
-    State(s): State<Shared>,
+    State(c): State<Arc<ControlPlane>>,
     Json(req): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    s.control
-        .handle_vote(req)
+    c.handle_vote(req)
         .await
         .map(Json)
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))
 }
 
 async fn raft_snapshot(
-    State(s): State<Shared>,
+    State(c): State<Arc<ControlPlane>>,
     Json(req): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    s.control
-        .handle_install_snapshot(req)
+    c.handle_install_snapshot(req)
         .await
         .map(Json)
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))
