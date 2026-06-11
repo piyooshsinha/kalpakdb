@@ -104,3 +104,20 @@ WebSocket — the database core is engine + protocol + SDK.
 - LMCache is the system to benchmark against.
 - `io_uring` is Linux-only; the I/O backend abstraction exists precisely so
   macOS dev nodes and Linux NVMe nodes run the same engine.
+
+## Transport: why HTTP/JSON now, and the path to zero-copy
+
+The wire protocol is deliberately JSON-over-HTTP for the v0 phase: one
+server, one port, curl-debuggable, and the Raft transport reuses it. Block
+payloads always travel as raw binary bodies (never JSON-encoded), and
+`Bytes` bodies are reference-counted, so today's ingest costs exactly two
+copies: network buffer -> aligned segment record, and -> warm tier.
+
+The planned upgrade is gRPC (tonic) **streaming for the data plane only**:
+pipe socket bytes directly into group-commit buffers, eliminating the
+intermediate copy; pair with `io_uring` registered buffers on Linux NVMe
+nodes for the full zero-copy path. Metadata stays on the existing
+HTTP/JSON+Raft path — it is tiny by construction (the Raft log has no
+request variant that can carry payload bytes, which is what keeps the
+two-phase write honest: data to storage first, then a small bind through
+consensus).
