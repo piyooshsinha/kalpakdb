@@ -112,9 +112,25 @@ KalpakDB is a database — the core is the engine, the wire protocol, and the cl
 cd dashboard && npm install && npm run dev   # proxies /v1 to 127.0.0.1:7411
 ```
 
+## Research foundations
+
+KalpakDB's design decisions trace back to recent systems research. Papers that directly shaped this build:
+
+| Paper | What it showed | Where it landed in KalpakDB |
+|---|---|---|
+| [ObjectCache: Layerwise Object-Storage Retrieval for KV Cache Reuse](https://arxiv.org/abs/2605.22850) | Object storage can serve as a runtime KV-cache backend for LLM inference; agent histories outgrow GPU/DRAM | The core thesis: a content-addressed block store serving prefix-selected KV blocks. Also our honesty rule — their latency numbers came from 100 Gbps RoCE, so commodity deployments validate architecture, not headlines |
+| [LMCache: An Efficient KV Cache Layer for Enterprise-Scale LLM Inference](https://arxiv.org/abs/2510.09665) | End-to-end KV-cache offloading across hierarchical storage (local disk, remote CPU/disk) | The system KalpakDB benchmarks against; validated the tiered-storage shape |
+| [SpeCache: Speculative Key-Value Caching](https://arxiv.org/abs/2503.16163) | Predict which KV pairs the next step needs and prefetch them, overlapping I/O with compute | Lookup-triggered speculative prefetch: a prefix hit warms its blocks into RAM during the client's round trip |
+| [CXL-SpecKV: A Disaggregated FPGA Speculative KV-Cache](https://arxiv.org/abs/2512.11920) | A lightweight LSTM next-token predictor reaches a 94.7% prefetch hit rate | The roadmap's model-based lookahead predictor for cross-node block streaming |
+| [Asynchronous KV Cache Prefetching](https://arxiv.org/abs/2504.06319) / [PRESERVE](https://arxiv.org/abs/2501.08192) | Hide memory-access latency behind computation/communication overlap | The computation-transfer overlap pattern behind the prefetcher and the gRPC streaming plane |
+| [IMPRESS: Importance-Informed Multi-Tier Prefix KV Storage](https://www.usenix.org/conference/fast25/presentation/chen-weijian) (FAST '25) | Not all KV blocks deserve the fast tier — importance-aware placement beats plain recency | Why the warm tier uses TinyLFU (frequency-aware) rather than strict LRU; full importance-aware placement is on the roadmap |
+| [Multi-Tier Dynamic Storage for KV Cache](https://link.springer.com/article/10.1007/s40747-025-02200-4) | KV-cache tiering under resource-constrained (edge) conditions | Validates the two-box dev topology: RAM warm buffer over SSD cold store on commodity hardware |
+| [io_uring for High-Performance DBMSs](https://arxiv.org/abs/2512.04859) | Properly tuned io_uring lifts a storage engine from 16.5K to 546.5K TPS | The `IoBackend` trait seam and the planned Linux `io_uring`/`O_DIRECT` backend; 4 KiB record alignment is already direct-I/O compatible |
+| [MAGMA](https://arxiv.org/abs/2601.03236) / [MIRIX](https://arxiv.org/abs/2507.07957) / [A-Mem](https://openreview.net/forum?id=FiM0M8gcct) (agentic memory architectures) | The memory-framework layer is crowded; frameworks differ in ontology (episodic/semantic/procedural) but all need durable substrates | Why KalpakDB exposes primitives (blocks, prefix chains, signed metadata) instead of hardcoding one memory ontology — it aims to be the substrate *under* these frameworks |
+
 ## Architecture
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the thesis, the three planes, and the roadmap (multi-node data-plane replication, gRPC, `io_uring` backend, importance-aware tiering).
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the thesis, the three planes, and the roadmap (multi-node data-plane replication, `io_uring` backend, importance-aware tiering).
 
 ## License
 
