@@ -29,6 +29,22 @@ pub enum Request {
         #[serde(default)]
         parent: Option<Box<CacheKey>>,
     },
+    /// Bind a whole prefix chain atomically: one consensus round (and one
+    /// Raft log fsync) instead of one per depth. The chain is applied in
+    /// order, so parents always exist before their children.
+    BindChain {
+        agent: AgentId,
+        bindings: Vec<ChainBinding>,
+    },
+}
+
+/// One link of an atomic chain bind.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChainBinding {
+    pub key: CacheKey,
+    pub blocks: Vec<BlockId>,
+    #[serde(default)]
+    pub parent: Option<CacheKey>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

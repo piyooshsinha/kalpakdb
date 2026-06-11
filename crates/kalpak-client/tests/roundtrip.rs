@@ -72,6 +72,23 @@ async fn agent_workflow_roundtrip() {
     );
     assert!(db.lookup(&[other]).await.unwrap().is_none());
 
+    // Atomic chain bind: one consensus round for a 2-deep chain.
+    let fp2 = ModelFingerprint::new("test/model-2", "tok", "fp16/paged-16");
+    let c0 = CacheKey::root(fp2, &[100]);
+    let c1 = c0.extend(&[200]);
+    db.bind_chain(
+        agent,
+        vec![
+            (c0.clone(), vec![b0], None),
+            (c1.clone(), vec![b0, b1], Some(c0.clone())),
+        ],
+    )
+    .await
+    .unwrap();
+    let chain_hit = db.lookup(&[c0, c1]).await.unwrap().expect("chain bound");
+    assert_eq!(chain_hit.depth, 1);
+    assert_eq!(chain_hit.blocks, vec![b0, b1]);
+
     // Batch offload: many chunks, one group commit.
     let chunks: Vec<Vec<u8>> = (0..32u8).map(|i| vec![i; 2048]).collect();
     let batch_ids = db.put_blocks(&chunks).await.unwrap();

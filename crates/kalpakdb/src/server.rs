@@ -175,6 +175,7 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/agents", post(register_agent))
         .route("/v1/keys", post(make_key))
         .route("/v1/manifest/bind", post(bind_prefix))
+        .route("/v1/manifest/bind-chain", post(bind_chain))
         .route("/v1/manifest/lookup", post(lookup_prefix))
         .route("/v1/stats", get(stats))
         .route("/v1/ws", get(ws_stats))
@@ -484,6 +485,40 @@ async fn make_key(Json(req): Json<MakeKeyReq>) -> Json<CacheKey> {
         None => CacheKey::root(req.fingerprint, &req.tokens),
     };
     Json(key)
+}
+
+#[derive(Deserialize)]
+struct BindChainReq {
+    agent: AgentId,
+    bindings: Vec<kalpak_control::ChainBinding>,
+}
+
+/// Bind a whole prefix chain in one consensus round (one Raft fsync) —
+/// the fast path for committing a multi-depth context.
+async fn bind_chain(
+    State(s): State<Shared>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<BindChainReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !headers.contains_key(INTERNAL_HEADER) {
+        for b in &req.bindings {
+            for blk in &b.blocks {
+                if !s.store.contains(blk) {
+                    return Err(ApiError(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        format!("block {blk} is not stored; upload blocks before binding"),
+                    ));
+                }
+            }
+        }
+    }
+    match s.control.bind_chain(req.agent, req.bindings.clone()).await {
+        Ok(()) => Ok(Json(json!({ "bound": req.bindings.len() }))),
+        Err(e) => {
+            let body = json!({ "agent": req.agent, "bindings": req.bindings });
+            forward_to_leader(&s, e, "/v1/manifest/bind-chain", body).await
+        }
+    }
 }
 
 /// Probe a root-first chain of cache keys; returns the deepest bound prefix.

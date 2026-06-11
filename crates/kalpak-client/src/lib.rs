@@ -168,6 +168,27 @@ impl KalpakClient {
         self.bind(agent, key, blocks, Some(parent)).await
     }
 
+    /// Bind a whole root-first chain atomically: one consensus round (and
+    /// one Raft log fsync) instead of one per depth. Entries are
+    /// `(key, blocks, parent)`.
+    pub async fn bind_chain(
+        &self,
+        agent: AgentId,
+        chain: Vec<(CacheKey, Vec<BlockId>, Option<CacheKey>)>,
+    ) -> Result<(), ClientError> {
+        let bindings: Vec<_> = chain
+            .into_iter()
+            .map(|(key, blocks, parent)| json!({ "key": key, "blocks": blocks, "parent": parent }))
+            .collect();
+        let resp = self
+            .http
+            .post(format!("{}/v1/manifest/bind-chain", self.base))
+            .json(&json!({ "agent": agent, "bindings": bindings }))
+            .send()
+            .await?;
+        Self::check(resp).await.map(|_| ())
+    }
+
     async fn bind(
         &self,
         agent: AgentId,

@@ -179,6 +179,21 @@ class KalpakClient:
             {"agent": agent, "key": key, "blocks": blocks, "parent": parent},
         )
 
+    def bind_chain(
+        self,
+        agent: str,
+        bindings: list[tuple[dict, list[str], dict | None]],
+    ) -> None:
+        """Bind a root-first chain atomically: one consensus round (one
+        Raft log fsync) instead of one per depth. Entries are
+        ``(key, block_ids, parent_key_or_None)``."""
+        payload = [
+            {"key": key, "blocks": blocks, "parent": parent}
+            for key, blocks, parent in bindings
+        ]
+        self._json("POST", "/v1/manifest/bind-chain",
+                   {"agent": agent, "bindings": payload})
+
     def lookup(self, chain: list[dict]) -> PrefixHit | None:
         """Probe a root-first key chain for the longest cached prefix."""
         resp = self._json("POST", "/v1/manifest/lookup", {"chain": chain})

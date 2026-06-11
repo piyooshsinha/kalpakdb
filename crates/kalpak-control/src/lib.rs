@@ -29,7 +29,7 @@ use openraft::raft::{
 use openraft::{BasicNode, Config, Raft};
 
 pub use state_machine::{AgentRecord, BindingRecord, MetadataState};
-pub use types::{NodeId, Request, Response, TypeConfig};
+pub use types::{ChainBinding, NodeId, Request, Response, TypeConfig};
 
 use log_store::LogStore;
 use network::HttpNetworkFactory;
@@ -162,6 +162,17 @@ impl ControlPlane {
         })
         .await
         .map(|_| ())
+    }
+
+    /// Bind a whole prefix chain in ONE consensus round (one log fsync).
+    pub async fn bind_chain(
+        &self,
+        agent: AgentId,
+        bindings: Vec<ChainBinding>,
+    ) -> Result<(), ControlError> {
+        self.write(Request::BindChain { agent, bindings })
+            .await
+            .map(|_| ())
     }
 
     /// Blocks bound to the children of `key` in the prefix tree: the

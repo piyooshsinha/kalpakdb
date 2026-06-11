@@ -3,6 +3,7 @@
 //!   kalpakdb serve <data-dir> [--addr 127.0.0.1:7411] [--warm-mb 256] [--node-id 1] [--join] [--compact-secs 3600]
 //!   kalpakdb witness <data-dir> [--addr ...] [--node-id N]   (consensus-only voter)
 //!   kalpakdb bench <data-dir> [--blocks 2000] [--size-kb 64]
+//!   kalpakdb stress <base-url> [--agents 8] [--secs 10] [--chunk-kb 64]
 //!   kalpakdb put <data-dir>            reads payload from stdin, prints id
 //!   kalpakdb get <data-dir> <block-id> writes payload to stdout
 //!   kalpakdb stat <data-dir>           prints store statistics
@@ -66,6 +67,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 rt.block_on(server::serve(opts))
             }
+        }
+        [cmd, url, rest @ ..] if cmd == "stress" => {
+            let mut opts = kalpakdb::stress::StressOpts {
+                base: url.trim_end_matches('/').to_string(),
+                agents: 8,
+                secs: 10,
+                chunk_kb: 64,
+            };
+            let mut it = rest.iter();
+            while let Some(flag) = it.next() {
+                match flag.as_str() {
+                    "--agents" => {
+                        opts.agents = it.next().ok_or("--agents needs a value")?.parse()?
+                    }
+                    "--secs" => opts.secs = it.next().ok_or("--secs needs a value")?.parse()?,
+                    "--chunk-kb" => {
+                        opts.chunk_kb = it.next().ok_or("--chunk-kb needs a value")?.parse()?
+                    }
+                    other => return Err(format!("unknown flag: {other}").into()),
+                }
+            }
+            tokio::runtime::Runtime::new()?.block_on(kalpakdb::stress::stress(opts))
         }
         [cmd, dir, rest @ ..] if cmd == "bench" => {
             let mut blocks: u64 = 2000;
@@ -131,7 +154,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => {
             eprintln!(
-                "usage:\n  kalpakdb serve <data-dir> [--addr 127.0.0.1:7411] [--warm-mb 256] [--node-id 1] [--join] [--compact-secs 3600]\n  kalpakdb witness <data-dir> [--addr ...] [--node-id N]   (consensus-only voter)\n  kalpakdb bench <data-dir> [--blocks 2000] [--size-kb 64]\n  kalpakdb put <data-dir>            (payload on stdin)\n  kalpakdb get <data-dir> <block-id>\n  kalpakdb stat <data-dir>"
+                "usage:\n  kalpakdb serve <data-dir> [--addr 127.0.0.1:7411] [--warm-mb 256] [--node-id 1] [--join] [--compact-secs 3600]\n  kalpakdb witness <data-dir> [--addr ...] [--node-id N]   (consensus-only voter)\n  kalpakdb bench <data-dir> [--blocks 2000] [--size-kb 64]\n  kalpakdb stress <base-url> [--agents 8] [--secs 10] [--chunk-kb 64]\n  kalpakdb put <data-dir>            (payload on stdin)\n  kalpakdb get <data-dir> <block-id>\n  kalpakdb stat <data-dir>"
             );
             Err("invalid arguments".into())
         }

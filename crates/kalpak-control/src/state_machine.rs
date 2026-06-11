@@ -15,7 +15,7 @@ use openraft::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Entry, LogId, NodeId, Request, Response, TypeConfig};
+use crate::types::{ChainBinding, Entry, LogId, NodeId, Request, Response, TypeConfig};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentRecord {
@@ -74,27 +74,48 @@ impl StateMachineStore {
                 );
                 Response::Registered
             }
+            Request::BindChain { agent, bindings } => {
+                for ChainBinding {
+                    key,
+                    blocks,
+                    parent,
+                } in bindings
+                {
+                    Self::bind_one(state, agent, key, blocks, parent.as_ref());
+                }
+                Response::Bound
+            }
             Request::BindPrefix {
                 agent,
                 key,
                 blocks,
                 parent,
             } => {
-                let key_s = binding_key(key);
-                state.bindings.insert(
-                    key_s.clone(),
-                    BindingRecord {
-                        agent: *agent,
-                        blocks: blocks.clone(),
-                    },
-                );
-                if let Some(parent) = parent {
-                    let kids = state.children.entry(binding_key(parent)).or_default();
-                    if !kids.contains(&key_s) {
-                        kids.push(key_s);
-                    }
-                }
+                Self::bind_one(state, agent, key, blocks, parent.as_deref());
                 Response::Bound
+            }
+        }
+    }
+
+    fn bind_one(
+        state: &mut MetadataState,
+        agent: &AgentId,
+        key: &CacheKey,
+        blocks: &[BlockId],
+        parent: Option<&CacheKey>,
+    ) {
+        let key_s = binding_key(key);
+        state.bindings.insert(
+            key_s.clone(),
+            BindingRecord {
+                agent: *agent,
+                blocks: blocks.to_vec(),
+            },
+        );
+        if let Some(parent) = parent {
+            let kids = state.children.entry(binding_key(parent)).or_default();
+            if !kids.contains(&key_s) {
+                kids.push(key_s);
             }
         }
     }
