@@ -103,6 +103,7 @@ pub fn router(state: Shared) -> Router {
     let raft = raft_router(state.control.clone());
     Router::new()
         .route("/v1/blocks", post(put_block))
+        .route("/v1/blocks/batch", post(put_blocks_batch))
         .route("/v1/blocks/{id}", get(get_block))
         .route("/v1/agents", post(register_agent))
         .route("/v1/manifest/bind", post(bind_prefix))
@@ -235,6 +236,56 @@ async fn put_block(
         });
     }
     Ok(Json(json!({ "id": id.to_string(), "bytes": body.len() })))
+}
+
+/// Batch block upload with one group-committed fsync.
+///
+/// Body framing (binary, little-endian): `u32 count`, then per block
+/// `u32 len` + `len` payload bytes. Replies with the ids in input order.
+async fn put_blocks_batch(
+    State(s): State<Shared>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let bad = |m: &str| ApiError(StatusCode::BAD_REQUEST, m.to_string());
+    if body.len() < 4 {
+        return Err(bad("truncated batch header"));
+    }
+    let count = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+    let mut payloads = Vec::with_capacity(count);
+    let mut at = 4usize;
+    for _ in 0..count {
+        if at + 4 > body.len() {
+            return Err(bad("truncated block length"));
+        }
+        let len = u32::from_le_bytes(body[at..at + 4].try_into().unwrap()) as usize;
+        at += 4;
+        if at + len > body.len() {
+            return Err(bad("truncated block payload"));
+        }
+        payloads.push(&body[at..at + len]);
+        at += len;
+    }
+    let ids = s.store.put_many(payloads.iter().copied())?;
+
+    if !headers.contains_key(INTERNAL_HEADER) {
+        let state = s.clone();
+        let raw = body.clone();
+        tokio::spawn(async move {
+            for peer in state.control.peer_addrs() {
+                let _ = state
+                    .http
+                    .post(format!("http://{peer}/v1/blocks/batch"))
+                    .header(INTERNAL_HEADER, "1")
+                    .body(raw.clone())
+                    .send()
+                    .await;
+            }
+        });
+    }
+    Ok(Json(json!({
+        "ids": ids.iter().map(|i| i.to_string()).collect::<Vec<_>>()
+    })))
 }
 
 async fn get_block(

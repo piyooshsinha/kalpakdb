@@ -104,6 +104,20 @@ impl<B: IoBackend> TieredStore<B> {
         Ok(id)
     }
 
+    /// Group-commit a batch (one fsync), then warm every block.
+    pub fn put_many<'a, I>(&self, payloads: I) -> Result<Vec<BlockId>, Error>
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        let payloads: Vec<&[u8]> = payloads.into_iter().collect();
+        let ids = self.cold.put_many(payloads.iter().copied())?;
+        let mut warm = self.warm.lock().unwrap();
+        for (id, payload) in ids.iter().zip(&payloads) {
+            warm.insert(*id, Arc::new(payload.to_vec()));
+        }
+        Ok(ids)
+    }
+
     /// Serve from RAM when possible; on a cold hit, verify and promote.
     pub fn get(&self, id: &BlockId) -> Result<Arc<Vec<u8>>, Error> {
         {

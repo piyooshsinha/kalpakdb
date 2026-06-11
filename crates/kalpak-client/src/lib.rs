@@ -95,6 +95,32 @@ impl KalpakClient {
         r.id.parse().map_err(|_| ClientError::Decode(r.id))
     }
 
+    /// Store a batch of blocks under one group-committed fsync — the fast
+    /// path for offloading a multi-chunk context.
+    pub async fn put_blocks(&self, payloads: &[Vec<u8>]) -> Result<Vec<BlockId>, ClientError> {
+        #[derive(Deserialize)]
+        struct Resp {
+            ids: Vec<String>,
+        }
+        let mut body = Vec::with_capacity(4 + payloads.iter().map(|p| 4 + p.len()).sum::<usize>());
+        body.extend_from_slice(&(payloads.len() as u32).to_le_bytes());
+        for p in payloads {
+            body.extend_from_slice(&(p.len() as u32).to_le_bytes());
+            body.extend_from_slice(p);
+        }
+        let resp = self
+            .http
+            .post(format!("{}/v1/blocks/batch", self.base))
+            .body(body)
+            .send()
+            .await?;
+        let r: Resp = Self::check(resp).await?.json().await?;
+        r.ids
+            .into_iter()
+            .map(|id| id.parse().map_err(|_| ClientError::Decode(id.clone())))
+            .collect()
+    }
+
     /// Fetch a block by content address.
     pub async fn get_block(&self, id: &BlockId) -> Result<Vec<u8>, ClientError> {
         let resp = self

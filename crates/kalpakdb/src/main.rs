@@ -150,6 +150,23 @@ fn bench(dir: &str, blocks: u64, size: usize) -> Result<(), Box<dyn std::error::
     }
     let put_s = t.elapsed().as_secs_f64();
 
+    // Batch path: same volume, fresh payloads, one fsync per batch of 64.
+    let t = Instant::now();
+    let mut batch: Vec<Vec<u8>> = Vec::with_capacity(64);
+    for i in 0..blocks {
+        let mut p = payload.clone();
+        p[..8].copy_from_slice(&(i + blocks).to_le_bytes());
+        batch.push(p);
+        if batch.len() == 64 {
+            store.put_many(batch.iter().map(|b| b.as_slice()))?;
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        store.put_many(batch.iter().map(|b| b.as_slice()))?;
+    }
+    let batch_s = t.elapsed().as_secs_f64();
+
     let t = Instant::now();
     for id in &ids {
         store.get(id)?;
@@ -166,9 +183,14 @@ fn bench(dir: &str, blocks: u64, size: usize) -> Result<(), Box<dyn std::error::
 
     println!("kalpakdb bench: {blocks} blocks x {} KiB", size / 1024);
     println!(
-        "  put       {:>10.0} blk/s  {:>8.1} MiB/s",
+        "  put       {:>10.0} blk/s  {:>8.1} MiB/s  (fsync per block)",
         blocks as f64 / put_s,
         mibs(total_bytes, put_s)
+    );
+    println!(
+        "  put batch {:>10.0} blk/s  {:>8.1} MiB/s  (group commit, 64/batch)",
+        blocks as f64 / batch_s,
+        mibs(total_bytes, batch_s)
     );
     println!(
         "  get warm  {:>10.0} blk/s  {:>8.1} MiB/s",

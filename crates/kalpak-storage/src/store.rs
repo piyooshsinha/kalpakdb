@@ -85,43 +85,78 @@ impl<B: IoBackend> BlockStore<B> {
 
     /// Store `payload`, returning its content address. No-op if present.
     pub fn put(&self, payload: &[u8]) -> Result<BlockId, Error> {
-        let id = BlockId::of(payload);
-        if self.index.read().unwrap().contains_key(&id) {
-            return Ok(id);
-        }
+        Ok(self.put_many(std::iter::once(payload))?[0])
+    }
 
-        let record = segment::encode_record(&id, payload);
+    /// Store a batch of payloads under a single fsync (group commit).
+    ///
+    /// Puts are fsync-bound: one block per sync caps throughput at the
+    /// device's flush rate. Batching amortizes the flush, so offloading a
+    /// multi-chunk context costs one sync instead of one per chunk. Returns
+    /// ids in input order; duplicates (within the batch or with existing
+    /// blocks) are deduplicated.
+    pub fn put_many<'a, I>(&self, payloads: I) -> Result<Vec<BlockId>, Error>
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        // Hash and encode outside the lock.
+        let prepared: Vec<(BlockId, &[u8])> =
+            payloads.into_iter().map(|p| (BlockId::of(p), p)).collect();
+        let ids: Vec<BlockId> = prepared.iter().map(|(id, _)| *id).collect();
+
         let mut segs = self.segments.write().unwrap();
+        let mut staged: Vec<(BlockId, Location)> = Vec::new();
+        let mut dirty = false;
 
-        // Re-check under the write lock: a racing put of the same bytes may
-        // have landed while we were encoding.
-        if self.index.read().unwrap().contains_key(&id) {
-            return Ok(id);
+        for (id, payload) in &prepared {
+            // Check under the write lock; also skips duplicates staged
+            // earlier in this same batch once they land in the index below.
+            if self.index.read().unwrap().contains_key(id)
+                || staged.iter().any(|(sid, _)| sid == id)
+            {
+                continue;
+            }
+            let record = segment::encode_record(id, payload);
+
+            if segs.tail + record.len() as u64 > SEGMENT_ROLL_BYTES && segs.tail > 0 {
+                // Seal the old segment before rolling. (`dirty` stays set:
+                // a write to the new segment follows immediately.)
+                if dirty {
+                    segs.files.last().unwrap().sync()?;
+                }
+                let seg_id = segs.files.len() as u32;
+                segs.files
+                    .push(self.backend.open(&segment_path(&self.dir, seg_id))?);
+                segs.tail = 0;
+            }
+
+            let seg_id = (segs.files.len() - 1) as u32;
+            let offset = segs.tail;
+            segs.files.last().unwrap().write_at(&record, offset)?;
+            dirty = true;
+            segs.tail += record.len() as u64;
+            staged.push((
+                *id,
+                Location {
+                    segment: seg_id,
+                    offset,
+                    payload_len: payload.len() as u64,
+                },
+            ));
         }
 
-        if segs.tail + record.len() as u64 > SEGMENT_ROLL_BYTES && segs.tail > 0 {
-            let seg_id = segs.files.len() as u32;
-            segs.files
-                .push(self.backend.open(&segment_path(&self.dir, seg_id))?);
-            segs.tail = 0;
+        // One sync covers every record staged above.
+        if dirty {
+            segs.files.last().unwrap().sync()?;
         }
 
-        let seg_id = (segs.files.len() - 1) as u32;
-        let offset = segs.tail;
-        let file = segs.files.last().unwrap();
-        file.write_at(&record, offset)?;
-        file.sync()?;
-        segs.tail += record.len() as u64;
-
-        self.index.write().unwrap().insert(
-            id,
-            Location {
-                segment: seg_id,
-                offset,
-                payload_len: payload.len() as u64,
-            },
-        );
-        Ok(id)
+        if !staged.is_empty() {
+            let mut index = self.index.write().unwrap();
+            for (id, loc) in staged {
+                index.insert(id, loc);
+            }
+        }
+        Ok(ids)
     }
 
     /// Fetch a block, verifying its hash before returning.
@@ -278,5 +313,53 @@ mod tests {
         let store = BlockStore::open_with(StdBackend, dir.path()).unwrap();
         let id = store.put(b"backend generic").unwrap();
         assert_eq!(store.get(&id).unwrap(), b"backend generic");
+    }
+
+    #[test]
+    fn put_many_single_sync_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let payloads: Vec<Vec<u8>> = (0..50u8).map(|i| vec![i; 3000]).collect();
+        let refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+        let ids = store.put_many(refs).unwrap();
+        assert_eq!(ids.len(), 50);
+        for (id, payload) in ids.iter().zip(&payloads) {
+            assert_eq!(&store.get(id).unwrap(), payload);
+        }
+        assert_eq!(store.stats().blocks, 50);
+    }
+
+    #[test]
+    fn put_many_dedups_within_batch_and_against_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        store.put(b"already there").unwrap();
+        let before = store.stats().bytes_on_disk;
+        let ids = store
+            .put_many([
+                b"already there".as_slice(),
+                b"new".as_slice(),
+                b"new".as_slice(),
+            ])
+            .unwrap();
+        assert_eq!(ids[1], ids[2]);
+        assert_eq!(store.stats().blocks, 2);
+        // Only "new" was written once.
+        assert_eq!(store.stats().bytes_on_disk, before + 4096);
+    }
+
+    #[test]
+    fn put_many_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let ids;
+        {
+            let store = BlockStore::open(dir.path()).unwrap();
+            ids = store
+                .put_many([b"alpha".as_slice(), b"beta".as_slice()])
+                .unwrap();
+        }
+        let store = BlockStore::open(dir.path()).unwrap();
+        assert_eq!(store.get(&ids[0]).unwrap(), b"alpha");
+        assert_eq!(store.get(&ids[1]).unwrap(), b"beta");
     }
 }

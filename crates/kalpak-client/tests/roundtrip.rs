@@ -70,6 +70,12 @@ async fn agent_workflow_roundtrip() {
     );
     assert!(db.lookup(&[other]).await.unwrap().is_none());
 
+    // Batch offload: many chunks, one group commit.
+    let chunks: Vec<Vec<u8>> = (0..32u8).map(|i| vec![i; 2048]).collect();
+    let batch_ids = db.put_blocks(&chunks).await.unwrap();
+    assert_eq!(batch_ids.len(), 32);
+    assert_eq!(db.get_block(&batch_ids[7]).await.unwrap(), chunks[7]);
+
     // Errors surface as typed server errors.
     let missing = kalpak_core::BlockId::of(b"never-stored");
     let err = db.get_block(&missing).await.unwrap_err();
