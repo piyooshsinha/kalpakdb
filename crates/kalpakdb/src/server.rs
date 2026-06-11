@@ -127,6 +127,7 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/manifest/lookup", post(lookup_prefix))
         .route("/v1/stats", get(stats))
         .route("/v1/ws", get(ws_stats))
+        .route("/v1/admin/compact", post(admin_compact))
         .with_state(state)
         .merge(raft)
         .layer(CorsLayer::permissive())
@@ -520,6 +521,23 @@ async fn raft_snapshot(
         .await
         .map(Json)
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))
+}
+
+/// Garbage-collect sealed segments: every block referenced by a
+/// Raft-replicated binding is live; everything else in sealed segments is
+/// swept. The active segment is never touched, which is the grace window
+/// for the put-then-bind two-phase write.
+async fn admin_compact(State(s): State<Shared>) -> Result<Json<serde_json::Value>, ApiError> {
+    let live = s.control.bound_blocks();
+    let state = s.clone();
+    let stats = tokio::task::spawn_blocking(move || state.store.compact(|id| live.contains(id)))
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    Ok(Json(json!({
+        "segments_rewritten": stats.segments_rewritten,
+        "blocks_dropped": stats.blocks_dropped,
+        "bytes_reclaimed": stats.bytes_reclaimed,
+    })))
 }
 
 fn stats_payload(s: &AppState) -> serde_json::Value {

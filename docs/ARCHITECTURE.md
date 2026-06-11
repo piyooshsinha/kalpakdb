@@ -92,9 +92,12 @@ WebSocket — the database core is engine + protocol + SDK.
    fetch with replicate-on-read ✅, proactive block replication on put ✅,
    `kalpakdb bench` ✅, gRPC streaming data plane ✅ (chunked put streams
    into one group commit; chunked get streams out as zero-copy `Bytes`
-   slices; opt-in via `--grpc-addr`); then: streaming straight into
-   group-commit buffers without reassembly, model-based lookahead
-   prediction (cf. SpeCache, CXL-SpecKV).
+   slices; opt-in via `--grpc-addr`), segment GC ✅ (mark-and-sweep over
+   sealed segments; live set = Raft-replicated bindings; the active
+   segment is the grace window for the put-then-bind two-phase write;
+   POST /v1/admin/compact); then: scheduled/automatic compaction,
+   streaming straight into group-commit buffers without reassembly,
+   model-based lookahead prediction (cf. SpeCache, CXL-SpecKV).
 4. **Dashboard** — React + WebSocket live metrics ✅; then: per-agent
    lineage views.
 

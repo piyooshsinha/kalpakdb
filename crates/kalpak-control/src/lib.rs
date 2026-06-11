@@ -207,6 +207,18 @@ impl ControlPlane {
         self.sm.state.read().unwrap().bindings.len()
     }
 
+    /// Every block referenced by any binding: the GC live set.
+    pub fn bound_blocks(&self) -> std::collections::HashSet<BlockId> {
+        self.sm
+            .state
+            .read()
+            .unwrap()
+            .bindings
+            .values()
+            .flat_map(|rec| rec.blocks.iter().copied())
+            .collect()
+    }
+
     /// Raft metrics for the observability plane.
     pub fn metrics(&self) -> openraft::RaftMetrics<NodeId, BasicNode> {
         self.raft.metrics().borrow().clone()

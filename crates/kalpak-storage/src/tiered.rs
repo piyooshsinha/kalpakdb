@@ -110,6 +110,29 @@ impl<B: IoBackend> TieredStore<B> {
         &self.cold
     }
 
+    /// Compact sealed segments, dropping blocks for which `live` is false,
+    /// and evict the dropped blocks from the warm tier.
+    pub fn compact(
+        &self,
+        live: impl Fn(&BlockId) -> bool,
+    ) -> Result<crate::store::CompactStats, Error> {
+        let stats = self.cold.compact(&live)?;
+        if stats.blocks_dropped > 0 {
+            // Dead ids are no longer in the cold index; sweep warm entries
+            // that the cold store no longer backs.
+            let dead: Vec<BlockId> = self
+                .warm
+                .iter()
+                .filter(|(id, _)| !self.cold.contains(id))
+                .map(|(id, _)| *id)
+                .collect();
+            for id in dead {
+                self.warm.invalidate(&id);
+            }
+        }
+        Ok(stats)
+    }
+
     pub fn tier_stats(&self) -> TierStats {
         // Flush moka's pending maintenance so counts reflect evictions.
         self.warm.run_pending_tasks();

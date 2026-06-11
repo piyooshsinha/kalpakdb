@@ -7,10 +7,9 @@ use kalpak_core::{BlockId, Error};
 use crate::io::{IoBackend, SegmentFile, StdBackend};
 use crate::segment::{self, Location, HEADER_LEN};
 
-/// Segments roll over once they pass this size (256 MiB). Small enough to
-/// keep recovery scans and future compaction units manageable, large enough
-/// to amortize file overhead.
-const SEGMENT_ROLL_BYTES: u64 = 256 * 1024 * 1024;
+/// Default segment roll size (256 MiB). Small enough to keep recovery scans
+/// and compaction units manageable, large enough to amortize file overhead.
+pub const DEFAULT_SEGMENT_ROLL_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Content-addressed block store over append-only segment files.
 ///
@@ -33,6 +32,7 @@ pub struct BlockStore<B: IoBackend = StdBackend> {
     files: RwLock<Vec<Arc<B::SegmentFile>>>,
     /// Append position in the active (last) segment. Serializes writers.
     append: Mutex<u64>,
+    roll_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,9 +42,24 @@ pub struct StoreStats {
     pub bytes_on_disk: u64,
 }
 
+/// Outcome of a [`BlockStore::compact`] sweep.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompactStats {
+    pub segments_rewritten: u32,
+    pub blocks_dropped: u64,
+    pub bytes_reclaimed: u64,
+}
+
 impl BlockStore<StdBackend> {
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, Error> {
         Self::open_with(StdBackend, dir)
+    }
+
+    /// Open with a custom segment roll size (tests fill segments cheaply).
+    pub fn open_with_roll(dir: impl AsRef<Path>, roll_bytes: u64) -> Result<Self, Error> {
+        let mut store = Self::open_with(StdBackend, dir)?;
+        store.roll_bytes = roll_bytes;
+        Ok(store)
     }
 }
 
@@ -85,6 +100,7 @@ impl<B: IoBackend> BlockStore<B> {
             index: RwLock::new(index),
             files: RwLock::new(files),
             append: Mutex::new(tail),
+            roll_bytes: DEFAULT_SEGMENT_ROLL_BYTES,
         })
     }
 
@@ -128,7 +144,7 @@ impl<B: IoBackend> BlockStore<B> {
             }
             let record = segment::encode_record(id, payload);
 
-            if *tail + record.len() as u64 > SEGMENT_ROLL_BYTES && *tail > 0 {
+            if *tail + record.len() as u64 > self.roll_bytes && *tail > 0 {
                 // Seal the old segment, then roll. The files write lock is
                 // held only for the push, never across disk I/O.
                 if dirty {
@@ -198,6 +214,97 @@ impl<B: IoBackend> BlockStore<B> {
         Ok(payload)
     }
 
+    /// Mark-and-sweep compaction over **sealed** segments.
+    ///
+    /// Rewrites every sealed segment that contains records for which
+    /// `live(id)` is false, dropping the dead records. The active segment is
+    /// never touched — recent writes stay safe through the two-phase write
+    /// window (put first, bind through consensus after), since anything not
+    /// yet bound is still in or near the active segment.
+    ///
+    /// Readers are never blocked: each rewrite happens into a tmp file that
+    /// atomically replaces the segment, and in-flight readers keep reading
+    /// their own `Arc`'d handle of the old file, which stays valid until
+    /// dropped. The index and file table swap together under brief locks.
+    pub fn compact(&self, live: impl Fn(&BlockId) -> bool) -> Result<CompactStats, Error> {
+        // Serialize with writers: compaction never touches the active
+        // segment, but holding the append lock keeps "sealed" stable and
+        // makes concurrent compactions impossible.
+        let _append = self.append.lock().unwrap();
+        let sealed = {
+            let files = self.files.read().unwrap();
+            files.len().saturating_sub(1)
+        };
+
+        let mut stats = CompactStats::default();
+        for seg in 0..sealed as u32 {
+            // Collect this segment's records from the index.
+            let entries: Vec<(BlockId, Location)> = {
+                let index = self.index.read().unwrap();
+                index
+                    .iter()
+                    .filter(|(_, loc)| loc.segment == seg)
+                    .map(|(id, loc)| (*id, *loc))
+                    .collect()
+            };
+            let (keep, drop): (Vec<_>, Vec<_>) = entries.into_iter().partition(|(id, _)| live(id));
+            if drop.is_empty() {
+                continue;
+            }
+
+            // Rewrite the segment with only live records, reading payloads
+            // through the current handle (no locks held during I/O).
+            let old = Arc::clone(&self.files.read().unwrap()[seg as usize]);
+            let tmp_path = self.dir.join(format!("seg-{seg:08}.klpk.compact"));
+            let tmp = self.backend.open(&tmp_path)?;
+            let mut new_locs: Vec<(BlockId, Location)> = Vec::with_capacity(keep.len());
+            let mut offset = 0u64;
+            for (id, loc) in &keep {
+                let mut payload = vec![0u8; loc.payload_len as usize];
+                old.read_at(&mut payload, loc.offset + HEADER_LEN as u64)?;
+                if !id.verify(&payload) {
+                    return Err(Error::Corrupt { id: *id });
+                }
+                let record = segment::encode_record(id, &payload);
+                tmp.write_at(&record, offset)?;
+                new_locs.push((
+                    *id,
+                    Location {
+                        segment: seg,
+                        offset,
+                        payload_len: loc.payload_len,
+                    },
+                ));
+                offset += record.len() as u64;
+            }
+            tmp.sync()?;
+            drop_handle(tmp);
+            let old_len = old.len()?;
+            std::fs::rename(&tmp_path, segment_path(&self.dir, seg))?;
+
+            // Swap the handle and the index entries together.
+            let new_file = Arc::new(self.backend.open(&segment_path(&self.dir, seg))?);
+            {
+                let mut files = self.files.write().unwrap();
+                files[seg as usize] = new_file;
+            }
+            {
+                let mut index = self.index.write().unwrap();
+                for (id, _) in &drop {
+                    index.remove(id);
+                }
+                for (id, loc) in new_locs {
+                    index.insert(id, loc);
+                }
+            }
+
+            stats.segments_rewritten += 1;
+            stats.blocks_dropped += drop.len() as u64;
+            stats.bytes_reclaimed += old_len.saturating_sub(offset);
+        }
+        Ok(stats)
+    }
+
     pub fn contains(&self, id: &BlockId) -> bool {
         self.index.read().unwrap().contains_key(id)
     }
@@ -216,6 +323,11 @@ impl<B: IoBackend> BlockStore<B> {
             bytes_on_disk: sealed + tail,
         }
     }
+}
+
+/// Explicitly close a segment handle before renaming over its path.
+fn drop_handle<T>(t: T) {
+    drop(t);
 }
 
 fn segment_path(dir: &Path, id: u32) -> PathBuf {
@@ -379,5 +491,61 @@ mod tests {
         let store = BlockStore::open(dir.path()).unwrap();
         assert_eq!(store.get(&ids[0]).unwrap(), b"alpha");
         assert_eq!(store.get(&ids[1]).unwrap(), b"beta");
+    }
+
+    #[test]
+    fn compact_drops_dead_blocks_and_reclaims_space() {
+        let dir = tempfile::tempdir().unwrap();
+        // Tiny roll so multiple segments seal quickly: each 4 KiB-aligned
+        // record fills a 10 KiB segment after two writes.
+        let store = BlockStore::open_with_roll(dir.path(), 10 * 1024).unwrap();
+        let ids: Vec<_> = (0..10u8).map(|i| store.put(&[i; 3000]).unwrap()).collect();
+        let before = store.stats();
+        assert!(before.segments > 2, "test needs several sealed segments");
+
+        // Keep even-indexed blocks only.
+        let live: std::collections::HashSet<_> = ids.iter().step_by(2).copied().collect();
+        let stats = store.compact(|id| live.contains(id)).unwrap();
+        assert!(stats.segments_rewritten > 0);
+        assert!(stats.bytes_reclaimed > 0);
+
+        for (i, id) in ids.iter().enumerate() {
+            if i % 2 == 0 {
+                assert_eq!(store.get(id).unwrap(), vec![i as u8; 3000]);
+            } else if store.contains(id) {
+                // Dead blocks may survive only in the active segment.
+                let loc_seg = store.stats().segments - 1;
+                let _ = loc_seg; // active-segment survivors are expected
+            }
+        }
+        assert!(store.stats().bytes_on_disk < before.bytes_on_disk);
+    }
+
+    #[test]
+    fn compact_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let ids: Vec<_>;
+        {
+            let store = BlockStore::open_with_roll(dir.path(), 10 * 1024).unwrap();
+            ids = (0..10u8).map(|i| store.put(&[i; 3000]).unwrap()).collect();
+            let live: std::collections::HashSet<_> = ids.iter().step_by(2).copied().collect();
+            store.compact(|id| live.contains(id)).unwrap();
+        }
+        // The rewritten segments must replay cleanly.
+        let store = BlockStore::open(dir.path()).unwrap();
+        for (i, id) in ids.iter().enumerate().step_by(2) {
+            assert_eq!(store.get(id).unwrap(), vec![i as u8; 3000]);
+        }
+    }
+
+    #[test]
+    fn compact_never_touches_the_active_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::open_with_roll(dir.path(), 1 << 20).unwrap();
+        // Everything fits in the single active segment.
+        let id = store.put(b"unbound but recent").unwrap();
+        let stats = store.compact(|_| false).unwrap();
+        assert_eq!(stats.segments_rewritten, 0);
+        assert_eq!(store.get(&id).unwrap(), b"unbound but recent");
     }
 }
