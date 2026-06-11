@@ -35,14 +35,40 @@ impl BlockService for BlockGrpc {
         &self,
         request: Request<Streaming<PutBlockChunk>>,
     ) -> Result<Response<PutBlocksResponse>, Status> {
+        /// Completed blocks are group-committed whenever this much payload
+        /// has accumulated, so an arbitrarily long stream needs bounded
+        /// memory. Deliberately NOT implemented by holding the append lock
+        /// across the network stream — a slow client must never head-of-line
+        /// block other writers.
+        const FLUSH_BYTES: usize = 64 * 1024 * 1024;
+
         let mut stream = request.into_inner();
         let mut blocks: Vec<Vec<u8>> = Vec::new();
+        let mut staged_bytes = 0usize;
         let mut current: Vec<u8> = Vec::new();
+        let mut ids: Vec<String> = Vec::new();
+
+        let flush = |blocks: Vec<Vec<u8>>, state: Arc<AppState>| async move {
+            tokio::task::spawn_blocking(move || {
+                state.store.put_many(blocks.iter().map(|b| b.as_slice()))
+            })
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(|e| Status::internal(e.to_string()))
+        };
 
         while let Some(chunk) = stream.message().await? {
             current.extend_from_slice(&chunk.data);
             if chunk.last_chunk {
+                staged_bytes += current.len();
                 blocks.push(std::mem::take(&mut current));
+                if staged_bytes >= FLUSH_BYTES {
+                    let batch = std::mem::take(&mut blocks);
+                    staged_bytes = 0;
+                    for id in flush(batch, self.state.clone()).await? {
+                        ids.push(id.to_string());
+                    }
+                }
             }
         }
         if !current.is_empty() {
@@ -50,18 +76,13 @@ impl BlockService for BlockGrpc {
                 "stream ended mid-block: missing last_chunk",
             ));
         }
+        if !blocks.is_empty() {
+            for id in flush(blocks, self.state.clone()).await? {
+                ids.push(id.to_string());
+            }
+        }
 
-        let state = self.state.clone();
-        let ids = tokio::task::spawn_blocking(move || {
-            state.store.put_many(blocks.iter().map(|b| b.as_slice()))
-        })
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .map_err(|e| Status::internal(e.to_string()))?;
-
-        Ok(Response::new(PutBlocksResponse {
-            ids: ids.iter().map(|i| i.to_string()).collect(),
-        }))
+        Ok(Response::new(PutBlocksResponse { ids }))
     }
 
     type GetBlockStream = ReceiverStream<Result<BlockChunk, Status>>;
