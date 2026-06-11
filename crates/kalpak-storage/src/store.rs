@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
 
 use kalpak_core::{BlockId, Error};
 
@@ -12,22 +12,27 @@ use crate::segment::{self, Location, HEADER_LEN};
 /// to amortize file overhead.
 const SEGMENT_ROLL_BYTES: u64 = 256 * 1024 * 1024;
 
-struct Segments<F> {
-    files: Vec<F>,
-    /// Append position in the active (last) segment.
-    tail: u64,
-}
-
 /// Content-addressed block store over append-only segment files.
 ///
 /// `put` is idempotent: storing bytes that already exist returns the existing
 /// id without writing. `get` verifies the payload hash on every read, so
 /// corruption is detected at the read site rather than propagated.
+///
+/// Locking is split so that **reads never wait on disk I/O**: records are
+/// immutable once indexed, so readers only briefly lock `files` to clone an
+/// `Arc` of the right segment handle, then read with no lock held. Writers
+/// serialize on `append` (which owns the tail offset) and hold no shared
+/// lock during `write_at`/`sync` — an fsync in `put_many` cannot stall a
+/// `get`. The index is only updated after the sync, so readers can never
+/// observe an unflushed block.
 pub struct BlockStore<B: IoBackend = StdBackend> {
     backend: B,
     dir: PathBuf,
     index: RwLock<HashMap<BlockId, Location>>,
-    segments: RwLock<Segments<B::SegmentFile>>,
+    /// Segment handles for readers. Write-locked only on segment roll.
+    files: RwLock<Vec<Arc<B::SegmentFile>>>,
+    /// Append position in the active (last) segment. Serializes writers.
+    append: Mutex<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,17 +66,16 @@ impl<B: IoBackend> BlockStore<B> {
         let mut index = HashMap::new();
         let mut files = Vec::new();
         let mut tail = 0;
-        for (i, seg_id) in seg_ids.iter().enumerate() {
+        for seg_id in &seg_ids {
             let file = backend.open(&segment_path(&dir, *seg_id))?;
+            // Only the last segment's tail matters; earlier ones are sealed.
             tail = segment::scan(&file, *seg_id, |id, loc| {
                 index.insert(id, loc);
             })?;
-            // Only the last segment's tail matters; earlier ones are sealed.
-            let _ = i;
-            files.push(file);
+            files.push(Arc::new(file));
         }
         if files.is_empty() {
-            files.push(backend.open(&segment_path(&dir, 0))?);
+            files.push(Arc::new(backend.open(&segment_path(&dir, 0))?));
             tail = 0;
         }
 
@@ -79,7 +83,8 @@ impl<B: IoBackend> BlockStore<B> {
             backend,
             dir,
             index: RwLock::new(index),
-            segments: RwLock::new(Segments { files, tail }),
+            files: RwLock::new(files),
+            append: Mutex::new(tail),
         })
     }
 
@@ -99,18 +104,23 @@ impl<B: IoBackend> BlockStore<B> {
     where
         I: IntoIterator<Item = &'a [u8]>,
     {
-        // Hash and encode outside the lock.
+        // Hash outside any lock.
         let prepared: Vec<(BlockId, &[u8])> =
             payloads.into_iter().map(|p| (BlockId::of(p), p)).collect();
         let ids: Vec<BlockId> = prepared.iter().map(|(id, _)| *id).collect();
 
-        let mut segs = self.segments.write().unwrap();
+        // Writers serialize on the tail; readers are untouched by this lock.
+        let mut tail = self.append.lock().unwrap();
+        let mut active = {
+            let files = self.files.read().unwrap();
+            (files.len() as u32 - 1, Arc::clone(files.last().unwrap()))
+        };
         let mut staged: Vec<(BlockId, Location)> = Vec::new();
         let mut dirty = false;
 
         for (id, payload) in &prepared {
-            // Check under the write lock; also skips duplicates staged
-            // earlier in this same batch once they land in the index below.
+            // The append lock is held, so the index check is race-free with
+            // other writers; `staged` covers duplicates within this batch.
             if self.index.read().unwrap().contains_key(id)
                 || staged.iter().any(|(sid, _)| sid == id)
             {
@@ -118,38 +128,45 @@ impl<B: IoBackend> BlockStore<B> {
             }
             let record = segment::encode_record(id, payload);
 
-            if segs.tail + record.len() as u64 > SEGMENT_ROLL_BYTES && segs.tail > 0 {
-                // Seal the old segment before rolling. (`dirty` stays set:
-                // a write to the new segment follows immediately.)
+            if *tail + record.len() as u64 > SEGMENT_ROLL_BYTES && *tail > 0 {
+                // Seal the old segment, then roll. The files write lock is
+                // held only for the push, never across disk I/O.
                 if dirty {
-                    segs.files.last().unwrap().sync()?;
+                    active.1.sync()?;
                 }
-                let seg_id = segs.files.len() as u32;
-                segs.files
-                    .push(self.backend.open(&segment_path(&self.dir, seg_id))?);
-                segs.tail = 0;
+                let new_file = {
+                    let mut files = self.files.write().unwrap();
+                    let seg_id = files.len() as u32;
+                    files.push(Arc::new(
+                        self.backend.open(&segment_path(&self.dir, seg_id))?,
+                    ));
+                    (seg_id, Arc::clone(files.last().unwrap()))
+                };
+                active = new_file;
+                *tail = 0;
             }
 
-            let seg_id = (segs.files.len() - 1) as u32;
-            let offset = segs.tail;
-            segs.files.last().unwrap().write_at(&record, offset)?;
+            let offset = *tail;
+            active.1.write_at(&record, offset)?;
             dirty = true;
-            segs.tail += record.len() as u64;
+            *tail += record.len() as u64;
             staged.push((
                 *id,
                 Location {
-                    segment: seg_id,
+                    segment: active.0,
                     offset,
                     payload_len: payload.len() as u64,
                 },
             ));
         }
 
-        // One sync covers every record staged above.
+        // One sync covers every record staged above. Readers keep reading
+        // sealed records throughout: no shared lock is held here.
         if dirty {
-            segs.files.last().unwrap().sync()?;
+            active.1.sync()?;
         }
 
+        // Publish only after the data is durable.
         if !staged.is_empty() {
             let mut index = self.index.write().unwrap();
             for (id, loc) in staged {
@@ -168,12 +185,12 @@ impl<B: IoBackend> BlockStore<B> {
             .get(id)
             .ok_or(Error::BlockNotFound(*id))?;
 
+        // Clone the segment handle under a brief lock, then read with no
+        // lock held: indexed records are immutable, and an in-flight fsync
+        // on the active segment cannot block this path.
+        let file = Arc::clone(&self.files.read().unwrap()[loc.segment as usize]);
         let mut payload = vec![0u8; loc.payload_len as usize];
-        {
-            let segs = self.segments.read().unwrap();
-            let file = &segs.files[loc.segment as usize];
-            file.read_at(&mut payload, loc.offset + HEADER_LEN as u64)?;
-        }
+        file.read_at(&mut payload, loc.offset + HEADER_LEN as u64)?;
 
         if !id.verify(&payload) {
             return Err(Error::Corrupt { id: *id });
@@ -186,16 +203,17 @@ impl<B: IoBackend> BlockStore<B> {
     }
 
     pub fn stats(&self) -> StoreStats {
-        let index = self.index.read().unwrap();
-        let segs = self.segments.read().unwrap();
-        let sealed: u64 = segs.files[..segs.files.len() - 1]
+        let blocks = self.index.read().unwrap().len() as u64;
+        let tail = *self.append.lock().unwrap();
+        let files = self.files.read().unwrap();
+        let sealed: u64 = files[..files.len() - 1]
             .iter()
             .map(|f| f.len().unwrap_or(0))
             .sum();
         StoreStats {
-            blocks: index.len() as u64,
-            segments: segs.files.len() as u32,
-            bytes_on_disk: sealed + segs.tail,
+            blocks,
+            segments: files.len() as u32,
+            bytes_on_disk: sealed + tail,
         }
     }
 }

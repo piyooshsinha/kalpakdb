@@ -88,8 +88,11 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
         let (data, last_applied, membership) = {
             let state = self.state.read().unwrap();
-            let data =
-                serde_json::to_vec(&*state).map_err(|e| StorageIOError::read_state_machine(&e))?;
+            // bincode, not JSON: snapshotting holds the state read lock, so
+            // serialization speed bounds how long writes can stall once the
+            // binding map grows large.
+            let data = bincode::serde::encode_to_vec(&*state, bincode::config::standard())
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
             (data, state.last_applied, state.membership.clone())
         };
 
@@ -162,8 +165,9 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let data = snapshot.into_inner();
-        let new_state: MetadataState = serde_json::from_slice(&data)
-            .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
+        let (new_state, _): (MetadataState, _) =
+            bincode::serde::decode_from_slice(&data, bincode::config::standard())
+                .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
         *self.state.write().unwrap() = new_state;
         *self.snapshot.write().unwrap() = Some((meta.clone(), data));
         Ok(())

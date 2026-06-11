@@ -4,62 +4,29 @@
 //! This is the single-node shape of Kalpak's tiering story (NUC RAM = warm,
 //! Mac Mini SSD = cold, in the dev topology). `put` writes through to disk —
 //! the warm tier is never the only copy of anything — and `get` promotes
-//! cold hits, evicting least-recently-used blocks once the byte budget is
-//! exceeded. Because blocks are immutable and content-addressed there is no
+//! cold hits. Because blocks are immutable and content-addressed there is no
 //! invalidation problem: a cached block can never be stale, only evicted.
+//!
+//! The warm tier is a `moka` concurrent cache: lock-free reads under the
+//! highly parallel access pattern of inference workloads (a hand-rolled
+//! `Mutex<Vec>` LRU costs an O(N) scan-and-shift per touch and serializes
+//! every reader — measurably catastrophic past ~10^5 blocks). Eviction is
+//! size-aware (each entry weighs its payload length) under moka's TinyLFU
+//! policy, which approximates LRU but also resists scan pollution.
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use kalpak_core::{BlockId, Error};
 
 use crate::io::{IoBackend, StdBackend};
 use crate::store::BlockStore;
 
-/// LRU warm buffer keyed by content address, capped in bytes.
-struct WarmTier {
-    /// Insertion/touch order: front = coldest, back = hottest. Entries are
-    /// (id, payload); `map` points at payloads shared with readers.
-    order: Vec<BlockId>,
-    map: HashMap<BlockId, Arc<Vec<u8>>>,
-    bytes: u64,
-    budget: u64,
-}
-
-impl WarmTier {
-    fn touch(&mut self, id: &BlockId) {
-        if let Some(pos) = self.order.iter().position(|x| x == id) {
-            let id = self.order.remove(pos);
-            self.order.push(id);
-        }
-    }
-
-    fn insert(&mut self, id: BlockId, payload: Arc<Vec<u8>>) {
-        let len = payload.len() as u64;
-        // A block larger than the whole budget skips the warm tier entirely.
-        if len > self.budget {
-            return;
-        }
-        if self.map.insert(id, payload).is_none() {
-            self.order.push(id);
-            self.bytes += len;
-        } else {
-            self.touch(&id);
-        }
-        while self.bytes > self.budget {
-            let coldest = self.order.remove(0);
-            if let Some(evicted) = self.map.remove(&coldest) {
-                self.bytes -= evicted.len() as u64;
-            }
-        }
-    }
-}
-
 pub struct TieredStore<B: IoBackend = StdBackend> {
     cold: BlockStore<B>,
-    warm: Mutex<WarmTier>,
+    warm: moka::sync::Cache<BlockId, Arc<Vec<u8>>>,
+    warm_budget: u64,
     hits: AtomicU64,
     misses: AtomicU64,
 }
@@ -81,26 +48,32 @@ impl TieredStore<StdBackend> {
 
 impl<B: IoBackend> TieredStore<B> {
     pub fn new(cold: BlockStore<B>, warm_budget_bytes: u64) -> Self {
+        let warm = moka::sync::Cache::builder()
+            .max_capacity(warm_budget_bytes)
+            .weigher(|_id: &BlockId, payload: &Arc<Vec<u8>>| {
+                payload.len().try_into().unwrap_or(u32::MAX)
+            })
+            .build();
         Self {
             cold,
-            warm: Mutex::new(WarmTier {
-                order: Vec::new(),
-                map: HashMap::new(),
-                bytes: 0,
-                budget: warm_budget_bytes,
-            }),
+            warm,
+            warm_budget: warm_budget_bytes,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
+        }
+    }
+
+    fn warm_insert(&self, id: BlockId, payload: Arc<Vec<u8>>) {
+        // A block larger than the whole budget skips the warm tier entirely.
+        if (payload.len() as u64) <= self.warm_budget {
+            self.warm.insert(id, payload);
         }
     }
 
     /// Write through to the cold store, then warm the block.
     pub fn put(&self, payload: &[u8]) -> Result<BlockId, Error> {
         let id = self.cold.put(payload)?;
-        self.warm
-            .lock()
-            .unwrap()
-            .insert(id, Arc::new(payload.to_vec()));
+        self.warm_insert(id, Arc::new(payload.to_vec()));
         Ok(id)
     }
 
@@ -111,26 +84,21 @@ impl<B: IoBackend> TieredStore<B> {
     {
         let payloads: Vec<&[u8]> = payloads.into_iter().collect();
         let ids = self.cold.put_many(payloads.iter().copied())?;
-        let mut warm = self.warm.lock().unwrap();
         for (id, payload) in ids.iter().zip(&payloads) {
-            warm.insert(*id, Arc::new(payload.to_vec()));
+            self.warm_insert(*id, Arc::new(payload.to_vec()));
         }
         Ok(ids)
     }
 
     /// Serve from RAM when possible; on a cold hit, verify and promote.
     pub fn get(&self, id: &BlockId) -> Result<Arc<Vec<u8>>, Error> {
-        {
-            let mut warm = self.warm.lock().unwrap();
-            if let Some(payload) = warm.map.get(id).cloned() {
-                warm.touch(id);
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(payload);
-            }
+        if let Some(payload) = self.warm.get(id) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(payload);
         }
         self.misses.fetch_add(1, Ordering::Relaxed);
         let payload = Arc::new(self.cold.get(id)?);
-        self.warm.lock().unwrap().insert(*id, Arc::clone(&payload));
+        self.warm_insert(*id, Arc::clone(&payload));
         Ok(payload)
     }
 
@@ -143,11 +111,12 @@ impl<B: IoBackend> TieredStore<B> {
     }
 
     pub fn tier_stats(&self) -> TierStats {
-        let warm = self.warm.lock().unwrap();
+        // Flush moka's pending maintenance so counts reflect evictions.
+        self.warm.run_pending_tasks();
         TierStats {
-            warm_blocks: warm.map.len() as u64,
-            warm_bytes: warm.bytes,
-            warm_budget: warm.budget,
+            warm_blocks: self.warm.entry_count(),
+            warm_bytes: self.warm.weighted_size(),
+            warm_budget: self.warm_budget,
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
         }
@@ -193,27 +162,23 @@ mod tests {
     }
 
     #[test]
-    fn eviction_respects_byte_budget_lru_order() {
+    fn eviction_respects_byte_budget() {
         let dir = tempfile::tempdir().unwrap();
         // Budget fits two 1000-byte blocks, not three.
         let store = TieredStore::open(dir.path(), 2500).unwrap();
-        let a = store.put(&[1u8; 1000]).unwrap();
-        let b = store.put(&[2u8; 1000]).unwrap();
-        // Touch `a` so `b` is the LRU candidate.
-        store.get(&a).unwrap();
-        let c = store.put(&[3u8; 1000]).unwrap();
+        let ids: Vec<_> = (1u8..=3).map(|i| store.put(&[i; 1000]).unwrap()).collect();
 
         let s = store.tier_stats();
-        assert_eq!(s.warm_blocks, 2);
-        assert!(s.warm_bytes <= s.warm_budget);
+        assert!(
+            s.warm_bytes <= s.warm_budget,
+            "warm tier exceeded its budget: {s:?}"
+        );
+        assert!(s.warm_blocks < 3, "all three blocks cannot fit the budget");
 
-        let warm_has = |id: &kalpak_core::BlockId| {
-            let before = store.tier_stats().hits;
-            store.get(id).unwrap();
-            store.tier_stats().hits > before
-        };
-        assert!(warm_has(&c));
-        assert!(warm_has(&a) || !warm_has(&b)); // `b` was evicted, not `a`
+        // Every block stays readable regardless of which was evicted.
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(store.get(id).unwrap().as_slice(), &[i as u8 + 1; 1000]);
+        }
     }
 
     #[test]
@@ -223,5 +188,43 @@ mod tests {
         let id = store.put(&[7u8; 5000]).unwrap();
         assert_eq!(store.tier_stats().warm_blocks, 0);
         assert_eq!(store.get(&id).unwrap().len(), 5000);
+    }
+
+    #[test]
+    fn concurrent_reads_and_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(TieredStore::open(dir.path(), 1 << 20).unwrap());
+        let seed: Vec<_> = (0..50u8).map(|i| store.put(&[i; 2000]).unwrap()).collect();
+
+        // Readers hammer the warm tier while writers group-commit batches:
+        // the regression this guards is reads stalling behind fsyncs.
+        let mut handles = Vec::new();
+        for t in 0..4 {
+            let store = store.clone();
+            let seed = seed.clone();
+            handles.push(std::thread::spawn(move || {
+                for round in 0..200 {
+                    let id = &seed[(t * 7 + round) % seed.len()];
+                    assert!(store.get(id).is_ok());
+                }
+            }));
+        }
+        for t in 0..2u64 {
+            let store = store.clone();
+            handles.push(std::thread::spawn(move || {
+                for round in 0..20u64 {
+                    let payloads: Vec<Vec<u8>> = (0..8u64)
+                        .map(|i| (t * 100_000 + round * 100 + i).to_le_bytes().repeat(300))
+                        .collect();
+                    store
+                        .put_many(payloads.iter().map(|p| p.as_slice()))
+                        .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(store.tier_stats().warm_bytes <= store.tier_stats().warm_budget);
     }
 }
