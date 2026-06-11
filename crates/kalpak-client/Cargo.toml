@@ -15,6 +15,14 @@ reqwest = { version = "0.12", default-features = false, features = ["json"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+kalpak-proto = { path = "../kalpak-proto", optional = true }
+tonic = { version = "0.14", optional = true }
+tokio-stream = { version = "0.1", optional = true }
+
+[features]
+# gRPC streaming data plane client (chunked block streams, group-committed
+# server side). Off by default to keep the HTTP-only SDK dependency-light.
+grpc = ["dep:kalpak-proto", "dep:tonic", "dep:tokio-stream"]
 
 [dev-dependencies]
 kalpakdb = { path = "../kalpakdb" }

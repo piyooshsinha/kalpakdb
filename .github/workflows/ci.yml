@@ -49,6 +49,14 @@ jobs:
       - name: Test io_uring backend (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: cargo test -p kalpak-storage --features uring
+      - name: Test gRPC SDK client
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test -p kalpak-client --features grpc
+      - name: Bench (regression visibility, not a gate)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cargo build --release -p kalpakdb
+          ./target/release/kalpakdb bench /tmp --blocks 500 --size-kb 64
       - name: Build node for Python client tests
         if: matrix.os == 'ubuntu-latest'
         run: cargo build -p kalpakdb

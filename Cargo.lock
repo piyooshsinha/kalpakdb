@@ -1161,6 +1161,7 @@ version = "0.2.0"
 dependencies = [
  "ed25519-dalek",
  "kalpak-core",
+ "kalpak-proto",
  "kalpakdb",
  "reqwest 0.12.28",
  "serde",
@@ -1168,6 +1169,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
+ "tonic",
 ]
 
 [[package]]

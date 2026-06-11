@@ -223,3 +223,97 @@ impl KalpakClient {
         Ok(Self::check(resp).await?.json().await?)
     }
 }
+
+/// gRPC streaming client for the data plane (`--features grpc`).
+///
+/// Use this instead of the HTTP block endpoints when moving large KV
+/// tensors: blocks stream in fixed-size chunks (so a tensor larger than any
+/// single message never materializes as one frame) and the server commits
+/// the whole stream under a single fsync. Metadata operations (register,
+/// bind, lookup) stay on [`KalpakClient`] — the two-phase write: stream
+/// blocks here first, then bind the returned ids through consensus.
+#[cfg(feature = "grpc")]
+pub mod grpc {
+    use kalpak_core::BlockId;
+    use kalpak_proto::v1::block_service_client::BlockServiceClient;
+    use kalpak_proto::v1::{GetBlockRequest, PutBlockChunk};
+
+    use crate::ClientError;
+
+    /// Chunk size for outbound block streams.
+    const CHUNK_BYTES: usize = 1024 * 1024;
+
+    pub struct KalpakGrpcClient {
+        inner: BlockServiceClient<tonic::transport::Channel>,
+    }
+
+    impl From<tonic::Status> for ClientError {
+        fn from(s: tonic::Status) -> Self {
+            ClientError::Server {
+                status: s.code() as u16,
+                message: s.message().to_string(),
+            }
+        }
+    }
+
+    impl KalpakGrpcClient {
+        /// Connect to a node's gRPC data plane (`kalpakdb serve --grpc-addr`).
+        pub async fn connect(endpoint: impl Into<String>) -> Result<Self, ClientError> {
+            let inner = BlockServiceClient::connect(endpoint.into())
+                .await
+                .map_err(|e| ClientError::Decode(format!("grpc connect: {e}")))?;
+            Ok(Self { inner })
+        }
+
+        /// Stream a batch of blocks; the server group-commits the whole
+        /// stream under one fsync. Returns content ids in input order.
+        pub async fn put_blocks(
+            &mut self,
+            payloads: &[Vec<u8>],
+        ) -> Result<Vec<BlockId>, ClientError> {
+            let mut chunks = Vec::new();
+            for payload in payloads {
+                if payload.is_empty() {
+                    chunks.push(PutBlockChunk {
+                        data: Default::default(),
+                        last_chunk: true,
+                    });
+                    continue;
+                }
+                let mut pieces = payload.chunks(CHUNK_BYTES).peekable();
+                while let Some(piece) = pieces.next() {
+                    chunks.push(PutBlockChunk {
+                        data: piece.to_vec().into(),
+                        last_chunk: pieces.peek().is_none(),
+                    });
+                }
+            }
+            let resp = self
+                .inner
+                .put_blocks(tokio_stream::iter(chunks))
+                .await?
+                .into_inner();
+            resp.ids
+                .into_iter()
+                .map(|id| id.parse().map_err(|_| ClientError::Decode(id.clone())))
+                .collect()
+        }
+
+        /// Stream a block back, reassembling its chunks.
+        pub async fn get_block(&mut self, id: &BlockId) -> Result<Vec<u8>, ClientError> {
+            let mut stream = self
+                .inner
+                .get_block(GetBlockRequest { id: id.to_string() })
+                .await?
+                .into_inner();
+            let mut out = Vec::new();
+            while let Some(chunk) = stream.message().await? {
+                out.extend_from_slice(&chunk.data);
+                if chunk.last_chunk {
+                    break;
+                }
+            }
+            Ok(out)
+        }
+    }
+}
