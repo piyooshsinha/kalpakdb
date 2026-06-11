@@ -1157,7 +1157,7 @@ dependencies = [
 
 [[package]]
 name = "kalpak-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ed25519-dalek",
  "kalpak-core",
@@ -1172,7 +1172,7 @@ dependencies = [
 
 [[package]]
 name = "kalpak-control"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bincode",
  "ed25519-dalek",
@@ -1188,7 +1188,7 @@ dependencies = [
 
 [[package]]
 name = "kalpak-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "ed25519-dalek",
@@ -1200,7 +1200,7 @@ dependencies = [
 
 [[package]]
 name = "kalpak-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "prost",
@@ -1211,7 +1211,7 @@ dependencies = [
 
 [[package]]
 name = "kalpak-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "io-uring",
@@ -1226,7 +1226,7 @@ dependencies = [
 
 [[package]]
 name = "kalpakdb"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "bytes",
