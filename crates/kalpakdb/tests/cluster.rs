@@ -21,6 +21,7 @@ async fn spawn_node(node_id: u64, port: u16, dir: &std::path::Path) -> String {
         node_id,
         bootstrap: false,
         grpc_addr: None,
+        compact_secs: 0,
     };
     tokio::spawn(async move {
         if let Err(e) = serve(opts).await {

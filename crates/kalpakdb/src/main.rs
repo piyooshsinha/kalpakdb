@@ -1,6 +1,6 @@
 //! Kalpak node CLI.
 //!
-//!   kalpakdb serve <data-dir> [--addr 127.0.0.1:7411] [--warm-mb 256] [--node-id 1] [--join]
+//!   kalpakdb serve <data-dir> [--addr 127.0.0.1:7411] [--warm-mb 256] [--node-id 1] [--join] [--compact-secs 3600]
 //!   kalpakdb witness <data-dir> [--addr ...] [--node-id N]   (consensus-only voter)
 //!   kalpakdb bench <data-dir> [--blocks 2000] [--size-kb 64]
 //!   kalpakdb put <data-dir>            reads payload from stdin, prints id
@@ -36,6 +36,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 node_id: 1,
                 bootstrap: cmd == "serve",
                 grpc_addr: None,
+                compact_secs: 3600,
             };
             let mut it = rest.iter();
             while let Some(flag) = it.next() {
@@ -51,6 +52,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "--join" => opts.bootstrap = false,
                     "--grpc-addr" => {
                         opts.grpc_addr = Some(it.next().ok_or("--grpc-addr needs a value")?.clone())
+                    }
+                    "--compact-secs" => {
+                        opts.compact_secs =
+                            it.next().ok_or("--compact-secs needs a value")?.parse()?
                     }
                     other => return Err(format!("unknown flag: {other}").into()),
                 }
@@ -126,7 +131,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => {
             eprintln!(
-                "usage:\n  kalpakdb serve <data-dir> [--addr 127.0.0.1:7411] [--warm-mb 256] [--node-id 1] [--join]\n  kalpakdb witness <data-dir> [--addr ...] [--node-id N]   (consensus-only voter)\n  kalpakdb bench <data-dir> [--blocks 2000] [--size-kb 64]\n  kalpakdb put <data-dir>            (payload on stdin)\n  kalpakdb get <data-dir> <block-id>\n  kalpakdb stat <data-dir>"
+                "usage:\n  kalpakdb serve <data-dir> [--addr 127.0.0.1:7411] [--warm-mb 256] [--node-id 1] [--join] [--compact-secs 3600]\n  kalpakdb witness <data-dir> [--addr ...] [--node-id N]   (consensus-only voter)\n  kalpakdb bench <data-dir> [--blocks 2000] [--size-kb 64]\n  kalpakdb put <data-dir>            (payload on stdin)\n  kalpakdb get <data-dir> <block-id>\n  kalpakdb stat <data-dir>"
             );
             Err("invalid arguments".into())
         }

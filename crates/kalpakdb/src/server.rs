@@ -39,6 +39,9 @@ pub struct ServeOpts {
     pub bootstrap: bool,
     /// Bind address for the gRPC streaming data plane (None disables it).
     pub grpc_addr: Option<String>,
+    /// Run GC automatically every N seconds (0 disables; the
+    /// `/v1/admin/compact` endpoint always works).
+    pub compact_secs: u64,
 }
 
 async fn boot_control(opts: &ServeOpts) -> Result<Arc<ControlPlane>, Box<dyn std::error::Error>> {
@@ -63,6 +66,33 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
         control,
         http: reqwest::Client::new(),
     });
+
+    if opts.compact_secs > 0 {
+        let state = state.clone();
+        let every = std::time::Duration::from_secs(opts.compact_secs);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.tick().await; // first tick fires immediately; skip it
+            loop {
+                tick.tick().await;
+                let live = state.control.bound_blocks();
+                let store_state = state.clone();
+                let swept = tokio::task::spawn_blocking(move || {
+                    store_state.store.compact(|id| live.contains(id))
+                })
+                .await;
+                match swept {
+                    Ok(Ok(st)) if st.blocks_dropped > 0 => eprintln!(
+                        "kalpakdb: gc reclaimed {} bytes ({} blocks, {} segments)",
+                        st.bytes_reclaimed, st.blocks_dropped, st.segments_rewritten
+                    ),
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => eprintln!("kalpakdb: gc failed: {e}"),
+                    Err(e) => eprintln!("kalpakdb: gc task panicked: {e}"),
+                }
+            }
+        });
+    }
 
     if let Some(grpc_addr) = &opts.grpc_addr {
         let svc = crate::grpc::service(state.clone());
