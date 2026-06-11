@@ -31,6 +31,21 @@ pub trait SegmentFile: Send + Sync {
 
     /// Durably flush data to the device.
     fn sync(&self) -> Result<()>;
+
+    /// Write a batch of records and (optionally) flush, as one operation.
+    ///
+    /// The group-commit hot path. The default implementation loops
+    /// `write_at` + `sync`; the io_uring backend overrides it to submit
+    /// every write plus a drain-ordered fsync in a single ring submission.
+    fn write_batch(&self, writes: &[(u64, &[u8])], sync_after: bool) -> Result<()> {
+        for (offset, buf) in writes {
+            self.write_at(buf, *offset)?;
+        }
+        if sync_after {
+            self.sync()?;
+        }
+        Ok(())
+    }
 }
 
 /// Portable backend: positioned reads/writes via the OS page cache.

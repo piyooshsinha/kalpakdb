@@ -15,6 +15,8 @@ mod manifest;
 mod segment;
 mod store;
 mod tiered;
+#[cfg(all(target_os = "linux", feature = "uring"))]
+pub mod uring;
 
 pub use manifest::PrefixManifest;
 pub use store::{BlockStore, CompactStats, StoreStats};

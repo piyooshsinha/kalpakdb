@@ -132,7 +132,9 @@ impl<B: IoBackend> BlockStore<B> {
             (files.len() as u32 - 1, Arc::clone(files.last().unwrap()))
         };
         let mut staged: Vec<(BlockId, Location)> = Vec::new();
-        let mut dirty = false;
+        // Records staged for the current active file, flushed as one
+        // batched submission (a single ring round on the uring backend).
+        let mut pending: Vec<(u64, Vec<u8>)> = Vec::new();
 
         for (id, payload) in &prepared {
             // The append lock is held, so the index check is race-free with
@@ -145,11 +147,10 @@ impl<B: IoBackend> BlockStore<B> {
             let record = segment::encode_record(id, payload);
 
             if *tail + record.len() as u64 > self.roll_bytes && *tail > 0 {
-                // Seal the old segment, then roll. The files write lock is
-                // held only for the push, never across disk I/O.
-                if dirty {
-                    active.1.sync()?;
-                }
+                // Seal the old segment (flush its pending batch), then
+                // roll. The files write lock is held only for the push,
+                // never across disk I/O.
+                flush_pending(active.1.as_ref(), &mut pending, true)?;
                 let new_file = {
                     let mut files = self.files.write().unwrap();
                     let seg_id = files.len() as u32;
@@ -163,9 +164,8 @@ impl<B: IoBackend> BlockStore<B> {
             }
 
             let offset = *tail;
-            active.1.write_at(&record, offset)?;
-            dirty = true;
             *tail += record.len() as u64;
+            pending.push((offset, record));
             staged.push((
                 *id,
                 Location {
@@ -176,11 +176,10 @@ impl<B: IoBackend> BlockStore<B> {
             ));
         }
 
-        // One sync covers every record staged above. Readers keep reading
-        // sealed records throughout: no shared lock is held here.
-        if dirty {
-            active.1.sync()?;
-        }
+        // One batched write + sync covers every record staged above.
+        // Readers keep reading sealed records throughout: no shared lock
+        // is held here.
+        flush_pending(active.1.as_ref(), &mut pending, true)?;
 
         // Publish only after the data is durable.
         if !staged.is_empty() {
@@ -323,6 +322,21 @@ impl<B: IoBackend> BlockStore<B> {
             bytes_on_disk: sealed + tail,
         }
     }
+}
+
+/// Write the staged records as one batch (one ring submission on uring).
+fn flush_pending<F: SegmentFile>(
+    file: &F,
+    pending: &mut Vec<(u64, Vec<u8>)>,
+    sync_after: bool,
+) -> Result<(), Error> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let writes: Vec<(u64, &[u8])> = pending.iter().map(|(o, b)| (*o, b.as_slice())).collect();
+    file.write_batch(&writes, sync_after)?;
+    pending.clear();
+    Ok(())
 }
 
 /// Explicitly close a segment handle before renaming over its path.

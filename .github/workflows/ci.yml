@@ -46,3 +46,6 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Test io_uring backend (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test -p kalpak-storage --features uring

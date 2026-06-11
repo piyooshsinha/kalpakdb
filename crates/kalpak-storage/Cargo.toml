@@ -20,7 +20,12 @@ moka = { version = "0.12.15", features = ["sync"] }
 [dev-dependencies]
 tempfile.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.7", optional = true }
+libc = { version = "0.2", optional = true }
+
 [features]
-# Linux-only io_uring backend (Phase 1.5). The default backend uses portable
-# positioned I/O so the engine runs on macOS dev machines too.
-uring = []
+# Linux-only io_uring backend: batched submission for group commits (all of
+# a batch's writes + the fsync go through one ring submission). The default
+# backend uses portable positioned I/O so the engine runs everywhere.
+uring = ["dep:io-uring", "dep:libc"]
