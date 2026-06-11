@@ -37,8 +37,12 @@ payload, zero-padded to 4 KiB
   positioned reads/writes (runs on the macOS dev node). The Linux
   `io_uring` backend (`--features uring`) batches the group-commit path:
   a put_many's N writes + drain-ordered fsync go through one ring
-  submission instead of N+1 syscalls. `O_DIRECT` is next (needs an
-  aligned buffer pool; record offsets are already 4 KiB-aligned).
+  submission instead of N+1 syscalls, and segment files open with
+  `O_DIRECT` (page-cache bypass — the moka warm tier IS the cache, so
+  kernel double-caching is pure thrash). Contiguous batch writes
+  coalesce into single aligned submissions; sub-record reads go through
+  an aligned window; filesystems without `O_DIRECT` (tmpfs) fall back
+  transparently.
 - Segments roll at 256 MiB; sealed segments are immutable, which is the unit
   for future tiering, replication, and compaction. Batched appends +
   log-structured layout keep write amplification (SSD wear) low.
@@ -81,9 +85,9 @@ WebSocket — the database core is engine + protocol + SDK.
 
 1. **Storage engine (now)** — local block store ✅, prefix-chain manifest
    (CacheKey → block list) ✅, two-tier store (RAM warm buffer / SSD cold
-   store, write-through LRU) ✅, `io_uring` batched-submission backend ✅
-   (Linux, `--features uring`, CI-tested); then: `O_DIRECT` with an
-   aligned buffer pool, cross-node tiering, importance-aware placement
+   store, write-through LRU) ✅, `io_uring` batched-submission backend
+   with `O_DIRECT` page-cache bypass ✅ (Linux, `--features uring`,
+   CI-tested); then: cross-node tiering, importance-aware placement
    (IMPRESS-style).
 2. **Consensus** — `openraft` state machine for agent metadata and cache-key
    bindings ✅, durable Raft log ✅, multi-node HTTP transport with dynamic
