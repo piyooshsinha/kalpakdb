@@ -226,6 +226,38 @@ impl ControlPlane {
         self.sm.state.read().unwrap().bindings.len()
     }
 
+    /// All registered agents with their records.
+    pub fn agents_list(&self) -> Vec<(AgentId, AgentRecord)> {
+        let state = self.sm.state.read().unwrap();
+        let mut v: Vec<_> = state
+            .agents
+            .iter()
+            .map(|(id, r)| (*id, r.clone()))
+            .collect();
+        v.sort_by_key(|(_, r)| r.registered_at);
+        v
+    }
+
+    /// All bindings owned by `agent`: (serialized cache key, blocks).
+    pub fn bindings_of(&self, agent: &AgentId) -> Vec<(String, Vec<BlockId>)> {
+        let state = self.sm.state.read().unwrap();
+        state
+            .bindings
+            .iter()
+            .filter(|(_, rec)| rec.agent == *agent)
+            .map(|(k, rec)| (k.clone(), rec.blocks.clone()))
+            .collect()
+    }
+
+    /// Per-follower replicated log position (leader only): the lag view.
+    pub fn replication_state(&self) -> Option<std::collections::BTreeMap<NodeId, Option<u64>>> {
+        self.metrics().replication.map(|m| {
+            m.into_iter()
+                .map(|(id, log)| (id, log.map(|l| l.index)))
+                .collect()
+        })
+    }
+
     /// Every block referenced by any binding: the GC live set.
     pub fn bound_blocks(&self) -> std::collections::HashSet<BlockId> {
         self.sm

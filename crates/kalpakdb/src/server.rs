@@ -25,6 +25,20 @@ pub struct AppState {
     pub control: Arc<ControlPlane>,
     /// Client for node-to-node calls (leader forwarding, peer block fetch).
     pub http: reqwest::Client,
+    /// Cumulative GC telemetry (manual + scheduled compactions).
+    pub gc_runs: std::sync::atomic::AtomicU64,
+    pub gc_blocks_dropped: std::sync::atomic::AtomicU64,
+    pub gc_bytes_reclaimed: std::sync::atomic::AtomicU64,
+}
+
+impl AppState {
+    fn record_gc(&self, st: &kalpak_storage::CompactStats) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.gc_runs.fetch_add(1, Relaxed);
+        self.gc_blocks_dropped.fetch_add(st.blocks_dropped, Relaxed);
+        self.gc_bytes_reclaimed
+            .fetch_add(st.bytes_reclaimed, Relaxed);
+    }
 }
 
 type Shared = Arc<AppState>;
@@ -65,6 +79,9 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
         store,
         control,
         http: reqwest::Client::new(),
+        gc_runs: Default::default(),
+        gc_blocks_dropped: Default::default(),
+        gc_bytes_reclaimed: Default::default(),
     });
 
     if opts.compact_secs > 0 {
@@ -82,11 +99,14 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .await;
                 match swept {
-                    Ok(Ok(st)) if st.blocks_dropped > 0 => eprintln!(
-                        "kalpakdb: gc reclaimed {} bytes ({} blocks, {} segments)",
-                        st.bytes_reclaimed, st.blocks_dropped, st.segments_rewritten
-                    ),
-                    Ok(Ok(_)) => {}
+                    Ok(Ok(st)) if st.blocks_dropped > 0 => {
+                        state.record_gc(&st);
+                        eprintln!(
+                            "kalpakdb: gc reclaimed {} bytes ({} blocks, {} segments)",
+                            st.bytes_reclaimed, st.blocks_dropped, st.segments_rewritten
+                        )
+                    }
+                    Ok(Ok(st)) => state.record_gc(&st),
                     Ok(Err(e)) => eprintln!("kalpakdb: gc failed: {e}"),
                     Err(e) => eprintln!("kalpakdb: gc task panicked: {e}"),
                 }
@@ -158,6 +178,8 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/stats", get(stats))
         .route("/v1/ws", get(ws_stats))
         .route("/v1/admin/compact", post(admin_compact))
+        .route("/v1/agents/list", get(list_agents))
+        .route("/v1/agents/{id}/bindings", get(agent_bindings))
         .with_state(state)
         .merge(raft)
         .layer(CorsLayer::permissive())
@@ -577,11 +599,53 @@ async fn admin_compact(State(s): State<Shared>) -> Result<Json<serde_json::Value
     let stats = tokio::task::spawn_blocking(move || state.store.compact(|id| live.contains(id)))
         .await
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    s.record_gc(&stats);
     Ok(Json(json!({
         "segments_rewritten": stats.segments_rewritten,
         "blocks_dropped": stats.blocks_dropped,
         "bytes_reclaimed": stats.bytes_reclaimed,
     })))
+}
+
+/// The "mind explorer" listing: every registered agent, oldest first.
+async fn list_agents(State(s): State<Shared>) -> Json<serde_json::Value> {
+    let agents: Vec<_> = s
+        .control
+        .agents_list()
+        .into_iter()
+        .map(|(id, rec)| {
+            json!({
+                "agent": id.to_string(),
+                "display_name": rec.display_name,
+                "registered_at": rec.registered_at,
+                "bindings": s.control.bindings_of(&id).len(),
+            })
+        })
+        .collect();
+    Json(json!({ "agents": agents }))
+}
+
+/// Audit one agent's memory: which prefix keys it bound to which blocks.
+async fn agent_bindings(
+    State(s): State<Shared>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let agent: AgentId = id.parse()?;
+    let bindings: Vec<_> = s
+        .control
+        .bindings_of(&agent)
+        .into_iter()
+        .map(|(key, blocks)| {
+            json!({
+                "key": serde_json::from_str::<serde_json::Value>(&key)
+                    .unwrap_or(serde_json::Value::String(key)),
+                "blocks": blocks.iter().map(|b| b.to_string()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Ok(Json(
+        json!({ "agent": agent.to_string(), "bindings": bindings }),
+    ))
 }
 
 fn stats_payload(s: &AppState) -> serde_json::Value {
@@ -608,6 +672,12 @@ fn stats_payload(s: &AppState) -> serde_json::Value {
             "agents": s.control.agent_count(),
             "bindings": s.control.binding_count(),
             "peers": s.control.peer_addrs(),
+            "replication": s.control.replication_state(),
+        },
+        "gc": {
+            "runs": s.gc_runs.load(std::sync::atomic::Ordering::Relaxed),
+            "blocks_dropped": s.gc_blocks_dropped.load(std::sync::atomic::Ordering::Relaxed),
+            "bytes_reclaimed": s.gc_bytes_reclaimed.load(std::sync::atomic::Ordering::Relaxed),
         },
     })
 }
