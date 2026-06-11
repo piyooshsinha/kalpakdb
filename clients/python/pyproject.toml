@@ -1,0 +1,18 @@
+[project]
+name = "kalpakdb"
+version = "0.2.0"
+description = "Python client for KalpakDB: content-addressed, Raft-replicated state for AI agents"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+keywords = ["database", "ai-agents", "kv-cache", "raft"]
+
+[project.urls]
+Repository = "https://github.com/piyooshsinha/kalpakdb"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["kalpakdb*"]

@@ -49,3 +49,9 @@ jobs:
       - name: Test io_uring backend (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: cargo test -p kalpak-storage --features uring
+      - name: Build node for Python client tests
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo build -p kalpakdb
+      - name: Python client tests
+        if: matrix.os == 'ubuntu-latest'
+        run: KALPAKDB_BIN=$PWD/target/debug/kalpakdb python3 -m unittest discover -s clients/python/tests

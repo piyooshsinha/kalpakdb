@@ -173,6 +173,7 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/blocks/batch", post(put_blocks_batch))
         .route("/v1/blocks/{id}", get(get_block))
         .route("/v1/agents", post(register_agent))
+        .route("/v1/keys", post(make_key))
         .route("/v1/manifest/bind", post(bind_prefix))
         .route("/v1/manifest/lookup", post(lookup_prefix))
         .route("/v1/stats", get(stats))
@@ -465,6 +466,24 @@ async fn bind_prefix(
             forward_to_leader(&s, e, "/v1/manifest/bind", body).await
         }
     }
+}
+
+/// Compute a chained cache key server-side, so thin clients (e.g. the
+/// zero-dependency Python SDK) need no local BLAKE3.
+#[derive(Deserialize)]
+struct MakeKeyReq {
+    fingerprint: kalpak_core::ModelFingerprint,
+    tokens: Vec<u32>,
+    #[serde(default)]
+    parent: Option<CacheKey>,
+}
+
+async fn make_key(Json(req): Json<MakeKeyReq>) -> Json<CacheKey> {
+    let key = match req.parent {
+        Some(parent) => parent.extend(&req.tokens),
+        None => CacheKey::root(req.fingerprint, &req.tokens),
+    };
+    Json(key)
 }
 
 /// Probe a root-first chain of cache keys; returns the deepest bound prefix.

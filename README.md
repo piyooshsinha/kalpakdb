@@ -33,6 +33,7 @@ The name draws on Sanskrit roots that describe exactly what this database is for
 | `kalpakdb` | Node binary: HTTP/WebSocket memory API, cluster management, speculative prefetch, local CLI tools |
 | `kalpak-proto` | gRPC streaming data plane (chunked block streams, group-committed) |
 | `kalpak-client` | Rust SDK for the full agent workflow |
+| `clients/python` | Zero-dependency Python client (same workflow, server-side key hashing) |
 | `dashboard/` | Optional React observability UI (live metrics over WebSocket) |
 
 The three-node replication path is covered by an integration test that forms a real cluster over HTTP (init → learners → voters) and verifies state-machine convergence on every node.
@@ -69,6 +70,17 @@ if let Some(hit) = db.lookup(&[k0.clone(), k1.clone()]).await? {
 // offload the newly computed KV chunk and bind the deeper key
 let id = db.put_block(kv_bytes).await?;
 db.bind_prefix(agent, k1, vec![id]).await?;
+```
+
+### Python
+
+```python
+from kalpakdb import KalpakClient, ModelFingerprint   # clients/python
+
+db = KalpakClient("http://127.0.0.1:7411")
+fp = ModelFingerprint("meta-llama/Llama-3.1-8B", "tok-hash", "fp16/paged-16")
+k0 = db.cache_key(fp, [1, 2, 3])
+hit = db.lookup([k0])
 ```
 
 ### Three-node cluster
