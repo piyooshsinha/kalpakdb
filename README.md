@@ -89,6 +89,20 @@ curl -X POST -H 'content-type: application/json' \
   -d '{"voters":[1,2,3]}' http://10.0.0.1:7411/v1/cluster/promote
 ```
 
+### Docker
+
+```sh
+docker compose up -d        # two data nodes + a witness (see docker-compose.yml
+                            # for the cluster-formation curl commands)
+```
+
+### Runnable example
+
+```sh
+cargo run -p kalpakdb -- serve /tmp/kalpak-demo &
+cargo run -p kalpak-client --example agent_workflow   # run twice: miss, then hit
+```
+
 ### Optional dashboard
 
 KalpakDB is a database — the core is the engine, the wire protocol, and the client SDK. The React dashboard is optional tooling for humans:

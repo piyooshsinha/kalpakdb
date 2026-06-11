@@ -6,6 +6,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+keywords = ["database", "client", "sdk", "ai-agents", "kv-cache"]
+categories = ["database", "api-bindings"]
 
 [dependencies]
 kalpak-core.workspace = true

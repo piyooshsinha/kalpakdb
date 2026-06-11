@@ -6,6 +6,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+keywords = ["database", "ai-agents", "kv-cache", "raft", "distributed"]
+categories = ["database-implementations", "command-line-utilities"]
 
 [dependencies]
 axum = { version = "0.8.9", features = ["ws"] }

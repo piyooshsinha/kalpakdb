@@ -1,0 +1,7 @@
+target
+dashboard/node_modules
+dashboard/dist
+.git
+.github
+docs
+*.md

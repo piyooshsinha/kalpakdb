@@ -9,6 +9,23 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t kalpakdb:ci .
+      - name: Smoke test
+        run: |
+          docker run -d --name kalpak -p 7411:7411 kalpakdb:ci
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:7411/v1/stats && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:7411/v1/stats | grep -q control_plane
+          ID=$(curl -sf -X POST --data-binary "docker smoke" http://127.0.0.1:7411/v1/blocks | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
+          test "$(curl -sf http://127.0.0.1:7411/v1/blocks/$ID)" = "docker smoke"
+
   test:
     strategy:
       matrix:

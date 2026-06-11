@@ -1,0 +1,36 @@
+# Three-node KalpakDB cluster: two data nodes + a consensus-only witness.
+# Start it, then form the cluster:
+#
+#   docker compose up -d
+#   curl -X POST -H 'content-type: application/json' \
+#     -d '{"members":{"1":"node1:7411"}}' http://localhost:7411/v1/cluster/init
+#   curl -X POST -H 'content-type: application/json' \
+#     -d '{"node_id":2,"addr":"node2:7411"}' http://localhost:7411/v1/cluster/add-learner
+#   curl -X POST -H 'content-type: application/json' \
+#     -d '{"node_id":3,"addr":"witness:7411"}' http://localhost:7411/v1/cluster/add-learner
+#   curl -X POST -H 'content-type: application/json' \
+#     -d '{"voters":[1,2,3]}' http://localhost:7411/v1/cluster/promote
+
+services:
+  node1:
+    build: .
+    command: ["serve", "/var/lib/kalpakdb", "--addr", "0.0.0.0:7411", "--node-id", "1", "--join"]
+    ports: ["7411:7411"]
+    volumes: ["node1-data:/var/lib/kalpakdb"]
+
+  node2:
+    build: .
+    command: ["serve", "/var/lib/kalpakdb", "--addr", "0.0.0.0:7411", "--node-id", "2", "--join"]
+    ports: ["7412:7411"]
+    volumes: ["node2-data:/var/lib/kalpakdb"]
+
+  witness:
+    build: .
+    command: ["witness", "/var/lib/kalpakdb", "--addr", "0.0.0.0:7411", "--node-id", "3"]
+    ports: ["7413:7411"]
+    volumes: ["witness-data:/var/lib/kalpakdb"]
+
+volumes:
+  node1-data:
+  node2-data:
+  witness-data:
