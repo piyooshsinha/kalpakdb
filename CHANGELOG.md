@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.3.0 — 2026-06-12
+
+The hardening release: the security and operations gaps between
+"feature-complete" and "deployable" are closed.
+
+### Signed writes
+- `--require-signatures`: every metadata mutation (register, bind,
+  chain-bind) must carry an Ed25519 signature over a canonical binary
+  message, verified against the agent's public key before entering Raft
+- Canonical messages live in `kalpak-core::signing`: raw fixed-width
+  fields (never JSON), domain-separated per operation, byte layout
+  locked by test and reproduced exactly by both SDKs
+- Rust SDK signs via `KalpakClient::with_signer`; Python via the
+  optional `Ed25519Signer` (needs `cryptography`; the SDK stays
+  stdlib-only otherwise)
+- Unsigned/forged/wrong-message mutations get 401; reads stay open;
+  replay of a captured signature only reproduces an idempotent mutation
+
+### TLS
+- `kalpakdb serve|witness --tls-cert/--tls-key` (rustls): client-facing
+  API over HTTPS with no cleartext fallback on a TLS port
+- `kalpakdb cert <dir> [--hosts ...]`: self-signed dev certificates
+- CA-aware SDKs: `with_options(url, signer, ca_pem)` / `cafile=...`
+- Scope: client-facing API; node-to-node mesh stays on the private
+  cluster network (mTLS is future work)
+
+### Monitoring
+- `GET /metrics`: Prometheus text exposition (data plane, warm tier,
+  GC totals, Raft state, agents, bindings), zero new dependencies
+
+
 ## 0.2.0 — 2026-06-12
 
 First feature-complete release: every phase of the original architecture

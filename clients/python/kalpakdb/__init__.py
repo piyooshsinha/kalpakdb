@@ -39,7 +39,7 @@ __all__ = [
     "register_message",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 
 class Ed25519Signer:
