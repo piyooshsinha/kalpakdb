@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.5.0 — 2026-06-12
+
+The operations release: the capabilities that make a database
+trustworthy with data you cannot lose.
+
+### Integrity & recovery
+- `kalpakdb fsck <dir>`: re-read and hash-verify every block; reports
+  all corrupt/unreadable ids (content addressing makes the checksum the
+  identity — there is no separate checksum metadata to also corrupt)
+- Online backup: `GET /v1/admin/backup` streams a crash-consistent tar
+  from a LIVE node (control plane archived before segments + two-phase
+  write ordering = every binding in the backup has its blocks in the
+  backup; no quiescing, no locks). `kalpakdb backup <url> <tar>` and
+  `kalpakdb restore <tar> <dir>` (restore runs fsck automatically)
+
+### Importance-aware placement (IMPRESS-style)
+- The state machine maintains exact per-block binding refcounts
+  (rebind-safe, snapshot-carried); blocks referenced by >= 2 bindings
+  (shared prefixes, common system prompts) are pinned into a dedicated
+  tier (budget = warm/4) that scan floods can never evict
+- Proven: a pinned block survives a 100-block scan flood with zero
+  disk misses
+
+### Integrations & monitoring
+- `integrations/langchain`: conversation memory as prefix chains —
+  cross-session dedup of identical turns, server-side session resume
+  via the replicated prefix tree, Ed25519-attributed and auditable in
+  the memory explorer; dependency-free core + BaseChatMessageHistory shim
+- `docs/grafana-dashboard.json`: importable dashboard over /metrics
+- /metrics and /v1/stats expose the pinned tier
+
+
 ## 0.4.0 — 2026-06-12
 
 The launch-preparation release: the adoption path and the last security

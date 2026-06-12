@@ -14,10 +14,10 @@ axum = { version = "0.8.9", features = ["ws"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 bytes = "1.11.1"
 ed25519-dalek.workspace = true
-kalpak-control = { version = "0.4.0", path = "../kalpak-control" }
+kalpak-control = { version = "0.5.0", path = "../kalpak-control" }
 kalpak-core.workspace = true
-kalpak-proto = { version = "0.4.0", path = "../kalpak-proto" }
-kalpak-storage = { version = "0.4.0", path = "../kalpak-storage" }
+kalpak-proto = { version = "0.5.0", path = "../kalpak-proto" }
+kalpak-storage = { version = "0.5.0", path = "../kalpak-storage" }
 rcgen = "0.14.8"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
