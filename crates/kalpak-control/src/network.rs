@@ -18,9 +18,44 @@ use serde::Serialize;
 
 use crate::types::{NodeId, TypeConfig};
 
-#[derive(Default, Clone)]
+/// Mesh TLS material for mutually-authenticated node-to-node transport.
+#[derive(Clone)]
+pub struct MeshClientTls {
+    /// Cluster CA bundle (PEM).
+    pub ca_pem: Vec<u8>,
+    /// This node's mesh certificate + key (combined PEM), presented as the
+    /// TLS client identity.
+    pub identity_pem: Vec<u8>,
+}
+
+#[derive(Clone)]
 pub struct HttpNetworkFactory {
     client: reqwest::Client,
+    scheme: &'static str,
+}
+
+impl Default for HttpNetworkFactory {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            scheme: "http",
+        }
+    }
+}
+
+impl HttpNetworkFactory {
+    /// A factory that speaks mutually-authenticated HTTPS to peers.
+    pub fn with_mesh_tls(mesh: &MeshClientTls) -> Result<Self, reqwest::Error> {
+        let ca = reqwest::Certificate::from_pem(&mesh.ca_pem)?;
+        let id = reqwest::Identity::from_pem(&mesh.identity_pem)?;
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .add_root_certificate(ca)
+                .identity(id)
+                .build()?,
+            scheme: "https",
+        })
+    }
 }
 
 pub struct HttpNetwork {
@@ -36,7 +71,7 @@ impl RaftNetworkFactory<TypeConfig> for HttpNetworkFactory {
         HttpNetwork {
             client: self.client.clone(),
             target,
-            base: format!("http://{}", node.addr),
+            base: format!("{}://{}", self.scheme, node.addr),
         }
     }
 }

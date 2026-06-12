@@ -30,6 +30,7 @@ async fn lookup_prefetches_child_blocks() {
         require_signatures: false,
         tls_cert: None,
         tls_key: None,
+        mesh: None,
     };
     tokio::spawn(async move {
         let _ = serve(opts).await;

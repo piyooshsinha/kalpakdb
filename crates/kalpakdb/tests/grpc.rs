@@ -21,6 +21,7 @@ async fn grpc_streams_blocks_through_group_commit() {
         require_signatures: false,
         tls_cert: None,
         tls_key: None,
+        mesh: None,
     };
     tokio::spawn(async move {
         let _ = serve(opts).await;

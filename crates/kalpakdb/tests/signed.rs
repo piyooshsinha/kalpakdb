@@ -24,6 +24,7 @@ async fn spawn_node(dir: &std::path::Path) {
         require_signatures: true,
         tls_cert: None,
         tls_key: None,
+        mesh: None,
     };
     tokio::spawn(async move {
         let _ = serve(opts).await;

@@ -85,8 +85,11 @@ WebSocket — the database core is engine + protocol + SDK.
   boundary before entering Raft. Node-to-node forwards skip re-verification
   (ingress already verified), matching the internal trust model. The
   client-facing API serves TLS via `--tls-cert/--tls-key` (rustls;
-  `kalpakdb cert` generates dev certificates); the node-to-node mesh
-  stays on the private cluster network, with mTLS as future work.
+  `kalpakdb cert` generates dev certificates). Node-to-node traffic runs
+  over a dedicated mutual-TLS listener (`--mesh`; `kalpakdb mesh-ca`
+  generates the cluster CA + node certs): a CA-signed certificate IS
+  mesh membership, so internal trust no longer means "can reach the
+  port".
 
 ## Phased roadmap
 
@@ -103,7 +106,8 @@ WebSocket — the database core is engine + protocol + SDK.
    deployment quorum) ✅, network-partition survival ✅ (proxy-based
    isolation in-process: the majority commits through the partition, the
    isolated node's term inflation cannot wedge the heal, no split brain);
-   then: mesh mTLS.
+   mesh mTLS (dedicated mutually-authenticated listener for Raft +
+   replication; cluster-CA membership) ✅.
 3. **Memory API & speculative retrieval** — HTTP/WS endpoints ✅, Rust
    client SDK ✅, lookup-triggered warm-tier prefetch ✅, cross-node block
    fetch with replicate-on-read ✅, proactive block replication on put ✅,

@@ -33,6 +33,7 @@ pub use types::{ChainBinding, NodeId, Request, Response, TypeConfig};
 
 use log_store::LogStore;
 use network::HttpNetworkFactory;
+pub use network::MeshClientTls;
 use state_machine::{binding_key, StateMachineStore};
 
 #[derive(Debug, thiserror::Error)]
@@ -61,6 +62,16 @@ impl ControlPlane {
         node_id: NodeId,
         data_dir: Option<&Path>,
     ) -> Result<Self, ControlError> {
+        Self::start_node_with_mesh(node_id, data_dir, None).await
+    }
+
+    /// Like [`Self::start_node`], with optional mutually-authenticated TLS
+    /// for the node-to-node transport.
+    pub async fn start_node_with_mesh(
+        node_id: NodeId,
+        data_dir: Option<&Path>,
+        mesh: Option<&MeshClientTls>,
+    ) -> Result<Self, ControlError> {
         let config = Config {
             heartbeat_interval: 250,
             election_timeout_min: 500,
@@ -80,15 +91,14 @@ impl ControlPlane {
         };
         let sm = StateMachineStore::default();
 
-        let raft = Raft::new(
-            node_id,
-            config,
-            HttpNetworkFactory::default(),
-            log_store,
-            sm.clone(),
-        )
-        .await
-        .map_err(|e| ControlError::Init(e.to_string()))?;
+        let network = match mesh {
+            Some(m) => HttpNetworkFactory::with_mesh_tls(m)
+                .map_err(|e| ControlError::Init(format!("mesh tls: {e}")))?,
+            None => HttpNetworkFactory::default(),
+        };
+        let raft = Raft::new(node_id, config, network, log_store, sm.clone())
+            .await
+            .map_err(|e| ControlError::Init(e.to_string()))?;
 
         Ok(Self { raft, sm })
     }

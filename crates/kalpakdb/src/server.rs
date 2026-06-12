@@ -23,8 +23,11 @@ use tower_http::cors::CorsLayer;
 pub struct AppState {
     pub store: TieredStore,
     pub control: Arc<ControlPlane>,
-    /// Client for node-to-node calls (leader forwarding, peer block fetch).
+    /// Client for node-to-node calls (leader forwarding, peer block fetch);
+    /// carries the mesh identity when mesh mTLS is enabled.
     pub http: reqwest::Client,
+    /// URL scheme for node-to-node calls ("https" under mesh mTLS).
+    pub peer_scheme: &'static str,
     /// Reject unsigned metadata mutations.
     pub require_signatures: bool,
     /// Cumulative GC telemetry (manual + scheduled compactions).
@@ -66,11 +69,63 @@ pub struct ServeOpts {
     /// with `kalpakdb cert`.
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
+    /// Mutually-authenticated mesh listener for node-to-node traffic.
+    /// When set, cluster membership addresses must point here, and internal
+    /// trust (forwarding, replication) only exists on this listener —
+    /// the public listener strips internal semantics. Generate material
+    /// with `kalpakdb mesh-ca`.
+    pub mesh: Option<MeshOpts>,
+}
+
+#[derive(Clone)]
+pub struct MeshOpts {
+    pub addr: String,
+    pub ca: String,
+    pub cert: String,
+    pub key: String,
+}
+
+impl MeshOpts {
+    fn client_tls(&self) -> Result<kalpak_control::MeshClientTls, Box<dyn std::error::Error>> {
+        let cert = std::fs::read(&self.cert)?;
+        let key = std::fs::read(&self.key)?;
+        let mut identity_pem = cert.clone();
+        identity_pem.extend_from_slice(b"\n");
+        identity_pem.extend_from_slice(&key);
+        Ok(kalpak_control::MeshClientTls {
+            ca_pem: std::fs::read(&self.ca)?,
+            identity_pem,
+        })
+    }
+
+    /// rustls server config demanding a client certificate signed by the
+    /// cluster CA — presenting one IS mesh membership.
+    fn server_config(&self) -> Result<rustls::ServerConfig, Box<dyn std::error::Error>> {
+        let ca_pem = std::fs::read(&self.ca)?;
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut ca_pem.as_slice()) {
+            roots.add(cert?)?;
+        }
+        let verifier =
+            rustls::server::WebPkiClientVerifier::builder(std::sync::Arc::new(roots)).build()?;
+        let certs = rustls_pemfile::certs(&mut std::fs::read(&self.cert)?.as_slice())
+            .collect::<Result<Vec<_>, _>>()?;
+        let key = rustls_pemfile::private_key(&mut std::fs::read(&self.key)?.as_slice())?
+            .ok_or("no private key in mesh key file")?;
+        Ok(rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certs, key)?)
+    }
 }
 
 async fn boot_control(opts: &ServeOpts) -> Result<Arc<ControlPlane>, Box<dyn std::error::Error>> {
-    let control =
-        ControlPlane::start_node(opts.node_id, Some(std::path::Path::new(&opts.data_dir))).await?;
+    let mesh_tls = opts.mesh.as_ref().map(|m| m.client_tls()).transpose()?;
+    let control = ControlPlane::start_node_with_mesh(
+        opts.node_id,
+        Some(std::path::Path::new(&opts.data_dir)),
+        mesh_tls.as_ref(),
+    )
+    .await?;
     if opts.bootstrap {
         let members = std::collections::BTreeMap::from([(opts.node_id, opts.addr.clone())]);
         // Re-initialization of an already-formed cluster fails benignly on
@@ -85,10 +140,22 @@ async fn boot_control(opts: &ServeOpts) -> Result<Arc<ControlPlane>, Box<dyn std
 pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
     let store = TieredStore::open(&opts.data_dir, opts.warm_bytes)?;
     let control = boot_control(&opts).await?;
+    let (http, peer_scheme) = match &opts.mesh {
+        Some(m) => {
+            let tls = m.client_tls()?;
+            let client = reqwest::Client::builder()
+                .add_root_certificate(reqwest::Certificate::from_pem(&tls.ca_pem)?)
+                .identity(reqwest::Identity::from_pem(&tls.identity_pem)?)
+                .build()?;
+            (client, "https")
+        }
+        None => (reqwest::Client::new(), "http"),
+    };
     let state = Arc::new(AppState {
         store,
         control,
-        http: reqwest::Client::new(),
+        http,
+        peer_scheme,
         require_signatures: opts.require_signatures,
         gc_runs: Default::default(),
         gc_blocks_dropped: Default::default(),
@@ -140,8 +207,43 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let app = router(state);
+    if let Some(mesh) = &opts.mesh {
+        // The mesh listener serves the FULL router behind mutual TLS: a
+        // peer certificate signed by the cluster CA is mesh membership,
+        // which is what justifies INTERNAL_HEADER trust there.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cfg = mesh.server_config()?;
+        let mesh_app = router(state.clone());
+        let bind: std::net::SocketAddr = mesh.addr.parse()?;
+        eprintln!("kalpakdb node {} mesh (mTLS) on {bind}", opts.node_id);
+        tokio::spawn(async move {
+            let rustls_cfg =
+                axum_server::tls_rustls::RustlsConfig::from_config(std::sync::Arc::new(cfg));
+            if let Err(e) = axum_server::bind_rustls(bind, rustls_cfg)
+                .serve(mesh_app.into_make_service())
+                .await
+            {
+                eprintln!("kalpakdb: mesh listener exited: {e}");
+            }
+        });
+    }
+
+    let mut app = router(state);
+    if opts.mesh.is_some() {
+        // With a mesh listener present, internal semantics never apply to
+        // public traffic: strip the header so it cannot be spoofed to skip
+        // signature checks or fan-out suppression.
+        app = app.layer(axum::middleware::from_fn(strip_internal_header));
+    }
     serve_app(app, &opts).await
+}
+
+async fn strip_internal_header(
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    req.headers_mut().remove(INTERNAL_HEADER);
+    next.run(req).await
 }
 
 /// Bind the API over TLS when certificates are configured, plain HTTP
@@ -328,7 +430,7 @@ async fn forward_to_leader(
     };
     let resp = s
         .http
-        .post(format!("http://{addr}{path}"))
+        .post(format!("{}://{addr}{path}", s.peer_scheme))
         .header(INTERNAL_HEADER, "1")
         .json(&body)
         .send()
@@ -366,7 +468,7 @@ async fn put_block(
             for peer in state.control.peer_addrs() {
                 let _ = state
                     .http
-                    .post(format!("http://{peer}/v1/blocks"))
+                    .post(format!("{}://{peer}/v1/blocks", state.peer_scheme))
                     .header(INTERNAL_HEADER, "1")
                     .body(payload.clone())
                     .send()
@@ -414,7 +516,7 @@ async fn put_blocks_batch(
             for peer in state.control.peer_addrs() {
                 let _ = state
                     .http
-                    .post(format!("http://{peer}/v1/blocks/batch"))
+                    .post(format!("{}://{peer}/v1/blocks/batch", state.peer_scheme))
                     .header(INTERNAL_HEADER, "1")
                     .body(raw.clone())
                     .send()
@@ -441,7 +543,7 @@ async fn get_block(
             for peer in s.control.peer_addrs() {
                 let Ok(resp) = s
                     .http
-                    .get(format!("http://{peer}/v1/blocks/{id}"))
+                    .get(format!("{}://{peer}/v1/blocks/{id}", s.peer_scheme))
                     .header(INTERNAL_HEADER, "1")
                     .send()
                     .await

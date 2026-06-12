@@ -158,7 +158,15 @@ Unsigned or forged mutations get `401`; reads stay open. Replay of a captured si
     --tls-cert ./pki/kalpak-cert.pem --tls-key ./pki/kalpak-key.pem
 ```
 
-Clients pass the CA: `KalpakClient::with_options(url, signer, Some(ca_pem))` in Rust, `KalpakClient(url, cafile="…")` in Python, `curl --cacert …`. There is no cleartext fallback on a TLS port. Scope: TLS covers the client-facing API; node-to-node Raft/replication traffic is expected to run on a private cluster network (mTLS for the mesh is future work).
+Clients pass the CA: `KalpakClient::with_options(url, signer, Some(ca_pem))` in Rust, `KalpakClient(url, cafile="…")` in Python, `curl --cacert …`. There is no cleartext fallback on a TLS port.
+
+Node-to-node traffic gets **mutual TLS**: `kalpakdb mesh-ca` generates a cluster CA and node certificates, and `--mesh <addr>,<ca>,<cert>,<key>` moves all Raft/replication RPCs onto a dedicated mTLS listener where presenting a CA-signed certificate *is* mesh membership — both sides authenticate, so neither a rogue client nor a rogue server can join the cluster path:
+
+```sh
+./target/release/kalpakdb mesh-ca ./pki --hosts 10.0.0.1,10.0.0.2
+./target/release/kalpakdb serve /data/n1 --addr 10.0.0.1:7411 --node-id 1 \
+    --mesh 10.0.0.1:7415,./pki/mesh-ca.pem,./pki/mesh-cert.pem,./pki/mesh-key.pem
+```
 
 ## Monitoring
 
@@ -182,7 +190,7 @@ KalpakDB's design decisions trace back to recent systems research. Papers that d
 
 ## Architecture
 
-See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the two-box reference deployment runbook (with `scripts/bench_cluster.py` for the network-path numbers), and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the thesis, the three planes, and what remains on the roadmap (importance-aware tier placement, model-based lookahead prediction, mesh mTLS, real-network benchmarks vs LMCache). [CHANGELOG.md](CHANGELOG.md) tracks releases.
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the two-box reference deployment runbook (with `scripts/bench_cluster.py` for the network-path numbers), and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the thesis, the three planes, and what remains on the roadmap (importance-aware tier placement, model-based lookahead prediction, real-network benchmarks vs LMCache). [CHANGELOG.md](CHANGELOG.md) tracks releases.
 
 ## License
 

@@ -23,6 +23,7 @@ async fn grpc_sdk_two_phase_write() {
         require_signatures: false,
         tls_cert: None,
         tls_key: None,
+        mesh: None,
     };
     tokio::spawn(async move {
         let _ = serve(opts).await;

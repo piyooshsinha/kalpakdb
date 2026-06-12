@@ -40,6 +40,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 require_signatures: false,
                 tls_cert: None,
                 tls_key: None,
+                mesh: None,
                 compact_secs: 3600,
             };
             let mut it = rest.iter();
@@ -60,6 +61,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     "--tls-key" => {
                         opts.tls_key = Some(it.next().ok_or("--tls-key needs a value")?.clone())
+                    }
+                    "--mesh" => {
+                        // --mesh <addr>,<ca.pem>,<cert.pem>,<key.pem>
+                        let v = it.next().ok_or("--mesh needs addr,ca,cert,key")?;
+                        let parts: Vec<&str> = v.split(',').collect();
+                        if parts.len() != 4 {
+                            return Err("--mesh needs addr,ca,cert,key".into());
+                        }
+                        opts.mesh = Some(server::MeshOpts {
+                            addr: parts[0].to_string(),
+                            ca: parts[1].to_string(),
+                            cert: parts[2].to_string(),
+                            key: parts[3].to_string(),
+                        });
                     }
                     "--grpc-addr" => {
                         opts.grpc_addr = Some(it.next().ok_or("--grpc-addr needs a value")?.clone())
@@ -99,6 +114,32 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             tokio::runtime::Runtime::new()?.block_on(kalpakdb::stress::stress(opts))
+        }
+        // kalpakdb mesh-ca <out-dir> [--hosts h1,h2,...]
+        // Cluster CA + node certificate for the mutually-authenticated mesh.
+        [cmd, dir, rest @ ..] if cmd == "mesh-ca" => {
+            let mut hosts = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+            let mut it = rest.iter();
+            while let Some(flag) = it.next() {
+                match flag.as_str() {
+                    "--hosts" => {
+                        hosts = it
+                            .next()
+                            .ok_or("--hosts needs a value")?
+                            .split(',')
+                            .map(|h| h.trim().to_string())
+                            .collect()
+                    }
+                    other => return Err(format!("unknown flag: {other}").into()),
+                }
+            }
+            let (ca, cert, key) = kalpakdb::pki::write_mesh_pki(dir, &hosts)?;
+            println!(
+                "wrote {ca}\nwrote {cert}\nwrote {key}\nhosts: {}",
+                hosts.join(", ")
+            );
+            println!("serve with:  --mesh <mesh-addr>,{ca},{cert},{key}");
+            Ok(())
         }
         // kalpakdb cert <out-dir> [--hosts h1,h2,...]
         // Self-signed dev certificate for `serve --tls-cert/--tls-key`.

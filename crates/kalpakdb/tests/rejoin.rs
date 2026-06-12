@@ -25,6 +25,7 @@ fn spawn(node_id: u64, port: u16, dir: std::path::PathBuf) -> NodeProc {
         require_signatures: false,
         tls_cert: None,
         tls_key: None,
+        mesh: None,
     };
     let (kill, killed) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {

@@ -2,5 +2,6 @@
 //! (and embedders) can boot nodes in-process; `main.rs` is a thin CLI over it.
 
 pub mod grpc;
+pub mod pki;
 pub mod server;
 pub mod stress;
