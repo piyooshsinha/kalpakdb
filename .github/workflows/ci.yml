@@ -63,5 +63,6 @@ jobs:
       - name: Python client tests
         if: matrix.os == 'ubuntu-latest'
         run: |
-          pip3 install --quiet cryptography
+          pip3 install --quiet cryptography blake3
           KALPAKDB_BIN=$PWD/target/debug/kalpakdb python3 -m unittest discover -s clients/python/tests
+          KALPAKDB_BIN=$PWD/target/debug/kalpakdb python3 -m unittest discover -s integrations/vllm

@@ -35,6 +35,7 @@ The name draws on Sanskrit roots that describe exactly what this database is for
 | `kalpak-client` | Rust SDK: full agent workflow, transparent signing, TLS root-CA support, optional gRPC streaming (`--features grpc`) |
 | `clients/python` | Zero-dependency Python client (same workflow, server-side key hashing; optional Ed25519 signing via `cryptography`) |
 | `dashboard/` | Optional React observability UI: live metrics, replication lag, agent memory explorer with lineage |
+| `integrations/vllm` | vLLM KV connector (V1 interface): prefix reuse + offload through KalpakDB; protocol logic CI-tested, GPU validation pending |
 
 Failure modes are tested, not assumed: integration tests form real three-node clusters over HTTP and verify state-machine convergence, kill the leader and confirm re-election, crash and rejoin a node from its durable log, run two data nodes on a witness's quorum, and exercise signed-write rejection and TLS handshakes. Crash safety in the storage engine is covered by torn-write and corruption tests.
 
@@ -181,7 +182,7 @@ KalpakDB's design decisions trace back to recent systems research. Papers that d
 
 ## Architecture
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the thesis, the three planes, and what remains on the roadmap (importance-aware tier placement, model-based lookahead prediction, mesh mTLS, real-network benchmarks vs LMCache). [CHANGELOG.md](CHANGELOG.md) tracks releases.
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the two-box reference deployment runbook (with `scripts/bench_cluster.py` for the network-path numbers), and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the thesis, the three planes, and what remains on the roadmap (importance-aware tier placement, model-based lookahead prediction, mesh mTLS, real-network benchmarks vs LMCache). [CHANGELOG.md](CHANGELOG.md) tracks releases.
 
 ## License
 
