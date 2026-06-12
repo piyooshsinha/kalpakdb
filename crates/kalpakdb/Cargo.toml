@@ -12,6 +12,7 @@ categories = ["database-implementations", "command-line-utilities"]
 [dependencies]
 axum = { version = "0.8.9", features = ["ws"] }
 bytes = "1.11.1"
+ed25519-dalek.workspace = true
 kalpak-control = { version = "0.2.0", path = "../kalpak-control" }
 kalpak-core.workspace = true
 kalpak-proto = { version = "0.2.0", path = "../kalpak-proto" }

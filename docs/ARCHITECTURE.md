@@ -78,8 +78,12 @@ WebSocket — the database core is engine + protocol + SDK.
 - `CacheKey` — `(fingerprint, prefix_hash)` where `prefix_hash` is a chained
   BLAKE3 over token-id chunks: equal prefixes converge (cross-agent reuse),
   diverging prefixes split, and extending a context never rehashes history.
-- `AgentId` — Ed25519 public key. State mutations are signed and
-  attributable; identity survives infrastructure churn.
+- `AgentId` — Ed25519 public key; identity survives infrastructure churn.
+  With `--require-signatures`, mutations must be signed over canonical
+  binary messages (`kalpak-core::signing`, domain-separated per operation,
+  reproduced byte-for-byte by every SDK) and are verified at the API
+  boundary before entering Raft. Node-to-node forwards skip re-verification
+  (ingress already verified), matching the internal trust model.
 
 ## Phased roadmap
 

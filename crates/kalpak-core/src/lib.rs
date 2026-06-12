@@ -9,6 +9,7 @@ mod block;
 mod cache_key;
 mod error;
 mod identity;
+pub mod signing;
 
 pub use block::BlockId;
 pub use cache_key::{CacheKey, ModelFingerprint};

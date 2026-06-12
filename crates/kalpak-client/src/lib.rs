@@ -43,6 +43,9 @@ pub enum ClientError {
 pub struct KalpakClient {
     base: String,
     http: reqwest::Client,
+    /// When present, every metadata mutation is signed with this key —
+    /// required by nodes running `--require-signatures`.
+    signer: Option<ed25519_dalek::SigningKey>,
 }
 
 /// The longest cached prefix found for a key chain.
@@ -59,7 +62,31 @@ impl KalpakClient {
         Self {
             base: base.into().trim_end_matches('/').to_string(),
             http: reqwest::Client::new(),
+            signer: None,
         }
+    }
+
+    /// A client that signs its writes as the agent owning `signer`.
+    /// [`Self::agent_id`] gives the matching identity to register/bind as.
+    pub fn with_signer(base: impl Into<String>, signer: ed25519_dalek::SigningKey) -> Self {
+        Self {
+            base: base.into().trim_end_matches('/').to_string(),
+            http: reqwest::Client::new(),
+            signer: Some(signer),
+        }
+    }
+
+    /// The agent identity of this client's signing key, if any.
+    pub fn agent_id(&self) -> Option<AgentId> {
+        self.signer
+            .as_ref()
+            .map(|k| AgentId::from_verifying_key(&k.verifying_key()))
+    }
+
+    fn sign(&self, message: &[u8]) -> Option<String> {
+        self.signer
+            .as_ref()
+            .map(|k| kalpak_core::signing::sign_hex(k, message))
     }
 
     async fn check(resp: reqwest::Response) -> Result<reqwest::Response, ClientError> {
@@ -136,10 +163,14 @@ impl KalpakClient {
         agent: AgentId,
         display_name: &str,
     ) -> Result<(), ClientError> {
+        let sig = self.sign(&kalpak_core::signing::register_message(
+            &agent,
+            display_name,
+        ));
         let resp = self
             .http
             .post(format!("{}/v1/agents", self.base))
-            .json(&json!({ "agent": agent, "display_name": display_name }))
+            .json(&json!({ "agent": agent, "display_name": display_name, "signature": sig }))
             .send()
             .await?;
         Self::check(resp).await.map(|_| ())
@@ -176,6 +207,7 @@ impl KalpakClient {
         agent: AgentId,
         chain: Vec<(CacheKey, Vec<BlockId>, Option<CacheKey>)>,
     ) -> Result<(), ClientError> {
+        let sig = self.sign(&kalpak_core::signing::chain_message(&agent, &chain));
         let bindings: Vec<_> = chain
             .into_iter()
             .map(|(key, blocks, parent)| json!({ "key": key, "blocks": blocks, "parent": parent }))
@@ -183,7 +215,7 @@ impl KalpakClient {
         let resp = self
             .http
             .post(format!("{}/v1/manifest/bind-chain", self.base))
-            .json(&json!({ "agent": agent, "bindings": bindings }))
+            .json(&json!({ "agent": agent, "bindings": bindings, "signature": sig }))
             .send()
             .await?;
         Self::check(resp).await.map(|_| ())
@@ -196,10 +228,22 @@ impl KalpakClient {
         blocks: Vec<BlockId>,
         parent: Option<CacheKey>,
     ) -> Result<(), ClientError> {
+        let sig = self.sign(&kalpak_core::signing::bind_message(
+            &agent,
+            &key,
+            &blocks,
+            parent.as_ref(),
+        ));
         let resp = self
             .http
             .post(format!("{}/v1/manifest/bind", self.base))
-            .json(&json!({ "agent": agent, "key": key, "blocks": blocks, "parent": parent }))
+            .json(&json!({
+                "agent": agent,
+                "key": key,
+                "blocks": blocks,
+                "parent": parent,
+                "signature": sig,
+            }))
             .send()
             .await?;
         Self::check(resp).await.map(|_| ())

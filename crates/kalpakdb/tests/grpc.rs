@@ -18,6 +18,7 @@ async fn grpc_streams_blocks_through_group_commit() {
         bootstrap: true,
         grpc_addr: Some("127.0.0.1:17552".to_string()),
         compact_secs: 0,
+        require_signatures: false,
     };
     tokio::spawn(async move {
         let _ = serve(opts).await;

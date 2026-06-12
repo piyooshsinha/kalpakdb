@@ -27,6 +27,7 @@ async fn lookup_prefetches_child_blocks() {
         bootstrap: true,
         grpc_addr: None,
         compact_secs: 0,
+        require_signatures: false,
     };
     tokio::spawn(async move {
         let _ = serve(opts).await;

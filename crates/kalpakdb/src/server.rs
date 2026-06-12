@@ -25,6 +25,8 @@ pub struct AppState {
     pub control: Arc<ControlPlane>,
     /// Client for node-to-node calls (leader forwarding, peer block fetch).
     pub http: reqwest::Client,
+    /// Reject unsigned metadata mutations.
+    pub require_signatures: bool,
     /// Cumulative GC telemetry (manual + scheduled compactions).
     pub gc_runs: std::sync::atomic::AtomicU64,
     pub gc_blocks_dropped: std::sync::atomic::AtomicU64,
@@ -56,6 +58,9 @@ pub struct ServeOpts {
     /// Run GC automatically every N seconds (0 disables; the
     /// `/v1/admin/compact` endpoint always works).
     pub compact_secs: u64,
+    /// Reject metadata mutations (register/bind) that are not signed by the
+    /// owning agent's Ed25519 key.
+    pub require_signatures: bool,
 }
 
 async fn boot_control(opts: &ServeOpts) -> Result<Arc<ControlPlane>, Box<dyn std::error::Error>> {
@@ -79,6 +84,7 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
         store,
         control,
         http: reqwest::Client::new(),
+        require_signatures: opts.require_signatures,
         gc_runs: Default::default(),
         gc_blocks_dropped: Default::default(),
         gc_bytes_reclaimed: Default::default(),
@@ -245,6 +251,37 @@ impl From<kalpak_control::ControlError> for ApiError {
 /// must answer from local state only).
 const INTERNAL_HEADER: &str = "x-kalpak-internal";
 
+/// Verify a mutation's signature when the node demands signed writes.
+///
+/// Node-to-node requests (leader forwarding, replication) skip
+/// re-verification: the ingress node already verified before forwarding,
+/// matching the existing internal trust model.
+fn verify_signature(
+    s: &AppState,
+    headers: &axum::http::HeaderMap,
+    agent: &AgentId,
+    message: &[u8],
+    signature: Option<&str>,
+) -> Result<(), ApiError> {
+    if !s.require_signatures || headers.contains_key(INTERNAL_HEADER) {
+        return Ok(());
+    }
+    let Some(sig_hex) = signature else {
+        return Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "this node requires signed writes: missing 'signature'".to_string(),
+        ));
+    };
+    let sig = kalpak_core::signing::signature_from_hex(sig_hex)
+        .map_err(|_| ApiError(StatusCode::UNAUTHORIZED, "malformed signature".to_string()))?;
+    agent.verify(message, &sig).map_err(|_| {
+        ApiError(
+            StatusCode::UNAUTHORIZED,
+            "signature does not verify against the agent's public key".to_string(),
+        )
+    })
+}
+
 /// If a write failed because this node is a follower, transparently retry it
 /// against the leader and relay the leader's response.
 async fn forward_to_leader(
@@ -404,16 +441,25 @@ async fn get_block(
 struct RegisterAgentReq {
     agent: AgentId,
     display_name: String,
+    #[serde(default)]
+    signature: Option<String>,
 }
 
 async fn register_agent(
     State(s): State<Shared>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<RegisterAgentReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let msg = kalpak_core::signing::register_message(&req.agent, &req.display_name);
+    verify_signature(&s, &headers, &req.agent, &msg, req.signature.as_deref())?;
     match s.control.register_agent(req.agent, &req.display_name).await {
         Ok(()) => Ok(Json(json!({ "registered": req.agent.to_string() }))),
         Err(e) => {
-            let body = json!({ "agent": req.agent, "display_name": req.display_name });
+            let body = json!({
+                "agent": req.agent,
+                "display_name": req.display_name,
+                "signature": req.signature,
+            });
             forward_to_leader(&s, e, "/v1/agents", body).await
         }
     }
@@ -426,6 +472,8 @@ struct BindReq {
     blocks: Vec<BlockId>,
     #[serde(default)]
     parent: Option<CacheKey>,
+    #[serde(default)]
+    signature: Option<String>,
 }
 
 async fn bind_prefix(
@@ -433,6 +481,9 @@ async fn bind_prefix(
     headers: axum::http::HeaderMap,
     Json(req): Json<BindReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let msg =
+        kalpak_core::signing::bind_message(&req.agent, &req.key, &req.blocks, req.parent.as_ref());
+    verify_signature(&s, &headers, &req.agent, &msg, req.signature.as_deref())?;
     // Validate block existence on the node the client talked to; a
     // leader-forwarded bind skips this (the leader may not hold the blocks —
     // the data plane is per-node until proactive replication lands).
@@ -463,6 +514,7 @@ async fn bind_prefix(
                 "key": req.key,
                 "blocks": req.blocks,
                 "parent": req.parent,
+                "signature": req.signature,
             });
             forward_to_leader(&s, e, "/v1/manifest/bind", body).await
         }
@@ -491,6 +543,8 @@ async fn make_key(Json(req): Json<MakeKeyReq>) -> Json<CacheKey> {
 struct BindChainReq {
     agent: AgentId,
     bindings: Vec<kalpak_control::ChainBinding>,
+    #[serde(default)]
+    signature: Option<String>,
 }
 
 /// Bind a whole prefix chain in one consensus round (one Raft fsync) —
@@ -500,6 +554,13 @@ async fn bind_chain(
     headers: axum::http::HeaderMap,
     Json(req): Json<BindChainReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let links: Vec<_> = req
+        .bindings
+        .iter()
+        .map(|b| (b.key.clone(), b.blocks.clone(), b.parent.clone()))
+        .collect();
+    let msg = kalpak_core::signing::chain_message(&req.agent, &links);
+    verify_signature(&s, &headers, &req.agent, &msg, req.signature.as_deref())?;
     if !headers.contains_key(INTERNAL_HEADER) {
         for b in &req.bindings {
             for blk in &b.blocks {
@@ -515,7 +576,11 @@ async fn bind_chain(
     match s.control.bind_chain(req.agent, req.bindings.clone()).await {
         Ok(()) => Ok(Json(json!({ "bound": req.bindings.len() }))),
         Err(e) => {
-            let body = json!({ "agent": req.agent, "bindings": req.bindings });
+            let body = json!({
+                "agent": req.agent,
+                "bindings": req.bindings,
+                "signature": req.signature,
+            });
             forward_to_leader(&s, e, "/v1/manifest/bind-chain", body).await
         }
     }

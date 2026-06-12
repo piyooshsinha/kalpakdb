@@ -20,7 +20,7 @@ The name draws on Sanskrit roots that describe exactly what this database is for
 
 - **Everything is an immutable, content-addressed block.** A block's identity is the BLAKE3 hash of its bytes. Deduplication, integrity verification, and cache coherence fall out of the design instead of being features.
 - **KV caches are first-class citizens.** Cached prefixes are keyed by `(model fingerprint, chained prefix hash)` so equal prefixes converge across agents and incompatible models can never collide. Serving prefix-selected KV blocks back to the inference engine cuts time-to-first-token for repetitive agentic workloads, and lookups speculatively warm the blocks into RAM before the client asks for them.
-- **Agents are keypairs, not addresses.** State is owned by Ed25519 identities, so an agent's memory and trust relationships survive restarts, migrations, and infrastructure churn.
+- **Agents are keypairs, not addresses.** State is owned by Ed25519 identities, so an agent's memory and trust relationships survive restarts, migrations, and infrastructure churn. With `--require-signatures`, every metadata mutation must be signed by the owning agent's key — attribution is enforced, not assumed.
 - **Metadata and data never mix.** Raft replicates only metadata (agents, prefix bindings) with a durable log; tensors and blobs move on a separate direct-I/O data plane and are referenced by content address.
 
 ## What works today
@@ -123,6 +123,22 @@ KalpakDB is a database — the core is the engine, the wire protocol, and the cl
 ```sh
 cd dashboard && npm install && npm run dev   # proxies /v1 to 127.0.0.1:7411
 ```
+
+## Signed writes
+
+Run a node with `--require-signatures` and every register/bind must carry an Ed25519 signature over a canonical binary message, verified against the agent's public key before the mutation enters Raft. Both SDKs sign transparently:
+
+```rust
+let db = KalpakClient::with_signer("http://127.0.0.1:7411", signing_key);
+db.register_agent(db.agent_id().unwrap(), "researcher").await?;   // signed
+```
+
+```python
+db = KalpakClient("http://127.0.0.1:7411", signer=Ed25519Signer(private_key_bytes))
+db.register_agent(db.signer.agent, "researcher")                   # signed
+```
+
+Unsigned or forged mutations get `401`; reads stay open. Replay of a captured signature only reproduces the identical (idempotent) mutation — confidentiality and capture-resistance on the wire remain TLS's job, which is the next hardening step.
 
 ## Research foundations
 

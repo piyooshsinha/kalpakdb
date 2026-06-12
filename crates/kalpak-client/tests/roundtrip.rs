@@ -15,6 +15,7 @@ async fn spawn_node(port: u16, dir: &std::path::Path) -> KalpakClient {
         bootstrap: true,
         grpc_addr: None,
         compact_secs: 0,
+        require_signatures: false,
     };
     tokio::spawn(async move {
         let _ = serve(opts).await;

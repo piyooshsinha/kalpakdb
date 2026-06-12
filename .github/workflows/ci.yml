@@ -62,4 +62,6 @@ jobs:
         run: cargo build -p kalpakdb
       - name: Python client tests
         if: matrix.os == 'ubuntu-latest'
-        run: KALPAKDB_BIN=$PWD/target/debug/kalpakdb python3 -m unittest discover -s clients/python/tests
+        run: |
+          pip3 install --quiet cryptography
+          KALPAKDB_BIN=$PWD/target/debug/kalpakdb python3 -m unittest discover -s clients/python/tests

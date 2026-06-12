@@ -37,6 +37,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 node_id: 1,
                 bootstrap: cmd == "serve",
                 grpc_addr: None,
+                require_signatures: false,
                 compact_secs: 3600,
             };
             let mut it = rest.iter();
@@ -51,6 +52,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         opts.node_id = it.next().ok_or("--node-id needs a value")?.parse()?
                     }
                     "--join" => opts.bootstrap = false,
+                    "--require-signatures" => opts.require_signatures = true,
                     "--grpc-addr" => {
                         opts.grpc_addr = Some(it.next().ok_or("--grpc-addr needs a value")?.clone())
                     }

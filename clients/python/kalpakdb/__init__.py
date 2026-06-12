@@ -29,13 +29,93 @@ from dataclasses import dataclass
 from hashlib import blake2b  # only for docs; key hashing is server-compatible blake3 below
 
 __all__ = [
+    "Ed25519Signer",
     "KalpakClient",
     "KalpakError",
     "ModelFingerprint",
     "PrefixHit",
+    "bind_message",
+    "chain_message",
+    "register_message",
 ]
 
 __version__ = "0.2.0"
+
+
+class Ed25519Signer:
+    """Signs metadata mutations for nodes running ``--require-signatures``.
+
+    Needs the optional ``cryptography`` package (the only situation in
+    which this SDK is not stdlib-only)::
+
+        pip install cryptography
+        signer = Ed25519Signer(private_key_bytes_32)
+        db = KalpakClient("http://...", signer=signer)
+    """
+
+    def __init__(self, private_key: bytes):
+        try:
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+                Ed25519PrivateKey,
+            )
+        except ImportError as e:  # pragma: no cover
+            raise KalpakError(
+                "signed writes need the 'cryptography' package: pip install cryptography"
+            ) from e
+        self._key = Ed25519PrivateKey.from_private_bytes(private_key)
+
+    @property
+    def agent(self) -> str:
+        """Hex public key — the agent identity this signer writes as."""
+        from cryptography.hazmat.primitives.serialization import (
+            Encoding,
+            PublicFormat,
+        )
+        return self._key.public_key().public_bytes(
+            Encoding.Raw, PublicFormat.Raw
+        ).hex()
+
+    def sign_hex(self, message: bytes) -> str:
+        return self._key.sign(message).hex()
+
+
+# Canonical signed-write messages — byte-identical to kalpak-core's
+# `signing` module (raw fixed-width fields, never JSON).
+
+def _msg_key(key: dict) -> bytes:
+    fp = key["fingerprint"]
+    return (
+        fp["model_id"].encode() + b"\0"
+        + fp["tokenizer_hash"].encode() + b"\0"
+        + fp["kv_layout"].encode() + b"\0"
+        + bytes.fromhex(key["prefix_hash"])
+    )
+
+
+def _msg_link(key: dict, blocks: list[str], parent: dict | None) -> bytes:
+    out = _msg_key(key) + struct.pack("<I", len(blocks))
+    for b in blocks:
+        out += bytes.fromhex(b)
+    if parent is not None:
+        out += b"\x01" + bytes.fromhex(parent["prefix_hash"])
+    else:
+        out += b"\x00"
+    return out
+
+
+def register_message(agent: str, display_name: str) -> bytes:
+    return b"KLPK/reg/v1\0" + bytes.fromhex(agent) + display_name.encode()
+
+
+def bind_message(agent: str, key: dict, blocks: list[str], parent: dict | None) -> bytes:
+    return b"KLPK/bind/v1\0" + bytes.fromhex(agent) + _msg_link(key, blocks, parent)
+
+
+def chain_message(agent: str, links: list[tuple[dict, list[str], dict | None]]) -> bytes:
+    out = b"KLPK/chain/v1\0" + bytes.fromhex(agent) + struct.pack("<I", len(links))
+    for key, blocks, parent in links:
+        out += _msg_link(key, blocks, parent)
+    return out
 
 
 class KalpakError(Exception):
@@ -71,7 +151,9 @@ class PrefixHit:
 
 
 class KalpakClient:
-    def __init__(self, base: str, timeout: float = 30.0):
+    def __init__(self, base: str, timeout: float = 30.0,
+                 signer: "Ed25519Signer | None" = None):
+        self.signer = signer
         self.base = base.rstrip("/")
         self.timeout = timeout
 
@@ -160,9 +242,12 @@ class KalpakClient:
     # ---- control plane ----
 
     def register_agent(self, agent: str, display_name: str) -> None:
-        self._json(
-            "POST", "/v1/agents", {"agent": agent, "display_name": display_name}
-        )
+        body = {"agent": agent, "display_name": display_name}
+        if self.signer is not None:
+            body["signature"] = self.signer.sign_hex(
+                register_message(agent, display_name)
+            )
+        self._json("POST", "/v1/agents", body)
 
     def bind_prefix(
         self,
@@ -173,11 +258,12 @@ class KalpakClient:
     ) -> None:
         """Bind a prefix to its blocks; `parent` links the prefix tree for
         one-step-ahead speculative prefetch."""
-        self._json(
-            "POST",
-            "/v1/manifest/bind",
-            {"agent": agent, "key": key, "blocks": blocks, "parent": parent},
-        )
+        body = {"agent": agent, "key": key, "blocks": blocks, "parent": parent}
+        if self.signer is not None:
+            body["signature"] = self.signer.sign_hex(
+                bind_message(agent, key, blocks, parent)
+            )
+        self._json("POST", "/v1/manifest/bind", body)
 
     def bind_chain(
         self,
@@ -191,8 +277,12 @@ class KalpakClient:
             {"key": key, "blocks": blocks, "parent": parent}
             for key, blocks, parent in bindings
         ]
-        self._json("POST", "/v1/manifest/bind-chain",
-                   {"agent": agent, "bindings": payload})
+        body = {"agent": agent, "bindings": payload}
+        if self.signer is not None:
+            body["signature"] = self.signer.sign_hex(
+                chain_message(agent, list(bindings))
+            )
+        self._json("POST", "/v1/manifest/bind-chain", body)
 
     def lookup(self, chain: list[dict]) -> PrefixHit | None:
         """Probe a root-first key chain for the longest cached prefix."""
