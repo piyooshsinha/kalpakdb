@@ -152,8 +152,14 @@ class PrefixHit:
 
 class KalpakClient:
     def __init__(self, base: str, timeout: float = 30.0,
-                 signer: "Ed25519Signer | None" = None):
+                 signer: "Ed25519Signer | None" = None,
+                 cafile: str | None = None):
         self.signer = signer
+        # Extra root CA for self-signed/private-CA TLS deployments.
+        self._ssl_ctx = None
+        if cafile is not None:
+            import ssl
+            self._ssl_ctx = ssl.create_default_context(cafile=cafile)
         self.base = base.rstrip("/")
         self.timeout = timeout
 
@@ -173,7 +179,9 @@ class KalpakClient:
             headers={"content-type": content_type} if body is not None else {},
         )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(
+                req, timeout=self.timeout, context=self._ssl_ctx
+            ) as resp:
                 return resp.read()
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")

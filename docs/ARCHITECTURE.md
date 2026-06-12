@@ -83,7 +83,10 @@ WebSocket — the database core is engine + protocol + SDK.
   binary messages (`kalpak-core::signing`, domain-separated per operation,
   reproduced byte-for-byte by every SDK) and are verified at the API
   boundary before entering Raft. Node-to-node forwards skip re-verification
-  (ingress already verified), matching the internal trust model.
+  (ingress already verified), matching the internal trust model. The
+  client-facing API serves TLS via `--tls-cert/--tls-key` (rustls;
+  `kalpakdb cert` generates dev certificates); the node-to-node mesh
+  stays on the private cluster network, with mTLS as future work.
 
 ## Phased roadmap
 

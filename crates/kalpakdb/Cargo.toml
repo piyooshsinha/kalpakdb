@@ -11,13 +11,16 @@ categories = ["database-implementations", "command-line-utilities"]
 
 [dependencies]
 axum = { version = "0.8.9", features = ["ws"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 bytes = "1.11.1"
 ed25519-dalek.workspace = true
 kalpak-control = { version = "0.2.0", path = "../kalpak-control" }
 kalpak-core.workspace = true
 kalpak-proto = { version = "0.2.0", path = "../kalpak-proto" }
 kalpak-storage = { version = "0.2.0", path = "../kalpak-storage" }
+rcgen = "0.14.8"
 reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1.52.3", features = ["full"] }
@@ -28,4 +31,5 @@ tower-http = { version = "0.6.11", features = ["cors"] }
 [dev-dependencies]
 ed25519-dalek.workspace = true
 kalpak-client = { path = "../kalpak-client" }
+rcgen = "0.14.8"
 tempfile.workspace = true

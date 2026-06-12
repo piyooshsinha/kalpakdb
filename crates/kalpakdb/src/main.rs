@@ -38,6 +38,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 bootstrap: cmd == "serve",
                 grpc_addr: None,
                 require_signatures: false,
+                tls_cert: None,
+                tls_key: None,
                 compact_secs: 3600,
             };
             let mut it = rest.iter();
@@ -53,6 +55,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     "--join" => opts.bootstrap = false,
                     "--require-signatures" => opts.require_signatures = true,
+                    "--tls-cert" => {
+                        opts.tls_cert = Some(it.next().ok_or("--tls-cert needs a value")?.clone())
+                    }
+                    "--tls-key" => {
+                        opts.tls_key = Some(it.next().ok_or("--tls-key needs a value")?.clone())
+                    }
                     "--grpc-addr" => {
                         opts.grpc_addr = Some(it.next().ok_or("--grpc-addr needs a value")?.clone())
                     }
@@ -91,6 +99,41 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             tokio::runtime::Runtime::new()?.block_on(kalpakdb::stress::stress(opts))
+        }
+        // kalpakdb cert <out-dir> [--hosts h1,h2,...]
+        // Self-signed dev certificate for `serve --tls-cert/--tls-key`.
+        [cmd, dir, rest @ ..] if cmd == "cert" => {
+            let mut hosts = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+            let mut it = rest.iter();
+            while let Some(flag) = it.next() {
+                match flag.as_str() {
+                    "--hosts" => {
+                        hosts = it
+                            .next()
+                            .ok_or("--hosts needs a value")?
+                            .split(',')
+                            .map(|h| h.trim().to_string())
+                            .collect()
+                    }
+                    other => return Err(format!("unknown flag: {other}").into()),
+                }
+            }
+            let ck = rcgen::generate_simple_self_signed(hosts.clone())?;
+            std::fs::create_dir_all(dir)?;
+            let cert_path = format!("{dir}/kalpak-cert.pem");
+            let key_path = format!("{dir}/kalpak-key.pem");
+            std::fs::write(&cert_path, ck.cert.pem())?;
+            std::fs::write(&key_path, ck.signing_key.serialize_pem())?;
+            println!(
+                "wrote {cert_path}
+wrote {key_path}
+hosts: {}",
+                hosts.join(", ")
+            );
+            println!(
+                "serve with:  kalpakdb serve <dir> --tls-cert {cert_path} --tls-key {key_path}"
+            );
+            Ok(())
         }
         [cmd, dir, rest @ ..] if cmd == "bench" => {
             let mut blocks: u64 = 2000;

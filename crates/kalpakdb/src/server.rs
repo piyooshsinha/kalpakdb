@@ -61,6 +61,11 @@ pub struct ServeOpts {
     /// Reject metadata mutations (register/bind) that are not signed by the
     /// owning agent's Ed25519 key.
     pub require_signatures: bool,
+    /// Serve the client-facing API over TLS (PEM paths). Node-to-node
+    /// traffic stays plain HTTP on the cluster network; generate dev certs
+    /// with `kalpakdb cert`.
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
 }
 
 async fn boot_control(opts: &ServeOpts) -> Result<Arc<ControlPlane>, Box<dyn std::error::Error>> {
@@ -136,12 +141,38 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let app = router(state);
-    let listener = tokio::net::TcpListener::bind(&opts.addr).await?;
-    eprintln!(
-        "kalpakdb node {} listening on http://{} (data dir: {})",
-        opts.node_id, opts.addr, opts.data_dir
-    );
-    axum::serve(listener, app).await?;
+    serve_app(app, &opts).await
+}
+
+/// Bind the API over TLS when certificates are configured, plain HTTP
+/// otherwise.
+async fn serve_app(app: Router, opts: &ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
+    match (&opts.tls_cert, &opts.tls_key) {
+        (Some(cert), Some(key)) => {
+            // Two rustls crypto providers exist in the dep tree (ring via
+            // reqwest, aws-lc-rs via axum-server), so the process default
+            // must be chosen explicitly; "already installed" is fine.
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key).await?;
+            let addr: std::net::SocketAddr = opts.addr.parse()?;
+            eprintln!(
+                "kalpakdb node {} listening on https://{} (data dir: {})",
+                opts.node_id, opts.addr, opts.data_dir
+            );
+            axum_server::bind_rustls(addr, config)
+                .serve(app.into_make_service())
+                .await?;
+        }
+        (None, None) => {
+            let listener = tokio::net::TcpListener::bind(&opts.addr).await?;
+            eprintln!(
+                "kalpakdb node {} listening on http://{} (data dir: {})",
+                opts.node_id, opts.addr, opts.data_dir
+            );
+            axum::serve(listener, app).await?;
+        }
+        _ => return Err("--tls-cert and --tls-key must be given together".into()),
+    }
     Ok(())
 }
 
@@ -151,13 +182,11 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
 pub async fn serve_witness(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
     let control = boot_control(&opts).await?;
     let app = witness_router(control.clone());
-    let listener = tokio::net::TcpListener::bind(&opts.addr).await?;
     eprintln!(
-        "kalpakdb witness {} listening on http://{} (control dir: {})",
-        opts.node_id, opts.addr, opts.data_dir
+        "kalpakdb witness {} (control dir: {})",
+        opts.node_id, opts.data_dir
     );
-    axum::serve(listener, app).await?;
-    Ok(())
+    serve_app(app, &opts).await
 }
 
 /// Consensus routes, shared by full nodes and witnesses.

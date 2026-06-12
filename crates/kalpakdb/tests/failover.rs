@@ -31,6 +31,8 @@ fn spawn_node_proc(node_id: u64, port: u16, dir: &std::path::Path) -> NodeProc {
         grpc_addr: None,
         compact_secs: 0,
         require_signatures: false,
+        tls_cert: None,
+        tls_key: None,
     };
     let (kill, killed) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {

@@ -138,7 +138,16 @@ db = KalpakClient("http://127.0.0.1:7411", signer=Ed25519Signer(private_key_byte
 db.register_agent(db.signer.agent, "researcher")                   # signed
 ```
 
-Unsigned or forged mutations get `401`; reads stay open. Replay of a captured signature only reproduces the identical (idempotent) mutation — confidentiality and capture-resistance on the wire remain TLS's job, which is the next hardening step.
+Unsigned or forged mutations get `401`; reads stay open. Replay of a captured signature only reproduces the identical (idempotent) mutation — confidentiality and capture-resistance on the wire are TLS's job:
+
+## TLS
+
+```sh
+./target/release/kalpakdb cert ./pki                       # self-signed dev cert
+./target/release/kalpakdb serve /data --addr 0.0.0.0:7411     --tls-cert ./pki/kalpak-cert.pem --tls-key ./pki/kalpak-key.pem
+```
+
+Clients pass the CA: `KalpakClient::with_options(url, signer, Some(ca_pem))` in Rust, `KalpakClient(url, cafile="…")` in Python, `curl --cacert …`. There is no cleartext fallback on a TLS port. Scope: TLS covers the client-facing API; node-to-node Raft/replication traffic is expected to run on a private cluster network (mTLS for the mesh is future work).
 
 ## Research foundations
 

@@ -76,6 +76,26 @@ impl KalpakClient {
         }
     }
 
+    /// A fully configured client: optional signing identity and an optional
+    /// extra root CA (PEM) for self-signed/private-CA TLS deployments.
+    pub fn with_options(
+        base: impl Into<String>,
+        signer: Option<ed25519_dalek::SigningKey>,
+        root_ca_pem: Option<&[u8]>,
+    ) -> Result<Self, ClientError> {
+        let mut builder = reqwest::Client::builder();
+        if let Some(pem) = root_ca_pem {
+            let cert = reqwest::Certificate::from_pem(pem)
+                .map_err(|e| ClientError::Decode(format!("root CA: {e}")))?;
+            builder = builder.add_root_certificate(cert);
+        }
+        Ok(Self {
+            base: base.into().trim_end_matches('/').to_string(),
+            http: builder.build()?,
+            signer,
+        })
+    }
+
     /// The agent identity of this client's signing key, if any.
     pub fn agent_id(&self) -> Option<AgentId> {
         self.signer
