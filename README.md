@@ -1,6 +1,6 @@
 # KalpakDB
 
-[![CI](https://github.com/piyooshsinha/kalpakdb/actions/workflows/ci.yml/badge.svg)](https://github.com/piyooshsinha/kalpakdb/actions/workflows/ci.yml)
+[![CI](https://github.com/piyooshsinha/kalpakdb/actions/workflows/ci.yml/badge.svg)](https://github.com/piyooshsinha/kalpakdb/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/piyooshsinha/kalpakdb)](https://github.com/piyooshsinha/kalpakdb/releases)
 
 **A content-addressed, Raft-replicated database for AI agent state — the storage layer agent frameworks build on.**
 
@@ -27,16 +27,16 @@ The name draws on Sanskrit roots that describe exactly what this database is for
 
 | Component | Status |
 |---|---|
-| `kalpak-core` | Block identity, chained prefix cache keys, Ed25519 agent identity |
-| `kalpak-storage` | Append-only content-addressed segments, crash recovery, two-tier RAM/SSD store, prefix manifest, pluggable I/O backend |
-| `kalpak-control` | Raft control plane (`openraft`): durable log, dynamic membership, snapshot compaction, JSON-over-HTTP transport |
-| `kalpakdb` | Node binary: HTTP/WebSocket memory API, cluster management, speculative prefetch, local CLI tools |
-| `kalpak-proto` | gRPC streaming data plane (chunked block streams, group-committed) |
-| `kalpak-client` | Rust SDK for the full agent workflow |
-| `clients/python` | Zero-dependency Python client (same workflow, server-side key hashing) |
-| `dashboard/` | Optional React observability UI (live metrics over WebSocket) |
+| `kalpak-core` | Block identity, chained prefix cache keys, Ed25519 agent identity, canonical signed-write messages |
+| `kalpak-storage` | Append-only content-addressed segments, crash recovery, group commit, two-tier RAM/SSD store (moka), mark-and-sweep GC, Linux `io_uring` + `O_DIRECT` backend (`--features uring`) |
+| `kalpak-control` | Raft control plane (`openraft`): durable log, dynamic membership, witness nodes, leader forwarding, snapshot compaction, atomic chain binds |
+| `kalpakdb` | Node binary: HTTP/WS memory API, gRPC data plane, cluster management, speculative + lookahead prefetch, scheduled GC, TLS, signed-write enforcement, Prometheus metrics, `bench`/`stress`/`cert` tools |
+| `kalpak-proto` | gRPC streaming protocol (chunked block streams into one group commit) |
+| `kalpak-client` | Rust SDK: full agent workflow, transparent signing, TLS root-CA support, optional gRPC streaming (`--features grpc`) |
+| `clients/python` | Zero-dependency Python client (same workflow, server-side key hashing; optional Ed25519 signing via `cryptography`) |
+| `dashboard/` | Optional React observability UI: live metrics, replication lag, agent memory explorer with lineage |
 
-The three-node replication path is covered by an integration test that forms a real cluster over HTTP (init → learners → voters) and verifies state-machine convergence on every node.
+Failure modes are tested, not assumed: integration tests form real three-node clusters over HTTP and verify state-machine convergence, kill the leader and confirm re-election, crash and rejoin a node from its durable log, run two data nodes on a witness's quorum, and exercise signed-write rejection and TLS handshakes. Crash safety in the storage engine is covered by torn-write and corruption tests.
 
 ## Quick start
 
@@ -124,6 +124,15 @@ KalpakDB is a database — the core is the engine, the wire protocol, and the cl
 cd dashboard && npm install && npm run dev   # proxies /v1 to 127.0.0.1:7411
 ```
 
+### Built-in tools
+
+```sh
+kalpakdb bench /tmp --blocks 2000 --size-kb 64      # storage throughput (put/batch/warm/cold)
+kalpakdb stress http://127.0.0.1:7411 --agents 8    # concurrent agent workload against a node
+kalpakdb cert ./pki                                  # self-signed TLS certs
+kalpakdb key <model> <tok> <layout> 1,2,3 4,5        # chained CacheKeys offline
+```
+
 ## Signed writes
 
 Run a node with `--require-signatures` and every register/bind must carry an Ed25519 signature over a canonical binary message, verified against the agent's public key before the mutation enters Raft. Both SDKs sign transparently:
@@ -144,7 +153,8 @@ Unsigned or forged mutations get `401`; reads stay open. Replay of a captured si
 
 ```sh
 ./target/release/kalpakdb cert ./pki                       # self-signed dev cert
-./target/release/kalpakdb serve /data --addr 0.0.0.0:7411     --tls-cert ./pki/kalpak-cert.pem --tls-key ./pki/kalpak-key.pem
+./target/release/kalpakdb serve /data --addr 0.0.0.0:7411 \
+    --tls-cert ./pki/kalpak-cert.pem --tls-key ./pki/kalpak-key.pem
 ```
 
 Clients pass the CA: `KalpakClient::with_options(url, signer, Some(ca_pem))` in Rust, `KalpakClient(url, cafile="…")` in Python, `curl --cacert …`. There is no cleartext fallback on a TLS port. Scope: TLS covers the client-facing API; node-to-node Raft/replication traffic is expected to run on a private cluster network (mTLS for the mesh is future work).
@@ -166,12 +176,12 @@ KalpakDB's design decisions trace back to recent systems research. Papers that d
 | [Asynchronous KV Cache Prefetching](https://arxiv.org/abs/2504.06319) / [PRESERVE](https://arxiv.org/abs/2501.08192) | Hide memory-access latency behind computation/communication overlap | The computation-transfer overlap pattern behind the prefetcher and the gRPC streaming plane |
 | [IMPRESS: Importance-Informed Multi-Tier Prefix KV Storage](https://www.usenix.org/conference/fast25/presentation/chen-weijian) (FAST '25) | Not all KV blocks deserve the fast tier — importance-aware placement beats plain recency | Why the warm tier uses TinyLFU (frequency-aware) rather than strict LRU; full importance-aware placement is on the roadmap |
 | [Multi-Tier Dynamic Storage for KV Cache](https://link.springer.com/article/10.1007/s40747-025-02200-4) | KV-cache tiering under resource-constrained (edge) conditions | Validates the two-box dev topology: RAM warm buffer over SSD cold store on commodity hardware |
-| [io_uring for High-Performance DBMSs](https://arxiv.org/abs/2512.04859) | Properly tuned io_uring lifts a storage engine from 16.5K to 546.5K TPS | The `IoBackend` trait seam and the planned Linux `io_uring`/`O_DIRECT` backend; 4 KiB record alignment is already direct-I/O compatible |
+| [io_uring for High-Performance DBMSs](https://arxiv.org/abs/2512.04859) | Properly tuned io_uring lifts a storage engine from 16.5K to 546.5K TPS | The Linux `io_uring` backend (`--features uring`): batched group-commit submission + `O_DIRECT` page-cache bypass over the pre-aligned 4 KiB records |
 | [MAGMA](https://arxiv.org/abs/2601.03236) / [MIRIX](https://arxiv.org/abs/2507.07957) / [A-Mem](https://openreview.net/forum?id=FiM0M8gcct) (agentic memory architectures) | The memory-framework layer is crowded; frameworks differ in ontology (episodic/semantic/procedural) but all need durable substrates | Why KalpakDB exposes primitives (blocks, prefix chains, signed metadata) instead of hardcoding one memory ontology — it aims to be the substrate *under* these frameworks |
 
 ## Architecture
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the thesis, the three planes, and the roadmap (multi-node data-plane replication, `io_uring` backend, importance-aware tiering).
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the thesis, the three planes, and what remains on the roadmap (importance-aware tier placement, model-based lookahead prediction, mesh mTLS, real-network benchmarks vs LMCache). [CHANGELOG.md](CHANGELOG.md) tracks releases.
 
 ## License
 
