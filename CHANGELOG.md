@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.4.0 — 2026-06-12
+
+The launch-preparation release: the adoption path and the last security
+gap.
+
+### vLLM connector (`integrations/vllm`)
+- KalpakDB connector for vLLM's V1 KV-connector interface: longest-prefix
+  reuse on prefill, chunked offload + chain binds on decode, all through
+  the Python SDK. Protocol logic is CI-tested against a real node; GPU
+  end-to-end validation pending hardware.
+
+### Mesh mTLS
+- `--mesh <addr>,<ca>,<cert>,<key>` moves all Raft RPCs onto a dedicated
+  mutually-authenticated TLS listener: both sides present cluster-CA-signed
+  certificates, so a certificate IS mesh membership
+- `kalpakdb mesh-ca <dir> [--hosts ...]` generates the cluster CA + node certs
+- Completes the security model: signed writes (who wrote) + client TLS
+  (what travels) + mesh mTLS (who replicates)
+
+### Deployment & community
+- `docs/DEPLOYMENT.md`: two-box (storage + compute + witness) runbook
+- `scripts/bench_cluster.py`: network-path benchmark for the hardware session
+- Issue/PR templates, SECURITY.md, ROADMAP.md
+- Network-partition simulation test (kill-switch proxies; isolate, heal,
+  converge)
+
+
 ## 0.3.0 — 2026-06-12
 
 The hardening release: the security and operations gaps between

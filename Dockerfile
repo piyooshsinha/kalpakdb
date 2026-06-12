@@ -10,7 +10,9 @@ COPY crates ./crates
 RUN cargo build --release -p kalpakdb
 
 FROM debian:bookworm-slim
-RUN useradd --system --home /var/lib/kalpakdb kalpakdb \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --home /var/lib/kalpakdb kalpakdb \
     && mkdir -p /var/lib/kalpakdb \
     && chown kalpakdb:kalpakdb /var/lib/kalpakdb
 COPY --from=builder /build/target/release/kalpakdb /usr/local/bin/kalpakdb

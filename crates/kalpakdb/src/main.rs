@@ -17,6 +17,11 @@ use kalpak_core::BlockId;
 use kalpak_storage::BlockStore;
 
 fn main() -> ExitCode {
+    // The dep tree carries two rustls crypto providers (ring via reqwest,
+    // aws-lc-rs via axum-server); any TLS use without an explicit process
+    // default panics. Install once, unconditionally — a plain-HTTP node
+    // still builds reqwest clients that may touch rustls.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

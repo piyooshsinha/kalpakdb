@@ -18,10 +18,13 @@ jobs:
       - name: Smoke test
         run: |
           docker run -d --name kalpak -p 7411:7411 kalpakdb:ci
+          ok=""
           for i in $(seq 1 30); do
-            curl -sf http://127.0.0.1:7411/v1/stats && break
+            curl -sf http://127.0.0.1:7411/v1/stats && ok=1 && break
             sleep 1
           done
+          echo "--- container logs ---"; docker logs kalpak || true
+          test -n "$ok"
           curl -sf http://127.0.0.1:7411/v1/stats | grep -q control_plane
           ID=$(curl -sf -X POST --data-binary "docker smoke" http://127.0.0.1:7411/v1/blocks | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
           test "$(curl -sf http://127.0.0.1:7411/v1/blocks/$ID)" = "docker smoke"
