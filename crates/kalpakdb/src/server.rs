@@ -213,6 +213,7 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/manifest/bind-chain", post(bind_chain))
         .route("/v1/manifest/lookup", post(lookup_prefix))
         .route("/v1/stats", get(stats))
+        .route("/metrics", get(metrics))
         .route("/v1/ws", get(ws_stats))
         .route("/v1/admin/compact", post(admin_compact))
         .route("/v1/agents/list", get(list_agents))
@@ -840,6 +841,126 @@ fn stats_payload(s: &AppState) -> serde_json::Value {
 
 async fn stats(State(s): State<Shared>) -> Json<serde_json::Value> {
     Json(stats_payload(&s))
+}
+
+/// Prometheus text exposition of the same numbers `/v1/stats` reports,
+/// so the node drops into existing monitoring stacks unchanged.
+async fn metrics(State(s): State<Shared>) -> ([(axum::http::HeaderName, &'static str); 1], String) {
+    use std::fmt::Write as _;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let cold = s.store.cold().stats();
+    let tier = s.store.tier_stats();
+    let raft = s.control.metrics();
+
+    let mut out = String::with_capacity(2048);
+    let mut m = |name: &str, kind: &str, help: &str, value: u64| {
+        let _ = writeln!(
+            out,
+            "# HELP kalpak_{name} {help}\n# TYPE kalpak_{name} {kind}\nkalpak_{name} {value}"
+        );
+    };
+
+    m(
+        "blocks",
+        "gauge",
+        "Content-addressed blocks on this node",
+        cold.blocks,
+    );
+    m(
+        "segments",
+        "gauge",
+        "Segment files on disk",
+        cold.segments as u64,
+    );
+    m(
+        "disk_bytes",
+        "gauge",
+        "Bytes on disk across segments",
+        cold.bytes_on_disk,
+    );
+    m(
+        "warm_blocks",
+        "gauge",
+        "Blocks resident in the warm tier",
+        tier.warm_blocks,
+    );
+    m(
+        "warm_bytes",
+        "gauge",
+        "Warm tier bytes in use",
+        tier.warm_bytes,
+    );
+    m(
+        "warm_budget_bytes",
+        "gauge",
+        "Warm tier byte budget",
+        tier.warm_budget,
+    );
+    m("warm_hits_total", "counter", "Warm tier hits", tier.hits);
+    m(
+        "warm_misses_total",
+        "counter",
+        "Warm tier misses (disk reads)",
+        tier.misses,
+    );
+    m(
+        "gc_runs_total",
+        "counter",
+        "Compaction runs",
+        s.gc_runs.load(Relaxed),
+    );
+    m(
+        "gc_blocks_dropped_total",
+        "counter",
+        "Blocks swept by GC",
+        s.gc_blocks_dropped.load(Relaxed),
+    );
+    m(
+        "gc_bytes_reclaimed_total",
+        "counter",
+        "Bytes reclaimed by GC",
+        s.gc_bytes_reclaimed.load(Relaxed),
+    );
+    m("raft_term", "gauge", "Current Raft term", raft.current_term);
+    m(
+        "raft_last_log_index",
+        "gauge",
+        "Last Raft log index",
+        raft.last_log_index.unwrap_or(0),
+    );
+    m(
+        "raft_last_applied",
+        "gauge",
+        "Last applied Raft log index",
+        raft.last_applied.map(|l| l.index).unwrap_or(0),
+    );
+    m(
+        "raft_is_leader",
+        "gauge",
+        "1 when this node is the Raft leader",
+        u64::from(raft.current_leader == Some(raft.id)),
+    );
+    m(
+        "agents",
+        "gauge",
+        "Registered agent identities",
+        s.control.agent_count() as u64,
+    );
+    m(
+        "bindings",
+        "gauge",
+        "Prefix bindings in the state machine",
+        s.control.binding_count() as u64,
+    );
+
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        out,
+    )
 }
 
 async fn ws_stats(ws: WebSocketUpgrade, State(s): State<Shared>) -> Response {

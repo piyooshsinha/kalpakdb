@@ -149,6 +149,10 @@ Unsigned or forged mutations get `401`; reads stay open. Replay of a captured si
 
 Clients pass the CA: `KalpakClient::with_options(url, signer, Some(ca_pem))` in Rust, `KalpakClient(url, cafile="…")` in Python, `curl --cacert …`. There is no cleartext fallback on a TLS port. Scope: TLS covers the client-facing API; node-to-node Raft/replication traffic is expected to run on a private cluster network (mTLS for the mesh is future work).
 
+## Monitoring
+
+`GET /metrics` serves Prometheus text exposition (blocks, warm-tier hit/miss counters, GC totals, Raft term/log/leader, agents, bindings) — point a scraper at any node. The same numbers feed `/v1/stats` (JSON) and the dashboard's WebSocket stream.
+
 ## Research foundations
 
 KalpakDB's design decisions trace back to recent systems research. Papers that directly shaped this build:

@@ -128,4 +128,17 @@ async fn signed_writes_are_enforced() {
 
     // 6. Reads never require signatures: stats and lookups stay open.
     assert!(unsigned.stats().await.is_ok());
+
+    // 7. Prometheus metrics are exposed (and open: monitoring needs no key).
+    let body = http
+        .get(format!("http://{ADDR}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("# TYPE kalpak_blocks gauge"));
+    assert!(body.contains("kalpak_raft_is_leader 1"));
+    assert!(body.contains("kalpak_agents 1"));
 }
