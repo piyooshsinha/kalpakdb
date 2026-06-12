@@ -100,8 +100,10 @@ WebSocket — the database core is engine + protocol + SDK.
    bindings ✅, durable Raft log ✅, multi-node HTTP transport with dynamic
    membership ✅, leader forwarding (write to any node) ✅, leader-failover
    survival ✅, witness node (consensus-only voter giving a two-box
-   deployment quorum) ✅; then: network-partition simulation, group commit
-   for the fsync-bound write path.
+   deployment quorum) ✅, network-partition survival ✅ (proxy-based
+   isolation in-process: the majority commits through the partition, the
+   isolated node's term inflation cannot wedge the heal, no split brain);
+   then: mesh mTLS.
 3. **Memory API & speculative retrieval** — HTTP/WS endpoints ✅, Rust
    client SDK ✅, lookup-triggered warm-tier prefetch ✅, cross-node block
    fetch with replicate-on-read ✅, proactive block replication on put ✅,
