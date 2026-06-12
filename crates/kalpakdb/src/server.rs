@@ -22,6 +22,7 @@ use tower_http::cors::CorsLayer;
 
 pub struct AppState {
     pub store: TieredStore,
+    pub data_dir: String,
     pub control: Arc<ControlPlane>,
     /// Client for node-to-node calls (leader forwarding, peer block fetch);
     /// carries the mesh identity when mesh mTLS is enabled.
@@ -153,6 +154,7 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
     };
     let state = Arc::new(AppState {
         store,
+        data_dir: opts.data_dir.clone(),
         control,
         http,
         peer_scheme,
@@ -318,6 +320,7 @@ pub fn router(state: Shared) -> Router {
         .route("/metrics", get(metrics))
         .route("/v1/ws", get(ws_stats))
         .route("/v1/admin/compact", post(admin_compact))
+        .route("/v1/admin/backup", get(admin_backup))
         .route("/v1/agents/list", get(list_agents))
         .route("/v1/agents/{id}/bindings", get(agent_bindings))
         .with_state(state)
@@ -905,6 +908,56 @@ async fn agent_bindings(
     Ok(Json(
         json!({ "agent": agent.to_string(), "bindings": bindings }),
     ))
+}
+
+/// Stream a crash-consistent tar of the data directory from a LIVE node.
+///
+/// Ordering is the correctness argument: the control plane (Raft log +
+/// snapshot) is archived BEFORE the segments. Bindings only reference
+/// blocks that were durable before the bind (the two-phase write), so
+/// every binding in the archived metadata has its blocks in the archived
+/// segments. A torn segment/log tail from writes racing the copy is
+/// dropped on open by the existing recovery paths — the restored state is
+/// exactly "the node as of some moment during the backup".
+async fn admin_backup(State(s): State<Shared>) -> Result<Response, ApiError> {
+    let data_dir = s.data_dir.clone();
+    let tar_path =
+        tokio::task::spawn_blocking(move || -> Result<std::path::PathBuf, std::io::Error> {
+            let tmp = tempfile::NamedTempFile::new()?;
+            let (file, path) = tmp.keep().map_err(|e| e.error)?;
+            let mut builder = tar::Builder::new(std::io::BufWriter::new(file));
+            let root = std::path::Path::new(&data_dir);
+            // 1. control plane first (see ordering argument above)
+            let control = root.join("control");
+            if control.is_dir() {
+                builder.append_dir_all("control", &control)?;
+            }
+            // 2. then data-plane segments
+            for entry in std::fs::read_dir(root)? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("seg-") && name.ends_with(".klpk") {
+                    builder.append_path_with_name(entry.path(), &name)?;
+                }
+            }
+            builder.into_inner()?;
+            Ok(path)
+        })
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("backup: {e}")))?;
+
+    let file = tokio::fs::File::open(&tar_path)
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // Unlink now; the open handle keeps the bytes alive until streamed.
+    let _ = tokio::fs::remove_file(&tar_path).await;
+    let stream = tokio_util::io::ReaderStream::new(file);
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/x-tar")],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response())
 }
 
 fn stats_payload(s: &AppState) -> serde_json::Value {

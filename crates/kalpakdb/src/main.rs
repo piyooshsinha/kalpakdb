@@ -234,6 +234,44 @@ hosts: {}",
             }
             Ok(())
         }
+        // kalpakdb backup <node-url> <out.tar>: crash-consistent online backup.
+        [cmd, url, out] if cmd == "backup" => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                let resp = reqwest::get(format!("{}/v1/admin/backup", url.trim_end_matches('/')))
+                    .await?
+                    .error_for_status()?;
+                let bytes = resp.bytes().await?;
+                std::fs::write(out, &bytes)?;
+                println!("wrote {out} ({} bytes)", bytes.len());
+                Ok::<(), Box<dyn std::error::Error>>(())
+            })
+        }
+        // kalpakdb restore <backup.tar> <data-dir>: unpack and verify.
+        [cmd, tarball, dir] if cmd == "restore" => {
+            std::fs::create_dir_all(dir)?;
+            let file = std::fs::File::open(tarball)?;
+            tar::Archive::new(file).unpack(dir)?;
+            let store = BlockStore::open(dir)?;
+            let r = store.verify_all();
+            println!(
+                "restored {} block(s), {} bytes — fsck {}",
+                r.blocks_checked,
+                r.bytes_checked,
+                if r.is_clean() { "clean" } else { "FAILED" }
+            );
+            if r.is_clean() {
+                println!("start the node with:  kalpakdb serve {dir} --node-id <id>");
+                Ok(())
+            } else {
+                Err(format!(
+                    "{} corrupt, {} unreadable",
+                    r.corrupt.len(),
+                    r.unreadable.len()
+                )
+                .into())
+            }
+        }
         // kalpakdb fsck <data-dir>: re-read and hash-verify every block.
         [cmd, dir] if cmd == "fsck" => {
             let store = BlockStore::open(dir)?;

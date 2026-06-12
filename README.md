@@ -133,6 +133,8 @@ kalpakdb bench /tmp --blocks 2000 --size-kb 64      # storage throughput (put/ba
 kalpakdb stress http://127.0.0.1:7411 --agents 8    # concurrent agent workload against a node
 kalpakdb cert ./pki                                  # self-signed TLS certs
 kalpakdb fsck /tmp/kalpak-data                       # offline integrity check (hash-verify every block)
+kalpakdb backup http://127.0.0.1:7411 backup.tar     # crash-consistent online backup from a live node
+kalpakdb restore backup.tar /data/restored           # unpack + fsck; then serve the restored dir
 kalpakdb key <model> <tok> <layout> 1,2,3 4,5        # chained CacheKeys offline
 ```
 

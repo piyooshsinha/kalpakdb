@@ -24,8 +24,11 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 rustls-pemfile = "2"
 serde.workspace = true
 serde_json.workspace = true
+tar = "0.4.46"
+tempfile.workspace = true
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-stream = "0.1.18"
+tokio-util = { version = "0.7.18", features = ["io"] }
 tonic = "0.14"
 tower-http = { version = "0.6.11", features = ["cors"] }
 
