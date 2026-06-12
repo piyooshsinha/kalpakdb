@@ -19,7 +19,7 @@ mod tiered;
 pub mod uring;
 
 pub use manifest::PrefixManifest;
-pub use store::{BlockStore, CompactStats, StoreStats};
+pub use store::{BlockStore, CompactStats, StoreStats, VerifyReport};
 pub use tiered::{TierStats, TieredStore};
 
 /// All records are aligned to this boundary so direct-I/O backends can read

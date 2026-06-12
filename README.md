@@ -36,6 +36,7 @@ The name draws on Sanskrit roots that describe exactly what this database is for
 | `clients/python` | Zero-dependency Python client (same workflow, server-side key hashing; optional Ed25519 signing via `cryptography`) |
 | `dashboard/` | Optional React observability UI: live metrics, replication lag, agent memory explorer with lineage |
 | `integrations/vllm` | vLLM KV connector (V1 interface): prefix reuse + offload through KalpakDB; protocol logic CI-tested, GPU validation pending |
+| `integrations/langchain` | LangChain chat-message history: sessions as prefix chains, cross-session dedup, server-side resume |
 
 Failure modes are tested, not assumed: integration tests form real three-node clusters over HTTP and verify state-machine convergence, kill the leader and confirm re-election, crash and rejoin a node from its durable log, run two data nodes on a witness's quorum, and exercise signed-write rejection and TLS handshakes. Crash safety in the storage engine is covered by torn-write and corruption tests.
 
@@ -131,6 +132,7 @@ cd dashboard && npm install && npm run dev   # proxies /v1 to 127.0.0.1:7411
 kalpakdb bench /tmp --blocks 2000 --size-kb 64      # storage throughput (put/batch/warm/cold)
 kalpakdb stress http://127.0.0.1:7411 --agents 8    # concurrent agent workload against a node
 kalpakdb cert ./pki                                  # self-signed TLS certs
+kalpakdb fsck /tmp/kalpak-data                       # offline integrity check (hash-verify every block)
 kalpakdb key <model> <tok> <layout> 1,2,3 4,5        # chained CacheKeys offline
 ```
 

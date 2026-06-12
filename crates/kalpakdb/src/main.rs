@@ -234,6 +234,32 @@ hosts: {}",
             }
             Ok(())
         }
+        // kalpakdb fsck <data-dir>: re-read and hash-verify every block.
+        [cmd, dir] if cmd == "fsck" => {
+            let store = BlockStore::open(dir)?;
+            let r = store.verify_all();
+            println!(
+                "checked {} block(s), {} bytes",
+                r.blocks_checked, r.bytes_checked
+            );
+            for id in &r.corrupt {
+                println!("CORRUPT    {id}");
+            }
+            for id in &r.unreadable {
+                println!("UNREADABLE {id}");
+            }
+            if r.is_clean() {
+                println!("clean");
+                Ok(())
+            } else {
+                Err(format!(
+                    "{} corrupt, {} unreadable",
+                    r.corrupt.len(),
+                    r.unreadable.len()
+                )
+                .into())
+            }
+        }
         [cmd, dir] if cmd == "stat" => {
             let store = BlockStore::open(dir)?;
             let s = store.stats();

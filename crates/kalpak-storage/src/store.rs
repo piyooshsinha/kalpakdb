@@ -35,6 +35,21 @@ pub struct BlockStore<B: IoBackend = StdBackend> {
     roll_bytes: u64,
 }
 
+/// Outcome of [`BlockStore::verify_all`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyReport {
+    pub blocks_checked: u64,
+    pub bytes_checked: u64,
+    pub corrupt: Vec<BlockId>,
+    pub unreadable: Vec<BlockId>,
+}
+
+impl VerifyReport {
+    pub fn is_clean(&self) -> bool {
+        self.corrupt.is_empty() && self.unreadable.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreStats {
     pub blocks: u64,
@@ -308,6 +323,31 @@ impl<B: IoBackend> BlockStore<B> {
         self.index.read().unwrap().contains_key(id)
     }
 
+    /// Full integrity check (fsck): re-read every indexed record and verify
+    /// its payload hashes to its id. Returns per-block findings rather than
+    /// failing fast, so one bad sector doesn't hide the rest.
+    pub fn verify_all(&self) -> VerifyReport {
+        let ids: Vec<BlockId> = self.index.read().unwrap().keys().copied().collect();
+        let mut report = VerifyReport {
+            blocks_checked: 0,
+            bytes_checked: 0,
+            corrupt: Vec::new(),
+            unreadable: Vec::new(),
+        };
+        for id in ids {
+            match self.get(&id) {
+                Ok(payload) => {
+                    // get() verifies the hash; reaching here means intact.
+                    report.blocks_checked += 1;
+                    report.bytes_checked += payload.len() as u64;
+                }
+                Err(Error::Corrupt { id }) => report.corrupt.push(id),
+                Err(_) => report.unreadable.push(id),
+            }
+        }
+        report
+    }
+
     pub fn stats(&self) -> StoreStats {
         let blocks = self.index.read().unwrap().len() as u64;
         let tail = *self.append.lock().unwrap();
@@ -561,5 +601,30 @@ mod tests {
         let stats = store.compact(|_| false).unwrap();
         assert_eq!(stats.segments_rewritten, 0);
         assert_eq!(store.get(&id).unwrap(), b"unbound but recent");
+    }
+
+    #[test]
+    fn verify_all_finds_exactly_the_corrupted_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let (good, bad);
+        {
+            let store = BlockStore::open(dir.path()).unwrap();
+            good = store.put(&[1u8; 3000]).unwrap();
+            bad = store.put(&[2u8; 3000]).unwrap();
+        }
+        // Flip one payload byte of the second record on disk.
+        let seg = dir.path().join("seg-00000000.klpk");
+        let mut bytes = std::fs::read(&seg).unwrap();
+        bytes[4096 + crate::segment::HEADER_LEN] ^= 0xFF;
+        std::fs::write(&seg, &bytes).unwrap();
+
+        let store = BlockStore::open(dir.path()).unwrap();
+        let r = store.verify_all();
+        assert!(!r.is_clean());
+        assert_eq!(r.blocks_checked, 1);
+        assert_eq!(r.corrupt, vec![bad]);
+        assert!(r.unreadable.is_empty());
+        // The intact block still verifies.
+        assert_eq!(store.get(&good).unwrap(), vec![1u8; 3000]);
     }
 }
