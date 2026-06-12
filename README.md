@@ -174,7 +174,9 @@ Node-to-node traffic gets **mutual TLS**: `kalpakdb mesh-ca` generates a cluster
 
 ## Monitoring
 
-`GET /metrics` serves Prometheus text exposition (blocks, warm-tier hit/miss counters, GC totals, Raft term/log/leader, agents, bindings) — point a scraper at any node. The same numbers feed `/v1/stats` (JSON) and the dashboard's WebSocket stream.
+`GET /metrics` serves Prometheus text exposition (blocks, warm-tier hit/miss counters, importance-pinned tier, GC totals, Raft term/log/leader, agents, bindings) — point a scraper at any node and import [docs/grafana-dashboard.json](docs/grafana-dashboard.json) into Grafana. The same numbers feed `/v1/stats` (JSON) and the dashboard's WebSocket stream.
+
+Placement is importance-aware (IMPRESS-style): blocks referenced by **multiple bindings** — shared prefixes, common system prompts — are pinned into a dedicated tier that a flood of one-off reads can never evict. The signal is structural (replicated binding refcounts), so it needs no workload tuning.
 
 ## Research foundations
 

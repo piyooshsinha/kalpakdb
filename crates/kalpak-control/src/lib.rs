@@ -292,6 +292,30 @@ impl ControlPlane {
         })
     }
 
+    /// How many bindings reference `id`.
+    pub fn block_ref_count(&self, id: &BlockId) -> u32 {
+        self.sm
+            .state
+            .read()
+            .unwrap()
+            .block_refs
+            .get(id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Blocks referenced by at least `min_refs` bindings — the structural
+    /// importance set for pinned warm placement (IMPRESS-style).
+    pub fn shared_blocks(&self, min_refs: u32) -> Vec<BlockId> {
+        let state = self.sm.state.read().unwrap();
+        state
+            .block_refs
+            .iter()
+            .filter(|(_, n)| **n >= min_refs)
+            .map(|(b, _)| *b)
+            .collect()
+    }
+
     /// Every block referenced by any binding: the GC live set.
     pub fn bound_blocks(&self) -> std::collections::HashSet<BlockId> {
         self.sm

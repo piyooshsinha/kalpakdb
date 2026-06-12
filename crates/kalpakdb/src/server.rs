@@ -382,6 +382,21 @@ impl From<kalpak_control::ControlError> for ApiError {
     }
 }
 
+/// After a bind commits, pin any of its blocks that are now referenced by
+/// multiple bindings: structural importance (shared prefixes, system
+/// prompts) earns eviction immunity (IMPRESS-style placement).
+fn pin_shared_blocks(s: &Shared, blocks: &[BlockId]) {
+    let state = s.clone();
+    let blocks = blocks.to_vec();
+    tokio::task::spawn_blocking(move || {
+        for id in blocks {
+            if state.control.block_ref_count(&id) >= 2 {
+                let _ = state.store.pin(&id);
+            }
+        }
+    });
+}
+
 /// Marks node-to-node requests so they never cascade (a peer asked to help
 /// must answer from local state only).
 const INTERNAL_HEADER: &str = "x-kalpak-internal";
@@ -642,7 +657,10 @@ async fn bind_prefix(
         )
         .await
     {
-        Ok(()) => Ok(Json(json!({ "bound": true }))),
+        Ok(()) => {
+            pin_shared_blocks(&s, &req.blocks);
+            Ok(Json(json!({ "bound": true })))
+        }
         Err(e) => {
             let body = json!({
                 "agent": req.agent,
@@ -709,7 +727,11 @@ async fn bind_chain(
         }
     }
     match s.control.bind_chain(req.agent, req.bindings.clone()).await {
-        Ok(()) => Ok(Json(json!({ "bound": req.bindings.len() }))),
+        Ok(()) => {
+            let all: Vec<BlockId> = req.bindings.iter().flat_map(|b| b.blocks.clone()).collect();
+            pin_shared_blocks(&s, &all);
+            Ok(Json(json!({ "bound": req.bindings.len() })))
+        }
         Err(e) => {
             let body = json!({
                 "agent": req.agent,
@@ -972,6 +994,9 @@ fn stats_payload(s: &AppState) -> serde_json::Value {
             "warm_blocks": tier.warm_blocks,
             "warm_bytes": tier.warm_bytes,
             "warm_budget": tier.warm_budget,
+            "pinned_blocks": tier.pinned_blocks,
+            "pinned_bytes": tier.pinned_bytes,
+            "pinned_budget": tier.pinned_budget,
             "hits": tier.hits,
             "misses": tier.misses,
         },
@@ -1051,6 +1076,18 @@ async fn metrics(State(s): State<Shared>) -> ([(axum::http::HeaderName, &'static
         "gauge",
         "Warm tier byte budget",
         tier.warm_budget,
+    );
+    m(
+        "pinned_blocks",
+        "gauge",
+        "Importance-pinned blocks (refcount >= 2)",
+        tier.pinned_blocks,
+    );
+    m(
+        "pinned_bytes",
+        "gauge",
+        "Importance-pinned bytes",
+        tier.pinned_bytes,
     );
     m("warm_hits_total", "counter", "Warm tier hits", tier.hits);
     m(

@@ -1,0 +1,220 @@
+{
+  "title": "KalpakDB",
+  "uid": "kalpakdb",
+  "tags": [
+    "kalpakdb"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "10s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Warm hit rate",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 8,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "rate(kalpak_warm_hits_total[1m]) / (rate(kalpak_warm_hits_total[1m]) + rate(kalpak_warm_misses_total[1m]))",
+          "legendFormat": "hit rate",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Reads/s (warm vs disk)",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 8,
+        "y": 0,
+        "w": 8,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "rate(kalpak_warm_hits_total[1m])",
+          "legendFormat": "warm hits/s",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(kalpak_warm_misses_total[1m])",
+          "legendFormat": "disk reads/s",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Tier occupancy",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 16,
+        "y": 0,
+        "w": 8,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "kalpak_warm_bytes",
+          "legendFormat": "warm bytes",
+          "refId": "A"
+        },
+        {
+          "expr": "kalpak_warm_budget_bytes",
+          "legendFormat": "warm budget",
+          "refId": "B"
+        },
+        {
+          "expr": "kalpak_pinned_bytes",
+          "legendFormat": "pinned bytes",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Blocks & disk",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 7,
+        "w": 8,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "kalpak_blocks",
+          "legendFormat": "blocks",
+          "refId": "A"
+        },
+        {
+          "expr": "kalpak_disk_bytes",
+          "legendFormat": "disk bytes",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "GC",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 8,
+        "y": 7,
+        "w": 8,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "rate(kalpak_gc_bytes_reclaimed_total[5m])",
+          "legendFormat": "bytes reclaimed/s",
+          "refId": "A"
+        },
+        {
+          "expr": "kalpak_gc_runs_total",
+          "legendFormat": "runs total",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Raft",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 16,
+        "y": 7,
+        "w": 8,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "kalpak_raft_last_log_index",
+          "legendFormat": "log head",
+          "refId": "A"
+        },
+        {
+          "expr": "kalpak_raft_last_applied",
+          "legendFormat": "applied",
+          "refId": "B"
+        },
+        {
+          "expr": "kalpak_raft_is_leader",
+          "legendFormat": "is leader",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Agents & bindings",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 14,
+        "w": 8,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "kalpak_agents",
+          "legendFormat": "agents",
+          "refId": "A"
+        },
+        {
+          "expr": "kalpak_bindings",
+          "legendFormat": "bindings",
+          "refId": "B"
+        }
+      ]
+    }
+  ]
+}

@@ -27,6 +27,14 @@ pub struct TieredStore<B: IoBackend = StdBackend> {
     cold: BlockStore<B>,
     warm: moka::sync::Cache<BlockId, Arc<Vec<u8>>>,
     warm_budget: u64,
+    /// Importance-pinned blocks (IMPRESS-style): structurally shared blocks
+    /// (referenced by multiple bindings) held outside the scan-evictable
+    /// cache. A flood of one-off reads can never evict a pinned block.
+    pinned: std::sync::RwLock<std::collections::HashMap<BlockId, Arc<Vec<u8>>>>,
+    pinned_bytes: AtomicU64,
+    /// Pinned budget is a quarter of the warm budget: importance placement
+    /// must never starve the recency cache that serves the common case.
+    pinned_budget: u64,
     hits: AtomicU64,
     misses: AtomicU64,
 }
@@ -36,6 +44,9 @@ pub struct TierStats {
     pub warm_blocks: u64,
     pub warm_bytes: u64,
     pub warm_budget: u64,
+    pub pinned_blocks: u64,
+    pub pinned_bytes: u64,
+    pub pinned_budget: u64,
     pub hits: u64,
     pub misses: u64,
 }
@@ -58,9 +69,33 @@ impl<B: IoBackend> TieredStore<B> {
             cold,
             warm,
             warm_budget: warm_budget_bytes,
+            pinned: std::sync::RwLock::new(std::collections::HashMap::new()),
+            pinned_bytes: AtomicU64::new(0),
+            pinned_budget: warm_budget_bytes / 4,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
+    }
+
+    /// Pin a block into the importance tier (no-op when already pinned,
+    /// unknown, or the pinned budget is exhausted — pinning is advisory,
+    /// the recency cache still serves unpinned blocks).
+    pub fn pin(&self, id: &BlockId) -> Result<bool, Error> {
+        if self.pinned.read().unwrap().contains_key(id) {
+            return Ok(true);
+        }
+        let payload = self.get(id)?;
+        let len = payload.len() as u64;
+        let mut pinned = self.pinned.write().unwrap();
+        if pinned.contains_key(id) {
+            return Ok(true);
+        }
+        if self.pinned_bytes.load(Ordering::Relaxed) + len > self.pinned_budget {
+            return Ok(false);
+        }
+        pinned.insert(*id, payload);
+        self.pinned_bytes.fetch_add(len, Ordering::Relaxed);
+        Ok(true)
     }
 
     fn warm_insert(&self, id: BlockId, payload: Arc<Vec<u8>>) {
@@ -91,7 +126,13 @@ impl<B: IoBackend> TieredStore<B> {
     }
 
     /// Serve from RAM when possible; on a cold hit, verify and promote.
+    /// Pinned (structurally important) blocks are checked first and are
+    /// immune to recency eviction.
     pub fn get(&self, id: &BlockId) -> Result<Arc<Vec<u8>>, Error> {
+        if let Some(payload) = self.pinned.read().unwrap().get(id) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(Arc::clone(payload));
+        }
         if let Some(payload) = self.warm.get(id) {
             self.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(payload);
@@ -118,6 +159,20 @@ impl<B: IoBackend> TieredStore<B> {
     ) -> Result<crate::store::CompactStats, Error> {
         let stats = self.cold.compact(&live)?;
         if stats.blocks_dropped > 0 {
+            // Dead blocks leave the pinned tier too.
+            let mut pinned = self.pinned.write().unwrap();
+            let dead: Vec<BlockId> = pinned
+                .keys()
+                .filter(|id| !self.cold.contains(id))
+                .copied()
+                .collect();
+            for id in dead {
+                if let Some(p) = pinned.remove(&id) {
+                    self.pinned_bytes
+                        .fetch_sub(p.len() as u64, Ordering::Relaxed);
+                }
+            }
+            drop(pinned);
             // Dead ids are no longer in the cold index; sweep warm entries
             // that the cold store no longer backs.
             let dead: Vec<BlockId> = self
@@ -140,6 +195,9 @@ impl<B: IoBackend> TieredStore<B> {
             warm_blocks: self.warm.entry_count(),
             warm_bytes: self.warm.weighted_size(),
             warm_budget: self.warm_budget,
+            pinned_blocks: self.pinned.read().unwrap().len() as u64,
+            pinned_bytes: self.pinned_bytes.load(Ordering::Relaxed),
+            pinned_budget: self.pinned_budget,
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
         }
@@ -249,5 +307,43 @@ mod tests {
             h.join().unwrap();
         }
         assert!(store.tier_stats().warm_bytes <= store.tier_stats().warm_budget);
+    }
+
+    #[test]
+    fn pinned_block_survives_a_scan_flood() {
+        let dir = tempfile::tempdir().unwrap();
+        // Tiny warm budget: a flood of one-off blocks evicts everything
+        // recency-based. Pinned budget = budget/4.
+        let store = TieredStore::open(dir.path(), 64 * 1024).unwrap();
+        let shared = store.put(&[7u8; 4000]).unwrap();
+        assert!(store.pin(&shared).unwrap());
+
+        // Flood with one-off blocks well past the warm budget.
+        for i in 0..100u32 {
+            store.put(&i.to_le_bytes().repeat(1000)).unwrap();
+        }
+
+        let before = store.tier_stats();
+        assert_eq!(store.get(&shared).unwrap().as_slice(), &[7u8; 4000]);
+        let after = store.tier_stats();
+        assert_eq!(after.hits, before.hits + 1, "pinned read must be a hit");
+        assert_eq!(after.misses, before.misses, "pinned read never hits disk");
+        assert_eq!(after.pinned_blocks, 1);
+    }
+
+    #[test]
+    fn pin_respects_its_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        // warm 16 KiB -> pinned budget 4 KiB.
+        let store = TieredStore::open(dir.path(), 16 * 1024).unwrap();
+        let a = store.put(&[1u8; 3000]).unwrap();
+        let b = store.put(&[2u8; 3000]).unwrap();
+        assert!(store.pin(&a).unwrap(), "first pin fits");
+        assert!(!store.pin(&b).unwrap(), "second pin exceeds the budget");
+        let s = store.tier_stats();
+        assert_eq!(s.pinned_blocks, 1);
+        assert!(s.pinned_bytes <= s.pinned_budget);
+        // Unpinned block is still perfectly readable.
+        assert_eq!(store.get(&b).unwrap().as_slice(), &[2u8; 3000]);
     }
 }

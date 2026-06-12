@@ -34,6 +34,11 @@ pub struct MetadataState {
     /// requests that declare their parent; drives lookahead prefetch.
     #[serde(default)]
     pub children: HashMap<String, Vec<String>>,
+    /// How many bindings reference each block: the structural importance
+    /// signal (a block shared by many prefixes — e.g. a common system
+    /// prompt — matters more than a single-context block).
+    #[serde(default)]
+    pub block_refs: HashMap<BlockId, u32>,
     pub last_applied: Option<LogId>,
     pub membership: StoredMembership<NodeId, openraft::BasicNode>,
 }
@@ -105,6 +110,21 @@ impl StateMachineStore {
         parent: Option<&CacheKey>,
     ) {
         let key_s = binding_key(key);
+        // Refcounts track binding membership: rebinding a key first releases
+        // its old blocks, so counts stay exact rather than ever-growing.
+        if let Some(old) = state.bindings.get(&key_s) {
+            for b in &old.blocks {
+                if let Some(n) = state.block_refs.get_mut(b) {
+                    *n = n.saturating_sub(1);
+                    if *n == 0 {
+                        state.block_refs.remove(b);
+                    }
+                }
+            }
+        }
+        for b in blocks {
+            *state.block_refs.entry(*b).or_insert(0) += 1;
+        }
         state.bindings.insert(
             key_s.clone(),
             BindingRecord {
