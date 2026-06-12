@@ -141,11 +141,11 @@ async fn cluster_survives_partition_and_heals() {
         json!({ "members": { "1": format!("127.0.0.1:{}", prox[0]) } }),
     )
     .await;
-    for i in 1..3 {
+    for (i, port) in prox.iter().enumerate().skip(1) {
         post_ok(
             &client,
             format!("http://{n1}/v1/cluster/add-learner"),
-            json!({ "node_id": i + 1, "addr": format!("127.0.0.1:{}", prox[i]) }),
+            json!({ "node_id": i + 1, "addr": format!("127.0.0.1:{port}") }),
         )
         .await;
     }
