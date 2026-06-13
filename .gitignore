@@ -5,3 +5,8 @@ dashboard/dist
 .DS_Store
 clients/typescript/node_modules
 clients/typescript/dist
+# Python bytecode and build artifacts
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
