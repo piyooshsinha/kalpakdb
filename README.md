@@ -35,6 +35,7 @@ The name draws on Sanskrit roots that describe exactly what this database is for
 | `kalpak-client` | Rust SDK: full agent workflow, transparent signing, TLS root-CA support, optional gRPC streaming (`--features grpc`) |
 | `clients/python` | Zero-dependency Python client (same workflow, server-side key hashing; optional Ed25519 signing via `cryptography`) |
 | `clients/typescript` | Zero-dependency TypeScript/Node client (Node 18+ fetch; signed writes via built-in Ed25519) |
+| `clients/go` | Zero-dependency Go client (stdlib net/http; signed writes via crypto/ed25519) |
 | `dashboard/` | Optional React observability UI: live metrics, replication lag, agent memory explorer with lineage |
 | `integrations/vllm` | vLLM KV connector (V1 interface): prefix reuse + offload through KalpakDB; protocol logic CI-tested, GPU validation pending |
 | `integrations/langchain` | LangChain chat-message history: sessions as prefix chains, cross-session dedup, server-side resume |
@@ -95,6 +96,17 @@ const db = new KalpakClient("http://127.0.0.1:7411");
 const fp = { model_id: "meta-llama/Llama-3.1-8B", tokenizer_hash: "tok-hash", kv_layout: "fp16/paged-16" };
 const k0 = await db.cacheKey(fp, [1, 2, 3]);
 const hit = await db.lookup([k0]);
+```
+
+### Go
+
+```go
+import kalpak "github.com/piyooshsinha/kalpakdb/clients/go"
+
+db := kalpak.New("http://127.0.0.1:7411")
+fp := kalpak.ModelFingerprint{ModelID: "meta-llama/Llama-3.1-8B", TokenizerHash: "tok-hash", KVLayout: "fp16/paged-16"}
+k0, _ := db.CacheKey(fp, []uint32{1, 2, 3})
+hit, _ := db.Lookup([]kalpak.CacheKey{k0})
 ```
 
 ### Three-node cluster

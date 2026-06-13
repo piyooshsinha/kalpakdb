@@ -69,6 +69,16 @@ jobs:
           cd clients/typescript
           npm ci
           KALPAKDB_BIN=$GITHUB_WORKSPACE/target/debug/kalpakdb npm test
+      - name: Set up Go
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - name: Go client tests
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cd clients/go
+          KALPAKDB_BIN=$GITHUB_WORKSPACE/target/debug/kalpakdb go test ./...
       - name: Python client tests
         if: matrix.os == 'ubuntu-latest'
         run: |
