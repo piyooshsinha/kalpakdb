@@ -17,8 +17,8 @@ repository = "https://github.com/piyooshsinha/kalpakdb"
 rust-version = "1.96"
 
 [workspace.dependencies]
-kalpak-core = { path = "crates/kalpak-core" }
-kalpak-storage = { path = "crates/kalpak-storage" }
+kalpak-core = { version = "0.6.0", path = "crates/kalpak-core" }
+kalpak-storage = { version = "0.6.0", path = "crates/kalpak-storage" }
 blake3 = "1.5"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 serde = { version = "1", features = ["derive"] }

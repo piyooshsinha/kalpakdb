@@ -34,6 +34,6 @@ tower-http = { version = "0.6.11", features = ["cors"] }
 
 [dev-dependencies]
 ed25519-dalek.workspace = true
-kalpak-client = { path = "../kalpak-client" }
+kalpak-client = { version = "0.6.0", path = "../kalpak-client" }
 rcgen = "0.14.8"
 tempfile.workspace = true

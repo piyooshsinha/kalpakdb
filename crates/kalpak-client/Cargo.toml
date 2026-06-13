@@ -15,7 +15,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-kalpak-proto = { path = "../kalpak-proto", optional = true }
+kalpak-proto = { version = "0.6.0", path = "../kalpak-proto", optional = true }
 tonic = { version = "0.14", optional = true }
 tokio-stream = { version = "0.1", optional = true }
 ed25519-dalek.workspace = true
