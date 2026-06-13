@@ -41,6 +41,11 @@ impl BlockService for BlockGrpc {
         /// across the network stream — a slow client must never head-of-line
         /// block other writers.
         const FLUSH_BYTES: usize = 64 * 1024 * 1024;
+        // A single block is bounded too: FLUSH_BYTES only caps *completed*
+        // blocks, so without this a client that streams chunks forever
+        // without ever setting last_chunk would grow one block unbounded and
+        // exhaust memory. No legitimate KV block approaches the default.
+        let max_block_bytes = self.state.max_block_bytes;
 
         let mut stream = request.into_inner();
         let mut blocks: Vec<Vec<u8>> = Vec::new();
@@ -59,6 +64,11 @@ impl BlockService for BlockGrpc {
 
         while let Some(chunk) = stream.message().await? {
             current.extend_from_slice(&chunk.data);
+            if current.len() > max_block_bytes {
+                return Err(Status::resource_exhausted(format!(
+                    "block exceeds {max_block_bytes} bytes without a last_chunk marker"
+                )));
+            }
             if chunk.last_chunk {
                 staged_bytes += current.len();
                 blocks.push(std::mem::take(&mut current));

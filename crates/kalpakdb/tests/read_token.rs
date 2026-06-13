@@ -19,6 +19,7 @@ async fn read_token_guards_observability_only() {
         grpc_addr: None,
         compact_secs: 0,
         require_signatures: false,
+        max_block_bytes: None,
         read_token: Some("s3cret".to_string()),
         tls_cert: None,
         tls_key: None,

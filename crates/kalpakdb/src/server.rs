@@ -31,6 +31,8 @@ pub struct AppState {
     pub peer_scheme: &'static str,
     /// Reject unsigned metadata mutations.
     pub require_signatures: bool,
+    /// Max bytes for a single streamed gRPC block.
+    pub max_block_bytes: usize,
     /// Bearer token demanded for observability reads, when set.
     pub read_token: Option<String>,
     /// Cumulative GC telemetry (manual + scheduled compactions).
@@ -67,6 +69,10 @@ pub struct ServeOpts {
     /// Reject metadata mutations (register/bind) that are not signed by the
     /// owning agent's Ed25519 key.
     pub require_signatures: bool,
+    /// Max bytes for a single streamed gRPC block before it is rejected
+    /// (None = 256 MiB default). A safety bound on unbounded accumulation,
+    /// also an ops knob for unusually large or memory-constrained nodes.
+    pub max_block_bytes: Option<usize>,
     /// Serve the client-facing API over TLS (PEM paths). Node-to-node
     /// traffic stays plain HTTP on the cluster network; generate dev certs
     /// with `kalpakdb cert`.
@@ -165,6 +171,7 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
         http,
         peer_scheme,
         require_signatures: opts.require_signatures,
+        max_block_bytes: opts.max_block_bytes.unwrap_or(256 * 1024 * 1024),
         read_token: opts.read_token.clone(),
         gc_runs: Default::default(),
         gc_blocks_dropped: Default::default(),
