@@ -176,6 +176,8 @@ Unsigned or forged mutations get `401`; reads stay open. Replay of a captured si
 
 Clients pass the CA: `KalpakClient::with_options(url, signer, Some(ca_pem))` in Rust, `KalpakClient(url, cafile="…")` in Python, `curl --cacert …`. There is no cleartext fallback on a TLS port.
 
+Observability reads can demand a token: `--read-token <t>` guards `/v1/stats`, `/v1/ws`, and the agent explorer with `Authorization: Bearer <t>` (the dashboard picks it up from `?token=`); `/metrics` stays open for Prometheus scrapers and the data path is governed by signatures, not the read token.
+
 Node-to-node traffic gets **mutual TLS**: `kalpakdb mesh-ca` generates a cluster CA and node certificates, and `--mesh <addr>,<ca>,<cert>,<key>` moves all Raft/replication RPCs onto a dedicated mTLS listener where presenting a CA-signed certificate *is* mesh membership — both sides authenticate, so neither a rogue client nor a rogue server can join the cluster path:
 
 ```sh

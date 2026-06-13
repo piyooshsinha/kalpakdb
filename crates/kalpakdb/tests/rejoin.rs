@@ -23,6 +23,7 @@ fn spawn(node_id: u64, port: u16, dir: std::path::PathBuf) -> NodeProc {
         grpc_addr: None,
         compact_secs: 0,
         require_signatures: false,
+        read_token: None,
         tls_cert: None,
         tls_key: None,
         mesh: None,

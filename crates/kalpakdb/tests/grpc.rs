@@ -19,6 +19,7 @@ async fn grpc_streams_blocks_through_group_commit() {
         grpc_addr: Some("127.0.0.1:17552".to_string()),
         compact_secs: 0,
         require_signatures: false,
+        read_token: None,
         tls_cert: None,
         tls_key: None,
         mesh: None,

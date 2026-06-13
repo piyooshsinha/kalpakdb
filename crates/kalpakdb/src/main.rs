@@ -43,6 +43,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 bootstrap: cmd == "serve",
                 grpc_addr: None,
                 require_signatures: false,
+                read_token: None,
                 tls_cert: None,
                 tls_key: None,
                 mesh: None,
@@ -61,6 +62,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     "--join" => opts.bootstrap = false,
                     "--require-signatures" => opts.require_signatures = true,
+                    "--read-token" => {
+                        opts.read_token =
+                            Some(it.next().ok_or("--read-token needs a value")?.clone())
+                    }
                     "--tls-cert" => {
                         opts.tls_cert = Some(it.next().ok_or("--tls-cert needs a value")?.clone())
                     }

@@ -1,5 +1,20 @@
 import { useEffect, useRef, useState } from "react";
 
+// Optional read token (--read-token nodes): taken from ?token=... once and
+// remembered. Attached as a Bearer header to fetches and ?token= to the WS.
+const READ_TOKEN: string | null = (() => {
+  const fromUrl = new URLSearchParams(location.search).get("token");
+  if (fromUrl) {
+    localStorage.setItem("kalpak_token", fromUrl);
+    return fromUrl;
+  }
+  return localStorage.getItem("kalpak_token");
+})();
+
+function authedFetch(path: string): Promise<Response> {
+  return fetch(path, READ_TOKEN ? { headers: { authorization: `Bearer ${READ_TOKEN}` } } : {});
+}
+
 type Stats = {
   data_plane: {
     blocks: number;
@@ -102,7 +117,7 @@ function Agents() {
 
   useEffect(() => {
     const load = () =>
-      fetch("/v1/agents/list")
+      authedFetch("/v1/agents/list")
         .then((r) => r.json())
         .then((d) => setAgents(d.agents ?? []))
         .catch(() => {});
@@ -113,7 +128,7 @@ function Agents() {
 
   useEffect(() => {
     if (!selected) return;
-    fetch(`/v1/agents/${selected}/bindings`)
+    authedFetch(`/v1/agents/${selected}/bindings`)
       .then((r) => r.json())
       .then((d) => setBindings(d.bindings ?? []))
       .catch(() => setBindings([]));
@@ -184,7 +199,8 @@ export default function App() {
 
     const connect = () => {
       const proto = location.protocol === "https:" ? "wss" : "ws";
-      ws = new WebSocket(`${proto}://${location.host}/v1/ws`);
+      const tok = READ_TOKEN ? `?token=${encodeURIComponent(READ_TOKEN)}` : "";
+      ws = new WebSocket(`${proto}://${location.host}/v1/ws${tok}`);
       ws.onopen = () => setOnline(true);
       ws.onmessage = (ev) => {
         const s: Stats = JSON.parse(ev.data);

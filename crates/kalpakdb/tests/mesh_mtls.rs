@@ -32,6 +32,7 @@ fn spawn_node(
         grpc_addr: None,
         compact_secs: 0,
         require_signatures: true,
+        read_token: None,
         tls_cert: None,
         tls_key: None,
         mesh: Some(MeshOpts {

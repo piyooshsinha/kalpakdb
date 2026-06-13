@@ -31,6 +31,8 @@ pub struct AppState {
     pub peer_scheme: &'static str,
     /// Reject unsigned metadata mutations.
     pub require_signatures: bool,
+    /// Bearer token demanded for observability reads, when set.
+    pub read_token: Option<String>,
     /// Cumulative GC telemetry (manual + scheduled compactions).
     pub gc_runs: std::sync::atomic::AtomicU64,
     pub gc_blocks_dropped: std::sync::atomic::AtomicU64,
@@ -70,6 +72,10 @@ pub struct ServeOpts {
     /// with `kalpakdb cert`.
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
+    /// When set, observability reads (/v1/stats, /v1/ws, /v1/agents/*)
+    /// require `Authorization: Bearer <token>` (or `?token=` for the
+    /// WebSocket). /metrics stays open for Prometheus scrapers.
+    pub read_token: Option<String>,
     /// Mutually-authenticated mesh listener for node-to-node traffic.
     /// When set, cluster membership addresses must point here, and internal
     /// trust (forwarding, replication) only exists on this listener —
@@ -159,6 +165,7 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
         http,
         peer_scheme,
         require_signatures: opts.require_signatures,
+        read_token: opts.read_token.clone(),
         gc_runs: Default::default(),
         gc_blocks_dropped: Default::default(),
         gc_bytes_reclaimed: Default::default(),
@@ -395,6 +402,32 @@ fn pin_shared_blocks(s: &Shared, blocks: &[BlockId]) {
             }
         }
     });
+}
+
+/// Guard for observability reads when `--read-token` is set. Accepts the
+/// token as a Bearer header or (for WebSocket clients, which cannot set
+/// headers from browsers) a `?token=` query parameter.
+fn check_read_token(
+    s: &AppState,
+    headers: &axum::http::HeaderMap,
+    query_token: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(expected) = &s.read_token else {
+        return Ok(());
+    };
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .or(query_token);
+    if presented == Some(expected.as_str()) {
+        Ok(())
+    } else {
+        Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "this node requires a read token: Authorization: Bearer <token>".to_string(),
+        ))
+    }
 }
 
 /// Marks node-to-node requests so they never cascade (a peer asked to help
@@ -884,7 +917,11 @@ async fn admin_compact(State(s): State<Shared>) -> Result<Json<serde_json::Value
 }
 
 /// The "mind explorer" listing: every registered agent, oldest first.
-async fn list_agents(State(s): State<Shared>) -> Json<serde_json::Value> {
+async fn list_agents(
+    State(s): State<Shared>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_read_token(&s, &headers, None)?;
     let agents: Vec<_> = s
         .control
         .agents_list()
@@ -898,14 +935,16 @@ async fn list_agents(State(s): State<Shared>) -> Json<serde_json::Value> {
             })
         })
         .collect();
-    Json(json!({ "agents": agents }))
+    Ok(Json(json!({ "agents": agents })))
 }
 
 /// Audit one agent's memory: which prefix keys it bound to which blocks.
 async fn agent_bindings(
     State(s): State<Shared>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    check_read_token(&s, &headers, None)?;
     let agent: AgentId = id.parse()?;
     let parents = s.control.parent_index();
     let bindings: Vec<_> = s
@@ -1019,8 +1058,12 @@ fn stats_payload(s: &AppState) -> serde_json::Value {
     })
 }
 
-async fn stats(State(s): State<Shared>) -> Json<serde_json::Value> {
-    Json(stats_payload(&s))
+async fn stats(
+    State(s): State<Shared>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_read_token(&s, &headers, None)?;
+    Ok(Json(stats_payload(&s)))
 }
 
 /// Prometheus text exposition of the same numbers `/v1/stats` reports,
@@ -1155,8 +1198,20 @@ async fn metrics(State(s): State<Shared>) -> ([(axum::http::HeaderName, &'static
     )
 }
 
-async fn ws_stats(ws: WebSocketUpgrade, State(s): State<Shared>) -> Response {
-    ws.on_upgrade(move |socket| stream_stats(socket, s))
+#[derive(Deserialize)]
+struct WsQuery {
+    #[serde(default)]
+    token: Option<String>,
+}
+
+async fn ws_stats(
+    ws: WebSocketUpgrade,
+    State(s): State<Shared>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<WsQuery>,
+) -> Result<Response, ApiError> {
+    check_read_token(&s, &headers, q.token.as_deref())?;
+    Ok(ws.on_upgrade(move |socket| stream_stats(socket, s)))
 }
 
 async fn stream_stats(mut socket: WebSocket, s: Shared) {
