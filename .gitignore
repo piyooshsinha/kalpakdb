@@ -3,3 +3,5 @@
 dashboard/node_modules
 dashboard/dist
 .DS_Store
+clients/typescript/node_modules
+clients/typescript/dist

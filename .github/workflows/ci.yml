@@ -63,6 +63,12 @@ jobs:
       - name: Build node for Python client tests
         if: matrix.os == 'ubuntu-latest'
         run: cargo build -p kalpakdb
+      - name: TypeScript client tests
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cd clients/typescript
+          npm ci
+          KALPAKDB_BIN=$GITHUB_WORKSPACE/target/debug/kalpakdb npm test
       - name: Python client tests
         if: matrix.os == 'ubuntu-latest'
         run: |
