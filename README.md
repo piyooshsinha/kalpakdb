@@ -222,7 +222,7 @@ KalpakDB's design decisions trace back to recent systems research. Papers that d
 
 ## Architecture
 
-See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the two-box reference deployment runbook (with `scripts/bench_cluster.py` for the network-path numbers), and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the thesis, the three planes, and what remains on the roadmap (importance-aware tier placement, model-based lookahead prediction, real-network benchmarks vs LMCache). [CHANGELOG.md](CHANGELOG.md) tracks releases.
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the two-box reference deployment runbook (with `scripts/bench_cluster.py` for the network-path numbers), and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the thesis, the three planes, and what remains on the roadmap (importance-aware tier placement, model-based lookahead prediction, real-network benchmarks vs LMCache). [CHANGELOG.md](CHANGELOG.md) tracks releases, and [docs/LAUNCH.md](docs/LAUNCH.md) holds the announcement drafts for when the hardware benchmarks land.
 
 ## License
 
