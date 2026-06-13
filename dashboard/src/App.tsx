@@ -23,6 +23,8 @@ type Stats = {
     warm_blocks: number;
     warm_bytes: number;
     warm_budget: number;
+    pinned_blocks: number;
+    pinned_bytes: number;
     hits: number;
     misses: number;
   };
@@ -248,7 +250,7 @@ export default function App() {
           <Card
             label="Warm tier"
             value={d ? fmtBytes(d.warm_bytes) : "—"}
-            detail={d ? `${d.warm_blocks} block(s) of ${fmtBytes(d.warm_budget)} budget` : ""}
+            detail={d ? `${d.warm_blocks} warm + ${d.pinned_blocks} pinned of ${fmtBytes(d.warm_budget)} budget` : ""}
           >
             <div className="bar">
               <div style={{ width: `${Math.min(warmPct, 100)}%` }} />
