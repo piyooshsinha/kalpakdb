@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.6.0 — 2026-06-12
+
+The verification release: adversarial proof of the durability claims,
+plus the third client surface.
+
+### Adversarial verification
+- SIGKILL crash test: a real kalpakdb process is killed four times mid
+  write-storm; the store must fsck clean after every kill and every
+  ACKNOWLEDGED write must be served byte-identically after restart
+- Property-based model testing (proptest): 64 randomized interleavings
+  of put / batched put / get / reopen / compact per run, segments
+  rolling every 16 KiB, checked against a HashMap model — plus a
+  generator proving the segment scanner survives arbitrary garbage
+
+### TypeScript/Node SDK (clients/typescript)
+- Zero runtime dependencies (Node 18+ fetch); full agent workflow
+- Signed writes via Node's built-in Ed25519 over the same canonical
+  byte layout as Rust and Python — cross-language verification is
+  tested live against a --require-signatures node
+
+
 ## 0.5.0 — 2026-06-12
 
 The operations release: the capabilities that make a database

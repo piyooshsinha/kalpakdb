@@ -1,6 +1,6 @@
 [project]
 name = "kalpakdb"
-version = "0.5.0"
+version = "0.6.0"
 description = "Python client for KalpakDB: content-addressed, Raft-replicated state for AI agents"
 readme = "README.md"
 license = "Apache-2.0"
