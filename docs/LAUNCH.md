@@ -221,6 +221,14 @@ deliberate and it's the project's credibility on the line:
   ~500 MiB/s on the dev Mac) are **single-node storage-engine** numbers, not
   end-to-end TTFT — fine to mention as "the storage layer is fast" but not as
   "KalpakDB makes inference N× faster."
+- `scripts/bench_prefix_reuse.py` measures the **KalpakDB-side** prefix-reuse
+  latency honestly: on the dev Mac, a cache *hit* (lookup + warm-block fetch)
+  is ~0.5 ms p50 / ~0.8 ms p99, versus ~4.4 ms p50 for a *miss* (put + bind).
+  The hit path is what an inference engine pays **instead of** recomputing a
+  prefix's KV cache — but the recompute it replaces is model-dependent and
+  only measurable end-to-end on the hardware run. Cite the 0.5 ms as "the
+  overhead KalpakDB adds on a cache hit is sub-millisecond," not as a speedup
+  multiplier.
 - The number that matters — TTFT with vs. without KalpakDB under vLLM on the
   real cluster — doesn't exist yet. When it does (issues #3, #5), it gets
   published with the full setup so anyone can reproduce it.
