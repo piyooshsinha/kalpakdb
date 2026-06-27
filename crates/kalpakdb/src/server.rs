@@ -562,7 +562,12 @@ async fn put_blocks_batch(
         return Err(bad("truncated batch header"));
     }
     let count = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
-    let mut payloads = Vec::with_capacity(count);
+    // `count` is attacker-controlled: never pre-allocate from it directly,
+    // or a 4-byte body claiming u32::MAX blocks would try to reserve tens of
+    // GB and abort the process. Every block contributes at least a 4-byte
+    // length prefix, so a body can hold at most body.len()/4 blocks — cap the
+    // reservation there. Malformed counts then fail cleanly in the loop below.
+    let mut payloads = Vec::with_capacity(count.min(body.len() / 4));
     let mut at = 4usize;
     for _ in 0..count {
         if at + 4 > body.len() {
