@@ -49,6 +49,10 @@ Failure modes are tested, not assumed: integration tests form real three-node cl
 ```sh
 cargo build --release
 ./target/release/kalpakdb serve /tmp/kalpak-n1 --addr 127.0.0.1:7411
+
+# tune the warm-tier budget and the max accepted block size (default 256 MiB,
+# the ceiling for both HTTP and gRPC ingest):
+./target/release/kalpakdb serve /tmp/kalpak-n1 --warm-mb 512 --max-block-mb 512
 ```
 
 ### Rust SDK

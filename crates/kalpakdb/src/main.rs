@@ -1,6 +1,6 @@
 //! Kalpak node CLI.
 //!
-//!   kalpakdb serve <data-dir> [--addr 127.0.0.1:7411] [--warm-mb 256] [--node-id 1] [--join] [--compact-secs 3600]
+//!   kalpakdb serve <data-dir> [--addr 127.0.0.1:7411] [--warm-mb 256] [--max-block-mb 256] [--node-id 1] [--join] [--compact-secs 3600]
 //!   kalpakdb witness <data-dir> [--addr ...] [--node-id N]   (consensus-only voter)
 //!   kalpakdb bench <data-dir> [--blocks 2000] [--size-kb 64]
 //!   kalpakdb stress <base-url> [--agents 8] [--secs 10] [--chunk-kb 64]
@@ -57,6 +57,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "--warm-mb" => {
                         let mb: u64 = it.next().ok_or("--warm-mb needs a value")?.parse()?;
                         opts.warm_bytes = mb * 1024 * 1024;
+                    }
+                    "--max-block-mb" => {
+                        let mb: usize = it.next().ok_or("--max-block-mb needs a value")?.parse()?;
+                        opts.max_block_bytes = Some(mb * 1024 * 1024);
                     }
                     "--node-id" => {
                         opts.node_id = it.next().ok_or("--node-id needs a value")?.parse()?
@@ -315,7 +319,7 @@ hosts: {}",
         }
         _ => {
             eprintln!(
-                "usage:\n  kalpakdb serve <data-dir> [--addr 127.0.0.1:7411] [--warm-mb 256] [--node-id 1] [--join] [--compact-secs 3600]\n  kalpakdb witness <data-dir> [--addr ...] [--node-id N]   (consensus-only voter)\n  kalpakdb bench <data-dir> [--blocks 2000] [--size-kb 64]\n  kalpakdb stress <base-url> [--agents 8] [--secs 10] [--chunk-kb 64]\n  kalpakdb put <data-dir>            (payload on stdin)\n  kalpakdb get <data-dir> <block-id>\n  kalpakdb stat <data-dir>"
+                "usage:\n  kalpakdb serve <data-dir> [--addr 127.0.0.1:7411] [--warm-mb 256] [--max-block-mb 256] [--node-id 1] [--join] [--compact-secs 3600]\n  kalpakdb witness <data-dir> [--addr ...] [--node-id N]   (consensus-only voter)\n  kalpakdb bench <data-dir> [--blocks 2000] [--size-kb 64]\n  kalpakdb stress <base-url> [--agents 8] [--secs 10] [--chunk-kb 64]\n  kalpakdb put <data-dir>            (payload on stdin)\n  kalpakdb get <data-dir> <block-id>\n  kalpakdb stat <data-dir>"
             );
             Err("invalid arguments".into())
         }
