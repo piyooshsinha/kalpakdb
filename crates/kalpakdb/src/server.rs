@@ -321,9 +321,19 @@ fn raft_router(control: Arc<ControlPlane>) -> Router {
 
 pub fn router(state: Shared) -> Router {
     let raft = raft_router(state.control.clone());
-    Router::new()
+
+    // Block ingest carries real KV tensors, routinely larger than axum's
+    // 2 MiB default body limit — which would silently 413 any realistic
+    // block. Raise these two routes to the same per-block ceiling the gRPC
+    // path enforces (`max_block_bytes`); every other route keeps the small
+    // default, bounding how much a metadata/JSON request can buffer.
+    let block_ingest = Router::new()
         .route("/v1/blocks", post(put_block))
         .route("/v1/blocks/batch", post(put_blocks_batch))
+        .layer(axum::extract::DefaultBodyLimit::max(state.max_block_bytes))
+        .with_state(state.clone());
+
+    Router::new()
         .route("/v1/blocks/{id}", get(get_block))
         .route("/v1/agents", post(register_agent))
         .route("/v1/keys", post(make_key))
@@ -338,6 +348,7 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/agents/list", get(list_agents))
         .route("/v1/agents/{id}/bindings", get(agent_bindings))
         .with_state(state)
+        .merge(block_ingest)
         .merge(raft)
         .layer(CorsLayer::permissive())
 }
