@@ -34,6 +34,7 @@ async fn https_serves_the_signed_workflow() {
         grpc_addr: None,
         compact_secs: 0,
         require_signatures: true,
+        max_block_bytes: None,
         read_token: None,
         mesh: None,
         tls_cert: Some(cert_path.to_string_lossy().into_owned()),

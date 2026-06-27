@@ -22,6 +22,7 @@ async fn spawn_node(dir: &std::path::Path) {
         grpc_addr: None,
         compact_secs: 0,
         require_signatures: true,
+        max_block_bytes: None,
         read_token: None,
         tls_cert: None,
         tls_key: None,

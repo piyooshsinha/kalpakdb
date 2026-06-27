@@ -69,6 +69,7 @@ fn spawn_node(node_id: u64, port: u16, dir: std::path::PathBuf) {
         grpc_addr: None,
         compact_secs: 0,
         require_signatures: false,
+        max_block_bytes: None,
         read_token: None,
         tls_cert: None,
         tls_key: None,
@@ -108,8 +109,8 @@ async fn cluster_survives_partition_and_heals() {
         .unwrap();
 
     // Real node ports and the proxy ports the CLUSTER knows them by.
-    let real = [17611u16, 17612, 17613];
-    let prox = [17621u16, 17622, 17623];
+    let real = [17711u16, 17712, 17713];
+    let prox = [17721u16, 17722, 17723];
     let mut proxies = Vec::new();
     for i in 0..3 {
         spawn_node(i as u64 + 1, real[i], dir.path().join(format!("n{i}")));

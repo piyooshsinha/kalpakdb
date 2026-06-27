@@ -19,6 +19,7 @@ async fn grpc_streams_blocks_through_group_commit() {
         grpc_addr: Some("127.0.0.1:17552".to_string()),
         compact_secs: 0,
         require_signatures: false,
+        max_block_bytes: None,
         read_token: None,
         tls_cert: None,
         tls_key: None,
@@ -120,4 +121,67 @@ async fn grpc_streams_blocks_through_group_commit() {
         }]))
         .await;
     assert_eq!(torn.unwrap_err().code(), tonic::Code::InvalidArgument);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_rejects_unbounded_single_block() {
+    use kalpak_proto::v1::block_service_client::BlockServiceClient;
+    use kalpak_proto::v1::PutBlockChunk;
+
+    let dir = tempfile::tempdir().unwrap();
+    let opts = ServeOpts {
+        data_dir: dir.path().to_string_lossy().into_owned(),
+        addr: "127.0.0.1:17553".to_string(),
+        warm_bytes: 16 * 1024 * 1024,
+        node_id: 1,
+        bootstrap: true,
+        grpc_addr: Some("127.0.0.1:17554".to_string()),
+        compact_secs: 0,
+        require_signatures: false,
+        // Small cap so the test needn't stream hundreds of MiB to trip it.
+        max_block_bytes: Some(1024 * 1024),
+        read_token: None,
+        tls_cert: None,
+        tls_key: None,
+        mesh: None,
+    };
+    tokio::spawn(async move {
+        let _ = serve(opts).await;
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut client = loop {
+        match BlockServiceClient::connect("http://127.0.0.1:17554").await {
+            Ok(c) => break c,
+            Err(_) => {
+                assert!(Instant::now() < deadline, "gRPC server did not start");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+
+    // Stream 2 MiB of chunks that NEVER set last_chunk — a single block
+    // growing past the 1 MiB cap. Must be rejected, not accumulated forever.
+    let chunks: Vec<PutBlockChunk> = (0..32)
+        .map(|_| PutBlockChunk {
+            data: vec![0u8; 64 * 1024].into(),
+            last_chunk: false,
+        })
+        .collect();
+    let err = client
+        .put_blocks(tokio_stream::iter(chunks))
+        .await
+        .expect_err("an unterminated oversized block must be rejected");
+    assert_eq!(err.code(), tonic::Code::ResourceExhausted, "got: {err:?}");
+
+    // The node is still healthy: a well-formed block still commits.
+    let ok = client
+        .put_blocks(tokio_stream::iter(vec![PutBlockChunk {
+            data: b"healthy after rejection".to_vec().into(),
+            last_chunk: true,
+        }]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ok.ids.len(), 1);
 }

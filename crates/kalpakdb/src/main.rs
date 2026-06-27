@@ -43,6 +43,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 bootstrap: cmd == "serve",
                 grpc_addr: None,
                 require_signatures: false,
+                max_block_bytes: None,
                 read_token: None,
                 tls_cert: None,
                 tls_key: None,

@@ -23,6 +23,7 @@ fn opts(dir: &std::path::Path, addr: &str) -> ServeOpts {
         grpc_addr: None,
         compact_secs: 0,
         require_signatures: false,
+        max_block_bytes: None,
         read_token: None,
         tls_cert: None,
         tls_key: None,

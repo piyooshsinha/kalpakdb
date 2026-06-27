@@ -21,6 +21,7 @@ async fn grpc_sdk_two_phase_write() {
         grpc_addr: Some("127.0.0.1:17582".to_string()),
         compact_secs: 0,
         require_signatures: false,
+        max_block_bytes: None,
         read_token: None,
         tls_cert: None,
         tls_key: None,

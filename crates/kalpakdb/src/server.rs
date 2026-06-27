@@ -31,6 +31,8 @@ pub struct AppState {
     pub peer_scheme: &'static str,
     /// Reject unsigned metadata mutations.
     pub require_signatures: bool,
+    /// Max bytes for a single streamed gRPC block.
+    pub max_block_bytes: usize,
     /// Bearer token demanded for observability reads, when set.
     pub read_token: Option<String>,
     /// Cumulative GC telemetry (manual + scheduled compactions).
@@ -67,6 +69,10 @@ pub struct ServeOpts {
     /// Reject metadata mutations (register/bind) that are not signed by the
     /// owning agent's Ed25519 key.
     pub require_signatures: bool,
+    /// Max bytes for a single streamed gRPC block before it is rejected
+    /// (None = 256 MiB default). A safety bound on unbounded accumulation,
+    /// also an ops knob for unusually large or memory-constrained nodes.
+    pub max_block_bytes: Option<usize>,
     /// Serve the client-facing API over TLS (PEM paths). Node-to-node
     /// traffic stays plain HTTP on the cluster network; generate dev certs
     /// with `kalpakdb cert`.
@@ -165,6 +171,7 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
         http,
         peer_scheme,
         require_signatures: opts.require_signatures,
+        max_block_bytes: opts.max_block_bytes.unwrap_or(256 * 1024 * 1024),
         read_token: opts.read_token.clone(),
         gc_runs: Default::default(),
         gc_blocks_dropped: Default::default(),
@@ -314,9 +321,19 @@ fn raft_router(control: Arc<ControlPlane>) -> Router {
 
 pub fn router(state: Shared) -> Router {
     let raft = raft_router(state.control.clone());
-    Router::new()
+
+    // Block ingest carries real KV tensors, routinely larger than axum's
+    // 2 MiB default body limit — which would silently 413 any realistic
+    // block. Raise these two routes to the same per-block ceiling the gRPC
+    // path enforces (`max_block_bytes`); every other route keeps the small
+    // default, bounding how much a metadata/JSON request can buffer.
+    let block_ingest = Router::new()
         .route("/v1/blocks", post(put_block))
         .route("/v1/blocks/batch", post(put_blocks_batch))
+        .layer(axum::extract::DefaultBodyLimit::max(state.max_block_bytes))
+        .with_state(state.clone());
+
+    Router::new()
         .route("/v1/blocks/{id}", get(get_block))
         .route("/v1/agents", post(register_agent))
         .route("/v1/keys", post(make_key))
@@ -331,6 +348,7 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/agents/list", get(list_agents))
         .route("/v1/agents/{id}/bindings", get(agent_bindings))
         .with_state(state)
+        .merge(block_ingest)
         .merge(raft)
         .layer(CorsLayer::permissive())
 }
