@@ -10,7 +10,8 @@ COPY crates ./crates
 RUN cargo build --release -p kalpakdb
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+# ca-certificates for outbound TLS; curl for the container HEALTHCHECK below.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --home /var/lib/kalpakdb kalpakdb \
     && mkdir -p /var/lib/kalpakdb \
@@ -19,5 +20,10 @@ COPY --from=builder /build/target/release/kalpakdb /usr/local/bin/kalpakdb
 USER kalpakdb
 VOLUME ["/var/lib/kalpakdb"]
 EXPOSE 7411
+# Readiness, not just liveness: /readyz is 200 only once the node has a
+# leader and can serve, so orchestrators hold traffic until the cluster
+# settles. /readyz and /healthz are unauthenticated by design.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:7411/readyz || exit 1
 ENTRYPOINT ["kalpakdb"]
 CMD ["serve", "/var/lib/kalpakdb", "--addr", "0.0.0.0:7411"]

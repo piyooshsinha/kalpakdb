@@ -307,7 +307,10 @@ pub async fn serve_witness(opts: ServeOpts) -> Result<(), Box<dyn std::error::Er
     serve_app(app, &opts).await
 }
 
-/// Consensus routes, shared by full nodes and witnesses.
+/// Consensus + health routes, shared by full nodes and witnesses. Health
+/// endpoints live here (rather than the data-plane router) so both node
+/// types expose them, and they are deliberately unauthenticated — an
+/// orchestrator's probe must not need a `--read-token`.
 fn raft_router(control: Arc<ControlPlane>) -> Router {
     Router::new()
         .route("/raft/append", post(raft_append))
@@ -316,6 +319,8 @@ fn raft_router(control: Arc<ControlPlane>) -> Router {
         .route("/v1/cluster/init", post(cluster_init))
         .route("/v1/cluster/add-learner", post(cluster_add_learner))
         .route("/v1/cluster/promote", post(cluster_promote))
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .with_state(control)
 }
 
@@ -360,6 +365,26 @@ fn witness_router(control: Arc<ControlPlane>) -> Router {
         .with_state(control)
         .merge(raft)
         .layer(CorsLayer::permissive())
+}
+
+/// Liveness: the process is up and serving HTTP. Always 200 — a probe
+/// failure here means the node is dead or wedged, and the orchestrator
+/// should restart it.
+async fn healthz() -> &'static str {
+    "ok"
+}
+
+/// Readiness: the node can actually serve — it knows a current leader
+/// (elected, not mid-election or partitioned). 200 when ready, 503 when
+/// not, so a load balancer / `depends_on` gate holds traffic until the
+/// cluster has settled. Unauthenticated, like `/healthz` and `/metrics`.
+async fn readyz(State(c): State<Arc<ControlPlane>>) -> Response {
+    let m = c.metrics();
+    if m.current_leader.is_some() {
+        (StatusCode::OK, "ready").into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "no leader").into_response()
+    }
 }
 
 async fn witness_stats(State(c): State<Arc<ControlPlane>>) -> Json<serde_json::Value> {
