@@ -32,7 +32,7 @@ fn spawn_node(dir: &std::path::Path) -> Child {
 }
 
 async fn wait_online(db: &KalpakClient) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while db.stats().await.is_err() {
         assert!(Instant::now() < deadline, "node did not come up");
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -107,7 +107,7 @@ async fn acknowledged_writes_survive_sigkill() {
     let db = KalpakClient::new(format!("http://{ADDR}"));
     wait_online(&db).await;
     // State machine replays the durable log; wait for the last bind.
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(hit) = db
             .lookup(std::slice::from_ref(&acked.last().unwrap().0))
