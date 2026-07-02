@@ -30,7 +30,7 @@ The name draws on Sanskrit roots that describe exactly what this database is for
 | `kalpak-core` | Block identity, chained prefix cache keys, Ed25519 agent identity, canonical signed-write messages |
 | `kalpak-storage` | Append-only content-addressed segments, crash recovery, group commit, two-tier RAM/SSD store (moka), mark-and-sweep GC, Linux `io_uring` + `O_DIRECT` backend (`--features uring`) |
 | `kalpak-control` | Raft control plane (`openraft`): durable log, dynamic membership, witness nodes, leader forwarding, snapshot compaction, atomic chain binds |
-| `kalpakdb` | Node binary: HTTP/WS memory API, gRPC data plane, cluster management, speculative + lookahead prefetch, scheduled GC, TLS, signed-write enforcement, Prometheus metrics, `bench`/`stress`/`cert` tools |
+| `kalpakdb` | Node binary: HTTP/WS memory API, gRPC data plane, cluster management, speculative + lookahead prefetch, scheduled GC, TLS, signed-write enforcement, Prometheus metrics, `/healthz` + `/readyz` probes, `bench`/`stress`/`cert` tools |
 | `kalpak-proto` | gRPC streaming protocol (chunked block streams into one group commit) |
 | `kalpak-client` | Rust SDK: full agent workflow, transparent signing, TLS root-CA support, optional gRPC streaming (`--features grpc`) |
 | `clients/python` | Zero-dependency Python client (same workflow, server-side key hashing; optional Ed25519 signing via `cryptography`) |
@@ -203,6 +203,8 @@ Node-to-node traffic gets **mutual TLS**: `kalpakdb mesh-ca` generates a cluster
 ```
 
 ## Monitoring
+
+`GET /healthz` (liveness, always 200 while the process serves) and `GET /readyz` (readiness, 200 only once the node has a leader and can serve; 503 otherwise) are unauthenticated so orchestrator probes need no `--read-token`. The Docker image ships a `HEALTHCHECK` on `/readyz`; `docker-compose.yml` uses `/healthz` (its nodes await manual cluster formation before they are ready).
 
 `GET /metrics` serves Prometheus text exposition (blocks, warm-tier hit/miss counters, importance-pinned tier, GC totals, Raft term/log/leader, agents, bindings) — point a scraper at any node and import [docs/grafana-dashboard.json](docs/grafana-dashboard.json) into Grafana. The same numbers feed `/v1/stats` (JSON) and the dashboard's WebSocket stream.
 

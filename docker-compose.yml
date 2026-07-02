@@ -11,24 +11,38 @@
 #   curl -X POST -H 'content-type: application/json' \
 #     -d '{"voters":[1,2,3]}' http://localhost:7411/v1/cluster/promote
 
+# These nodes start with --join and stay NOT-ready (no leader) until you run
+# the cluster-formation curl commands above, so each overrides the image's
+# /readyz healthcheck with /healthz (liveness): the container is healthy once
+# the process serves, and readiness follows once you form the cluster.
+x-healthcheck: &healthz
+  test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7411/healthz"]
+  interval: 10s
+  timeout: 3s
+  start_period: 15s
+  retries: 3
+
 services:
   node1:
     build: .
     command: ["serve", "/var/lib/kalpakdb", "--addr", "0.0.0.0:7411", "--node-id", "1", "--join"]
     ports: ["7411:7411"]
     volumes: ["node1-data:/var/lib/kalpakdb"]
+    healthcheck: *healthz
 
   node2:
     build: .
     command: ["serve", "/var/lib/kalpakdb", "--addr", "0.0.0.0:7411", "--node-id", "2", "--join"]
     ports: ["7412:7411"]
     volumes: ["node2-data:/var/lib/kalpakdb"]
+    healthcheck: *healthz
 
   witness:
     build: .
     command: ["witness", "/var/lib/kalpakdb", "--addr", "0.0.0.0:7411", "--node-id", "3"]
     ports: ["7413:7411"]
     volumes: ["witness-data:/var/lib/kalpakdb"]
+    healthcheck: *healthz
 
 volumes:
   node1-data:
