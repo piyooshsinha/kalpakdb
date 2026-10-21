@@ -66,6 +66,13 @@ async fn grpc_streams_blocks_through_group_commit() {
         .unwrap()
         .into_inner();
     assert_eq!(resp.ids.len(), 3);
+    let stats: serde_json::Value = reqwest::get("http://127.0.0.1:17551/v1/stats")
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stats["upload_retention"]["guarded_blocks"], 3);
 
     // Content addressing holds across the wire.
     assert_eq!(

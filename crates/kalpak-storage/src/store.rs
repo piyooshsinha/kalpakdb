@@ -299,9 +299,11 @@ impl<B: IoBackend> BlockStore<B> {
     ///
     /// Rewrites every sealed segment that contains records for which
     /// `live(id)` is false, dropping the dead records. The active segment is
-    /// never touched — recent writes stay safe through the two-phase write
-    /// window (put first, bind through consensus after), since anything not
-    /// yet bound is still in or near the active segment.
+    /// never touched. This alone is NOT a safe put-then-bind grace window:
+    /// unbound uploads can roll into sealed segments before their binds.
+    /// Callers must supply a coordinated safe live set or use this only on
+    /// an exclusively controlled store. The daemon disables this operation
+    /// until a distributed reclamation protocol exists.
     ///
     /// Payload reads use pinned handles: each rewrite happens into a tmp file
     /// that atomically replaces the segment, and in-flight readers keep reading

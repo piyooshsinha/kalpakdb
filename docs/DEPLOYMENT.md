@@ -26,7 +26,7 @@ cargo build --release --features kalpak-storage/uring
 ```sh
 # Mac Mini — storage node, node 1 (bootstrap)
 kalpakdb serve /var/lib/kalpak --addr 0.0.0.0:7411 --node-id 1 \
-  --warm-mb 1024 --compact-secs 3600 \
+  --warm-mb 1024 --compact-secs 0 \
   --tls-cert pki/kalpak-cert.pem --tls-key pki/kalpak-key.pem
 
 # NUC — compute node, node 2 (16GB RAM: big warm tier)

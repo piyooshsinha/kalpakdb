@@ -17,7 +17,11 @@ that the only remaining work needs external hardware.
   publish rewritten segment handles and index locations under the same locks.
 - Reverify signed mutations even when callers present the internal forwarding
   header. This closes that exemption, not the broader public Raft/admin issue.
-- Default CLI automatic GC to disabled; operators must explicitly opt in.
+- Block daemon manual GC and reject nonzero automatic-GC intervals until a
+  coordinated watermark exists; local bindings alone are not a safe live set.
+- Sync checksummed upload retention batches before new daemon payload writes;
+  recover torn journal tails, reject complete corruption and poison guarded
+  writes after journal I/O failure. Guards are bounded and non-expiring.
 - Hide Raft, cluster-management and admin namespaces on public listeners
   when mesh mTLS is configured, including witnesses. Bootstrap advertises
   the mesh address; witnesses start a mutually authenticated peer listener.
@@ -85,10 +89,13 @@ read pacing excludes metadata/checkpoint I/O and is not a device-level SLO.
    operations to local processes and trust an internal header; replace
    this legacy development behavior with authenticated local access.
    Expand witness, bootstrap and forwarding negative tests.
-2. **GC safety:** replace the active-segment-only grace assumption with
-   upload leases and a coordinated GC watermark. Bind-versus-GC and follower
-   lag races are not solved by the reader-generation fix. Until then, run
-   with `--compact-secs 0` and avoid manual compaction on live deployments.
+2. **GC safety:** durable non-expiring upload guards and a fail-closed daemon
+   compaction gate now prevent the unsafe local sweep. Still implement timed
+   lease release, legacy-inventory migration and a Raft-coordinated watermark,
+   then test binds, leader transitions, lagging followers and GC cancellation.
+   Keep `--compact-secs 0`; manual compaction returns 409. No reclamation or
+   capacity-recovery workflow exists yet. Upload guards add metadata fsync
+   overhead and are not a maintained-replication contract.
 3. **Data durability contract:** opt-in acknowledged replica counts now
    cover HTTP and gRPC. A source-local persistent retry ledger now resumes
    after crashes; committed responsibility now survives origin loss through

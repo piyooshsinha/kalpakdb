@@ -177,23 +177,6 @@ impl RepairLog {
         Ok(())
     }
 
-    /// Hold the intent lock across compaction, so a newly recorded upload
-    /// cannot race the empty check. Retention reclamation is deliberately
-    /// unavailable until a distributed GC/release protocol exists.
-    pub(crate) fn compact<T>(
-        &self,
-        operation: impl FnOnce() -> Result<T, kalpak_core::Error>,
-    ) -> Result<T, kalpak_core::Error> {
-        let guard = self.requirements.lock().unwrap();
-        if !guard.blocks.is_empty() {
-            return Err(io::Error::other(
-                "compaction disabled while replica retention requirements exist",
-            )
-            .into());
-        }
-        operation()
-    }
-
     fn batch(&self, after: Option<BlockId>) -> Vec<(BlockId, usize)> {
         let guard = self.requirements.lock().unwrap();
         guard
@@ -309,6 +292,10 @@ pub(crate) fn start(state: Arc<crate::server::AppState>) {
                                 let saved = tokio::task::spawn_blocking(move || {
                                     let _lease = disk_lease;
                                     disk_state
+                                        .retention
+                                        .protect(&[id])
+                                        .map_err(kalpak_core::Error::from)?;
+                                    disk_state
                                         .store
                                         .repair(&id, &bytes)
                                         .map(|_| bytes::Bytes::from(bytes))
@@ -384,7 +371,7 @@ mod tests {
         let log = RepairLog::open(dir.path()).unwrap();
         log.record(&[id], 3).unwrap();
         log.record(&[id], 1).unwrap();
-        assert!(log.compact(|| Ok(())).is_err());
+        assert!(log.retained(&id));
         drop(log);
         std::fs::write(
             dir.path().join("replica-requirements.pending"),
@@ -407,7 +394,7 @@ mod tests {
             .collect();
         assert!(log.record(&ids, 2).is_err());
         assert!(log.batch(None).is_empty());
-        assert!(log.compact(|| Ok(())).is_ok());
+        assert!(ids.iter().all(|id| !log.retained(id)));
         assert!(!dir.path().join("replica-requirements.json").exists());
     }
 }

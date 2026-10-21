@@ -25,6 +25,7 @@ pub struct AppState {
     pub(crate) online_scrub: crate::online_scrub::Metrics,
     replica_pushes: std::sync::atomic::AtomicU64,
     pub(crate) repairs: crate::repair::RepairLog,
+    pub(crate) retention: crate::retention::Retention,
     pub(crate) uploads: crate::admission::UploadBudget,
     pub store: Arc<TieredStore>,
     pub data_dir: String,
@@ -46,16 +47,6 @@ pub struct AppState {
     pub gc_bytes_reclaimed: std::sync::atomic::AtomicU64,
 }
 
-impl AppState {
-    fn record_gc(&self, st: &kalpak_storage::CompactStats) {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.gc_runs.fetch_add(1, Relaxed);
-        self.gc_blocks_dropped.fetch_add(st.blocks_dropped, Relaxed);
-        self.gc_bytes_reclaimed
-            .fetch_add(st.bytes_reclaimed, Relaxed);
-    }
-}
-
 type Shared = Arc<AppState>;
 
 pub struct ServeOpts {
@@ -68,8 +59,7 @@ pub struct ServeOpts {
     pub bootstrap: bool,
     /// Bind address for the gRPC streaming data plane (None disables it).
     pub grpc_addr: Option<String>,
-    /// Run GC automatically every N seconds (0 disables; the
-    /// `/v1/admin/compact` endpoint always works).
+    /// Must remain zero until coordinated GC is implemented.
     pub compact_secs: u64,
     /// Reject metadata mutations (register/bind) that are not signed by the
     /// owning agent's Ed25519 key.
@@ -159,6 +149,9 @@ async fn boot_control(opts: &ServeOpts) -> Result<Arc<ControlPlane>, Box<dyn std
 /// Validate transport boundaries before opening storage or starting tasks.
 /// Server-only TLS does not authenticate callers of the legacy Raft API.
 fn validate_listeners(opts: &ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
+    if opts.compact_secs != 0 {
+        return Err(crate::retention::gc_reason().into());
+    }
     if opts.mesh.is_none() {
         require_loopback(&opts.addr, "HTTP without mesh mTLS")?;
     }
@@ -197,6 +190,7 @@ pub async fn serve_with_scrub(
     let uploads =
         crate::admission::UploadBudget::new(opts.max_block_bytes.unwrap_or(256 * 1024 * 1024))?;
     let store = TieredStore::open(&opts.data_dir, opts.warm_bytes)?;
+    let retention = crate::retention::Retention::open(std::path::Path::new(&opts.data_dir))?;
     let scanner = scrub_mib_per_sec
         .map(|_| {
             kalpak_storage::online_scrub::OnlineScrubber::open(std::path::Path::new(&opts.data_dir))
@@ -220,6 +214,7 @@ pub async fn serve_with_scrub(
         online_scrub: Default::default(),
         replica_pushes: Default::default(),
         repairs,
+        retention,
         uploads,
         store: Arc::new(store),
         data_dir: opts.data_dir.clone(),
@@ -237,38 +232,6 @@ pub async fn serve_with_scrub(
     crate::repair::start(state.clone());
     if let (Some(scanner), Some(rate)) = (scanner, scrub_mib_per_sec) {
         crate::online_scrub::start(state.clone(), scanner, rate);
-    }
-
-    if opts.compact_secs > 0 {
-        let state = state.clone();
-        let every = std::time::Duration::from_secs(opts.compact_secs);
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(every);
-            tick.tick().await; // first tick fires immediately; skip it
-            loop {
-                tick.tick().await;
-                let live = state.control.bound_blocks();
-                let store_state = state.clone();
-                let swept = tokio::task::spawn_blocking(move || {
-                    store_state
-                        .repairs
-                        .compact(|| store_state.store.compact(|id| live.contains(id)))
-                })
-                .await;
-                match swept {
-                    Ok(Ok(st)) if st.blocks_dropped > 0 => {
-                        state.record_gc(&st);
-                        eprintln!(
-                            "kalpakdb: gc reclaimed {} bytes ({} blocks, {} segments)",
-                            st.bytes_reclaimed, st.blocks_dropped, st.segments_rewritten
-                        )
-                    }
-                    Ok(Ok(st)) => state.record_gc(&st),
-                    Ok(Err(e)) => eprintln!("kalpakdb: gc failed: {e}"),
-                    Err(e) => eprintln!("kalpakdb: gc task panicked: {e}"),
-                }
-            }
-        });
     }
 
     if let Some(grpc_addr) = &opts.grpc_addr {
@@ -946,6 +909,9 @@ async fn put_block(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let replicas = parse_replicas(headers.get("x-kalpak-replicas").map(|v| v.to_str()))
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
+    s.retention
+        .protect(&[BlockId::of(&body)])
+        .map_err(kalpak_core::Error::from)?;
     if replicas > 1 || headers.contains_key("x-kalpak-retain-replica") {
         s.repairs
             .record(&[BlockId::of(&body)], replicas)
@@ -1038,6 +1004,13 @@ async fn put_blocks_batch(
     if at != body.len() {
         return Err(bad("trailing bytes after batch"));
     }
+    let guarded: Vec<_> = payloads
+        .iter()
+        .map(|payload| BlockId::of(payload))
+        .collect();
+    s.retention
+        .protect(&guarded)
+        .map_err(kalpak_core::Error::from)?;
     if replicas > 1 || headers.contains_key("x-kalpak-retain-replica") {
         let ids: Vec<_> = payloads
             .iter()
@@ -1123,6 +1096,9 @@ async fn get_block(
                 if BlockId::of(&bytes) != id {
                     continue;
                 }
+                s.retention
+                    .protect(&[id])
+                    .map_err(kalpak_core::Error::from)?;
                 s.store.put(&bytes)?;
                 return Ok(bytes.to_vec());
             }
@@ -1410,26 +1386,12 @@ async fn raft_snapshot(
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))
 }
 
-/// Garbage-collect sealed segments: every block referenced by a
-/// Raft-replicated binding is live; everything else in sealed segments is
-/// swept. The active segment is never touched, which is the grace window
-/// for the put-then-bind two-phase write.
-async fn admin_compact(State(s): State<Shared>) -> Result<Json<serde_json::Value>, ApiError> {
-    let live = s.control.bound_blocks();
-    let state = s.clone();
-    let stats = tokio::task::spawn_blocking(move || {
-        state
-            .repairs
-            .compact(|| state.store.compact(|id| live.contains(id)))
-    })
-    .await
-    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
-    s.record_gc(&stats);
-    Ok(Json(json!({
-        "segments_rewritten": stats.segments_rewritten,
-        "blocks_dropped": stats.blocks_dropped,
-        "bytes_reclaimed": stats.bytes_reclaimed,
-    })))
+/// Local bindings are not a coordinated distributed reclamation watermark.
+async fn admin_compact(State(_s): State<Shared>) -> Result<Json<serde_json::Value>, ApiError> {
+    Err(ApiError(
+        StatusCode::CONFLICT,
+        crate::retention::gc_reason().to_string(),
+    ))
 }
 
 /// The "mind explorer" listing: every registered agent, oldest first.
@@ -1498,6 +1460,7 @@ async fn agent_bindings(
 /// exactly "the node as of some moment during the backup".
 async fn admin_backup(State(s): State<Shared>) -> Result<Response, ApiError> {
     let data_dir = s.data_dir.clone();
+    let backup_state = s.clone();
     let tar_path =
         tokio::task::spawn_blocking(move || -> Result<std::path::PathBuf, std::io::Error> {
             let tmp = tempfile::NamedTempFile::new()?;
@@ -1524,6 +1487,9 @@ async fn admin_backup(State(s): State<Shared>) -> Result<Response, ApiError> {
                     builder.append_path_with_name(entry.path(), &name)?;
                 }
             }
+            // Capture guards after segments so every copied upload is covered.
+            // The journal lock prevents a partially appended retention frame.
+            backup_state.retention.archive(&mut builder, root)?;
             builder.into_inner()?;
             Ok(path)
         })
@@ -1582,6 +1548,7 @@ fn stats_payload(s: &AppState) -> serde_json::Value {
             "acknowledged_replication_upload_attempts": s.replica_pushes.load(std::sync::atomic::Ordering::Relaxed),
         },
         "online_scrub": s.online_scrub.snapshot(),
+        "upload_retention": s.retention.snapshot(),
     })
 }
 

@@ -103,6 +103,10 @@ async fn online_backup_restores_into_a_working_node() {
         std::fs::read(restored.join("storage-generation")).unwrap(),
         std::fs::read(src.path().join("storage-generation")).unwrap()
     );
+    assert_eq!(
+        std::fs::read(restored.join("upload-retention.log")).unwrap(),
+        std::fs::read(src.path().join("upload-retention.log")).unwrap()
+    );
     let requirements: serde_json::Value =
         serde_json::from_slice(&std::fs::read(restored.join("replica-requirements.json")).unwrap())
             .unwrap();

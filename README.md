@@ -7,8 +7,8 @@
 > **Status: experimental, not production-ready.** Correctness and security
 > stabilization is in progress. See [the stabilization checklist](docs/STABILIZATION.md)
 > for implemented fixes, known risks, and release-blocking work. In particular,
-> disable automatic compaction (`--compact-secs 0`) while coordinated GC safety
-> remains unresolved, and do not expose current administrative/Raft routes to
+> daemon compaction is blocked while coordinated GC safety remains unresolved
+> (`--compact-secs` must be zero). Do not expose current administrative/Raft routes to
 > untrusted networks.
 
 The industry currently duct-tapes traditional databases together to handle AI memory and state: Redis for hot state, a vector database for embeddings, a graph database for facts, object storage for blobs — and the KV cache, the hottest and most expensive state in the entire stack, has no home at all and gets recomputed on every call. The bugs live in the seams between these systems: no atomicity across them, no shared lineage, no common identity.
@@ -37,7 +37,7 @@ The name draws on Sanskrit roots that describe exactly what this database is for
 | `kalpak-core` | Block identity, chained prefix cache keys, Ed25519 agent identity, canonical signed-write messages |
 | `kalpak-storage` | Append-only content-addressed segments, crash recovery, group commit, two-tier RAM/SSD store (moka), mark-and-sweep GC, Linux `io_uring` + `O_DIRECT` backend (`--features uring`) |
 | `kalpak-control` | Raft control plane (`openraft`): durable log, dynamic membership, witness nodes, leader forwarding, snapshot compaction, atomic chain binds |
-| `kalpakdb` | Node binary: HTTP/WS memory API, gRPC data plane, cluster management, speculative + lookahead prefetch, scheduled GC, TLS, signed-write enforcement, Prometheus metrics, `/healthz` + `/readyz` probes, `bench`/`stress`/`cert` tools |
+| `kalpakdb` | Node binary: HTTP/WS memory API, gRPC data plane, cluster management, speculative + lookahead prefetch, durable upload retention (daemon GC blocked), TLS, signed-write enforcement, Prometheus metrics, `/healthz` + `/readyz` probes, `bench`/`stress`/`cert` tools |
 | `kalpak-proto` | gRPC streaming protocol (chunked block streams into one group commit) |
 | `kalpak-client` | Rust SDK: full agent workflow, transparent signing, TLS root-CA support, optional gRPC streaming (`--features grpc`) |
 | `clients/python` | Zero-dependency Python client (same workflow, server-side key hashing; optional Ed25519 signing via `cryptography`) |
@@ -333,11 +333,44 @@ blocks; retries cannot lower a recorded target. A failed upload can leave
 repair intent and partial data. An intent recorded before a failed local
 write cannot be repaired until that source block is uploaded successfully.
 
-Acknowledged peers persist retention pins before accepting a copy. Manual
-and scheduled compaction are refused while any pins/requirements exist;
-there is deliberately no release API yet. This avoids deleting repair
-sources but can prevent space reclamation. Online backups include published
-repair metadata, though concurrent backup consistency remains unproven.
+Acknowledged peers persist retention pins before accepting a copy. All daemon
+compaction is now refused, even when no replica pins exist: a local binding
+snapshot is not a distributed GC watermark. There is no release API yet.
+Online backups include published repair metadata and upload retention,
+though concurrent backup consistency remains unproven.
+
+### Upload retention and GC safety
+
+Before HTTP single/batch, gRPC batch, repair and replicate-on-read payload
+writes, the daemon syncs non-expiring block guards to `upload-retention.log`.
+Only content hashes enter this journal; tensors still bypass Raft. A guard
+is durable before the payload append or response. Retried hashes deduplicate;
+cancelled/failed requests may leave conservative guards for absent data.
+Bindings do not release guards. These are local retention intents, not yet
+a distributed lease/commit protocol or a guarantee of maintained replication.
+
+Checksummed, sequenced journal batches recover across process crashes. A
+partial final record is truncated and synced before new appends; complete
+corrupt records fail startup. This is process-crash recovery, not proof
+against post-fsync media loss. A write/sync error poisons further guarded
+writes until restart. Capacity is bounded to 1,048,576 distinct hashes and
+128 MiB of journal data; new guards fail closed at capacity. Existing guards
+never expire automatically. `/v1/stats.upload_retention` exposes counts,
+capacity, write-failure status and the GC-blocked reason.
+
+`POST /v1/admin/compact` returns 409; nonzero `--compact-secs` is rejected
+before storage initialization. This protects both new uploads and legacy
+unguarded blocks from unsafe daemon reclamation. The storage library's
+low-level compaction primitive remains available for controlled tests, not
+as an online GC workaround. Older/offline CLI writes do not create daemon
+guards. Do not share a data directory between processes or delete retention
+metadata to reclaim capacity. There is no safe reclamation workflow yet.
+
+Each new guard batch adds a metadata fsync before the payload fsync; no
+throughput improvement is claimed. Backups capture a stable journal after
+segment traversal; the journal-copy lock can delay uploads. Timed
+lease release, safe migration of legacy inventories and a Raft-coordinated
+GC watermark are still required before reclamation can be enabled.
 
 Committed requirements survive origin loss and leader changes. The leader
 can fetch a missing local source from retained peers, verify its content

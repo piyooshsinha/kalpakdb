@@ -6,5 +6,6 @@ pub mod grpc;
 mod online_scrub;
 pub mod pki;
 mod repair;
+mod retention;
 pub mod server;
 pub mod stress;
