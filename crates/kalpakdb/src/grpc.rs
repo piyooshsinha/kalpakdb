@@ -23,19 +23,14 @@ const CHUNK_BYTES: usize = 1024 * 1024;
 const MAX_STREAM_BLOCKS: usize = 4096;
 const MAX_BATCH_BLOCKS: usize = 256;
 const MAX_STREAM_CHUNKS: usize = 65_536;
-const MAX_UPLOADS: usize = 4;
 const CHUNK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub struct BlockGrpc {
     state: Arc<AppState>,
-    uploads: Arc<tokio::sync::Semaphore>,
 }
 
 pub fn service(state: Arc<AppState>) -> BlockServiceServer<BlockGrpc> {
-    BlockServiceServer::new(BlockGrpc {
-        state,
-        uploads: Arc::new(tokio::sync::Semaphore::new(MAX_UPLOADS)),
-    })
+    BlockServiceServer::new(BlockGrpc { state })
 }
 
 #[tonic::async_trait]
@@ -55,12 +50,11 @@ impl BlockService for BlockGrpc {
         // without ever setting last_chunk would grow one block unbounded and
         // exhaust memory. No legitimate KV block approaches the default.
         let max_block_bytes = self.state.max_block_bytes;
-        let permit = Arc::new(
-            self.uploads
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| Status::resource_exhausted("too many concurrent block uploads"))?,
-        );
+        let permit = self
+            .state
+            .uploads
+            .try_acquire()
+            .map_err(|_| Status::resource_exhausted("shared upload budget exhausted"))?;
 
         let mut stream = request.into_inner();
         let mut blocks: Vec<Vec<u8>> = Vec::new();

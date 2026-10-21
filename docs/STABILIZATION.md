@@ -27,6 +27,9 @@ that the only remaining work needs external hardware.
 - Bound gRPC upload concurrency, total chunk/block counts, batch block counts
   and idle waits. Keep admission held until submitted blocking flushes finish,
   even if the client cancels. Reject an unfinished empty block as torn framing.
+- Share conservative upload reservations between HTTP (before body buffering),
+  gRPC and pending HTTP replication. Bound HTTP batch counts and reject
+  trailing framing bytes; apply HTTP upload and per-peer replication timeouts.
 
 The snapshot envelope is versioned (`raft-snapshot.json`, version 1) and
 contains the existing bincode state-machine payload plus Raft metadata.
@@ -55,8 +58,10 @@ Lost snapshots from older versions cannot be recreated by this change.
    compaction and replica placement. Current live-tar ordering is not a
    demonstrated concurrent snapshot protocol. Keep offline, verified copies.
 6. **Admission control:** gRPC upload counts and idle waits are bounded;
-   still add aggregate byte budgets shared with HTTP and reads, absolute
-   request deadlines, bounded replication queues and cancellation coverage.
+   HTTP and gRPC now share a logical payload reservation pool, also held by
+   pending HTTP replication. Still account for storage/allocator copies and
+   reads, add absolute gRPC deadlines, durable replication retries and broader
+   cancellation coverage. This is not a total resident-memory guarantee.
 7. **Deployment and CI:** resolve the failed master run, validate feature
    combinations and restart behavior on Linux/macOS, wire backend selection
    into the daemon, and pin a supported inference-engine configuration.

@@ -21,6 +21,7 @@ use serde_json::json;
 use tower_http::cors::CorsLayer;
 
 pub struct AppState {
+    pub(crate) uploads: crate::admission::UploadBudget,
     pub store: TieredStore,
     pub data_dir: String,
     pub control: Arc<ControlPlane>,
@@ -179,6 +180,8 @@ fn require_loopback(addr: &str, transport: &str) -> Result<(), Box<dyn std::erro
 
 pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
     validate_listeners(&opts)?;
+    let uploads =
+        crate::admission::UploadBudget::new(opts.max_block_bytes.unwrap_or(256 * 1024 * 1024))?;
     let store = TieredStore::open(&opts.data_dir, opts.warm_bytes)?;
     let control = boot_control(&opts).await?;
     let (http, peer_scheme) = match &opts.mesh {
@@ -193,6 +196,7 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
         None => (reqwest::Client::new(), "http"),
     };
     let state = Arc::new(AppState {
+        uploads,
         store,
         data_dir: opts.data_dir.clone(),
         control,
@@ -391,6 +395,10 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/blocks", post(put_block))
         .route("/v1/blocks/batch", post(put_blocks_batch))
         .layer(axum::extract::DefaultBodyLimit::max(state.max_block_bytes))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            admit_upload,
+        ))
         .with_state(state.clone());
 
     Router::new()
@@ -411,6 +419,23 @@ pub fn router(state: Shared) -> Router {
         .merge(block_ingest)
         .merge(raft)
         .layer(CorsLayer::permissive())
+}
+
+async fn admit_upload(
+    State(state): State<Shared>,
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let Ok(lease) = state.uploads.try_acquire() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "upload budget exhausted").into_response();
+    };
+    request.extensions_mut().insert(lease.clone());
+    // Admission precedes body buffering. A slow body cannot hold capacity
+    // forever; dropping this future releases its request reservation.
+    match tokio::time::timeout(std::time::Duration::from_secs(60), next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => StatusCode::REQUEST_TIMEOUT.into_response(),
+    }
 }
 
 fn witness_router(control: Arc<ControlPlane>) -> Router {
@@ -602,6 +627,7 @@ async fn forward_to_leader(
 
 async fn put_block(
     State(s): State<Shared>,
+    axum::Extension(lease): axum::Extension<crate::admission::UploadLease>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -613,12 +639,14 @@ async fn put_block(
         let state = s.clone();
         let payload = body.clone();
         tokio::spawn(async move {
+            let _lease = lease;
             for peer in state.control.peer_addrs() {
                 let _ = state
                     .http
                     .post(format!("{}://{peer}/v1/blocks", state.peer_scheme))
                     .header(INTERNAL_HEADER, "1")
                     .body(payload.clone())
+                    .timeout(std::time::Duration::from_secs(30))
                     .send()
                     .await;
             }
@@ -633,6 +661,7 @@ async fn put_block(
 /// `u32 len` + `len` payload bytes. Replies with the ids in input order.
 async fn put_blocks_batch(
     State(s): State<Shared>,
+    axum::Extension(lease): axum::Extension<crate::admission::UploadLease>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -641,6 +670,9 @@ async fn put_blocks_batch(
         return Err(bad("truncated batch header"));
     }
     let count = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+    if count > 4096 {
+        return Err(bad("batch exceeds 4096 blocks"));
+    }
     // `count` is attacker-controlled: never pre-allocate from it directly,
     // or a 4-byte body claiming u32::MAX blocks would try to reserve tens of
     // GB and abort the process. Every block contributes at least a 4-byte
@@ -660,18 +692,23 @@ async fn put_blocks_batch(
         payloads.push(&body[at..at + len]);
         at += len;
     }
+    if at != body.len() {
+        return Err(bad("trailing bytes after batch"));
+    }
     let ids = s.store.put_many(payloads.iter().copied())?;
 
     if !headers.contains_key(INTERNAL_HEADER) {
         let state = s.clone();
         let raw = body.clone();
         tokio::spawn(async move {
+            let _lease = lease;
             for peer in state.control.peer_addrs() {
                 let _ = state
                     .http
                     .post(format!("{}://{peer}/v1/blocks/batch", state.peer_scheme))
                     .header(INTERNAL_HEADER, "1")
                     .body(raw.clone())
+                    .timeout(std::time::Duration::from_secs(30))
                     .send()
                     .await;
             }

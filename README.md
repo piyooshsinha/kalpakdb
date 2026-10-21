@@ -211,14 +211,24 @@ even when HTTP TLS or mesh is enabled. These restrictions are intentional
 breaking changes; legacy wildcard-bind/container examples need mesh setup.
 Loopback is not protection against other users or processes on the host.
 
-gRPC uploads have fixed safety limits: four concurrent uploads per service,
+HTTP and gRPC uploads share a 512 MiB logical reservation pool. Each upload
+reserves its configured maximum block size plus a 64 MiB batch allowance,
+rounded up to MiB, with a minimum 128 MiB reservation. At the default block
+size, one upload is admitted at a time; small-block configurations allow up
+to four. `--max-block-mb` cannot exceed 448. HTTP overload returns 503 and
+gRPC overload returns `RESOURCE_EXHAUSTED`; retry with backoff. Reservations
+also cover pending best-effort replication, with a 30-second timeout per
+peer. HTTP uploads have a 60-second handler deadline. This is not a hard
+RSS cap: caches, reads, storage copies and allocator overhead are separate.
+
+gRPC uploads have additional safety limits:
 4,096 blocks and 65,536 chunks per request, and a 30-second inter-chunk idle
 timeout. Completed blocks flush at 64 MiB or 256 blocks; the configured
 per-block limit is checked before appending payload bytes. Split larger
 uploads into separate requests. Uploads are **not atomic**: an error or
 cancellation may leave earlier batches persisted. Content-addressed retries
-deduplicate those blocks. These bounds are not yet a global byte budget
-shared with HTTP ingestion or read streams.
+deduplicate those blocks. Read streams are not yet admission-controlled.
+HTTP binary batches are capped at 4,096 blocks and reject trailing bytes.
 
 Observability reads can demand a token: `--read-token <t>` guards `/v1/stats`, `/v1/ws`, and the agent explorer with `Authorization: Bearer <t>` (the dashboard picks it up from `?token=`); `/metrics` stays open for Prometheus scrapers and the data path is governed by signatures, not the read token.
 

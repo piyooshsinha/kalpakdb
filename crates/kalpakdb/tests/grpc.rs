@@ -162,6 +162,54 @@ async fn grpc_streams_blocks_through_group_commit() {
         .await
         .unwrap_err();
     assert_eq!(too_many_chunks.code(), tonic::Code::ResourceExhausted);
+
+    // An HTTP body that has not arrived yet must reserve from the same
+    // pool as gRPC, not after axum has already buffered it.
+    use tokio::io::AsyncWriteExt;
+    let mut slow_http = tokio::net::TcpStream::connect("127.0.0.1:17551")
+        .await
+        .unwrap();
+    slow_http
+        .write_all(b"POST /v1/blocks HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\n")
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let result = client
+            .put_blocks(tokio_stream::iter([PutBlockChunk {
+                data: b"admission-probe".to_vec().into(),
+                last_chunk: true,
+            }]))
+            .await;
+        if let Err(error) = result {
+            assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "HTTP failed to reserve shared budget"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(slow_http);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if client
+            .put_blocks(tokio_stream::iter([PutBlockChunk {
+                data: b"after-http-cancel".to_vec().into(),
+                last_chunk: true,
+            }]))
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cancelled HTTP request leaked budget"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
