@@ -11,6 +11,7 @@
 //! the node's API server wires `/raft/*` to the [`ControlPlane::handle_*`]
 //! methods. The Raft log and vote are durable when a data directory is given.
 
+mod durability;
 mod log_store;
 mod network;
 mod state_machine;
@@ -84,12 +85,30 @@ impl ControlPlane {
                 .map_err(|e| ControlError::Init(e.to_string()))?,
         );
 
-        let log_store = match data_dir {
+        let mut log_store = match data_dir {
             Some(dir) => LogStore::open(dir.join("control"))
                 .map_err(|e| ControlError::Init(e.to_string()))?,
             None => LogStore::in_memory(),
         };
-        let sm = StateMachineStore::default();
+        let sm = match data_dir {
+            Some(dir) => StateMachineStore::open(dir.join("control"))
+                .map_err(|e| ControlError::Init(format!("snapshot recovery: {e}")))?,
+            None => StateMachineStore::default(),
+        };
+        // An older deployment may already have purged logs while its only
+        // snapshot was volatile. Do not start an apparently healthy empty
+        // node when the discarded state cannot be reconstructed.
+        let log_state = openraft::storage::RaftLogStorage::get_log_state(&mut log_store)
+            .await
+            .map_err(|e| ControlError::Init(format!("log recovery: {e}")))?;
+        if let Some(purged) = log_state.last_purged_log_id {
+            let applied = sm.state.read().unwrap().last_applied;
+            if !applied.is_some_and(|id| id.index >= purged.index) {
+                return Err(ControlError::Init(
+                    "purged Raft logs require a durable snapshot; recover from a healthy peer or verified backup".to_string(),
+                ));
+            }
+        }
 
         let network = match mesh {
             Some(m) => HttpNetworkFactory::with_mesh_tls(m)
@@ -482,5 +501,83 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert_eq!(cp.agent(&a).unwrap().display_name, "survivor");
+    }
+
+    #[tokio::test]
+    async fn durable_snapshot_survives_log_purge_and_restart() {
+        use openraft::storage::{RaftLogStorage, RaftStateMachine};
+        let dir = tempfile::tempdir().unwrap();
+        let a = agent(9);
+        let k = key(&[80, 81]);
+        let blocks = vec![BlockId::of(b"durable-snapshot")];
+        let cp = ControlPlane::start_node(1, Some(dir.path())).await.unwrap();
+        cp.init_cluster(BTreeMap::from([(1, "local".to_string())]))
+            .await
+            .unwrap();
+        cp.register_agent(a, "snapshotted").await.unwrap();
+        cp.bind_prefix(a, k.clone(), blocks.clone(), None)
+            .await
+            .unwrap();
+        let index = cp.metrics().last_applied.unwrap().index;
+        cp.snapshot().await.unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut sm = cp.sm.clone();
+        loop {
+            if sm
+                .get_current_snapshot()
+                .await
+                .unwrap()
+                .is_some_and(|s| s.meta.last_log_id.is_some_and(|id| id.index >= index))
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "snapshot did not complete"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        cp.raft.trigger().purge_log(index).await.unwrap();
+        loop {
+            let mut log = LogStore::open(dir.path().join("control")).unwrap();
+            if log
+                .get_log_state()
+                .await
+                .unwrap()
+                .last_purged_log_id
+                .is_some_and(|l| l.index >= index)
+            {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "logs did not purge");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        cp.raft.shutdown().await.unwrap();
+        drop(cp);
+        drop(sm);
+        let restarted = ControlPlane::start_node(1, Some(dir.path())).await.unwrap();
+        // Immediately available from the durable snapshot, without waiting
+        // for election or a peer to reconstruct discarded log entries.
+        assert_eq!(restarted.agent(&a).unwrap().display_name, "snapshotted");
+        assert_eq!(restarted.lookup(&k).unwrap().blocks, blocks);
+        restarted.raft.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_snapshot_after_purge_fails_startup() {
+        use openraft::storage::RaftLogStorage;
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = LogStore::open(dir.path().join("control")).unwrap();
+        log.purge(openraft::LogId::new(
+            openraft::CommittedLeaderId::new(1, 1),
+            7,
+        ))
+        .await
+        .unwrap();
+        drop(log);
+        let result = ControlPlane::start_node(1, Some(dir.path())).await;
+        assert!(
+            matches!(result, Err(ControlError::Init(message)) if message.contains("durable snapshot"))
+        );
     }
 }

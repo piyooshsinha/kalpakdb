@@ -6,7 +6,8 @@
 
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::sync::{Arc, RwLock};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, RwLock};
 
 use kalpak_core::{AgentId, BlockId, CacheKey};
 use openraft::storage::{RaftStateMachine, Snapshot};
@@ -58,11 +59,76 @@ pub struct StateMachineStore {
     pub state: Arc<RwLock<MetadataState>>,
     snapshot: Arc<RwLock<Option<StoredSnapshotShared>>>,
     snapshot_idx: Arc<RwLock<u64>>,
+    directory: Option<PathBuf>,
+    publication: Arc<Mutex<()>>,
 }
 
 type StoredSnapshotShared = (SnapshotMeta<NodeId, openraft::BasicNode>, Vec<u8>);
 
+#[derive(Serialize, Deserialize)]
+struct DurableSnapshot {
+    version: u32,
+    meta: SnapshotMeta<NodeId, openraft::BasicNode>,
+    data: Vec<u8>,
+}
+
 impl StateMachineStore {
+    /// Recover the snapshot before OpenRaft inspects applied state or logs.
+    pub fn open(directory: PathBuf) -> std::io::Result<Self> {
+        std::fs::create_dir_all(&directory)?;
+        let store = Self {
+            directory: Some(directory.clone()),
+            ..Self::default()
+        };
+        let bytes = match std::fs::read(directory.join("raft-snapshot.json")) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(store),
+            Err(e) => return Err(e),
+        };
+        let saved: DurableSnapshot =
+            serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+        if saved.version != 1 {
+            return Err(std::io::Error::other("unsupported snapshot version"));
+        }
+        let state = Self::decode_snapshot(&saved.meta, &saved.data)?;
+        *store.state.write().unwrap() = state;
+        *store.snapshot.write().unwrap() = Some((saved.meta, saved.data));
+        Ok(store)
+    }
+
+    fn decode_snapshot(
+        meta: &SnapshotMeta<NodeId, openraft::BasicNode>,
+        data: &[u8],
+    ) -> std::io::Result<MetadataState> {
+        let (state, consumed): (MetadataState, usize) =
+            bincode::serde::decode_from_slice(data, bincode::config::standard())
+                .map_err(std::io::Error::other)?;
+        if consumed != data.len()
+            || state.last_applied != meta.last_log_id
+            || state.membership != meta.last_membership
+        {
+            return Err(std::io::Error::other("snapshot metadata/payload mismatch"));
+        }
+        Ok(state)
+    }
+
+    fn persist_snapshot(
+        &self,
+        meta: &SnapshotMeta<NodeId, openraft::BasicNode>,
+        data: &[u8],
+    ) -> std::io::Result<()> {
+        if let Some(dir) = &self.directory {
+            let saved = DurableSnapshot {
+                version: 1,
+                meta: meta.clone(),
+                data: data.to_vec(),
+            };
+            let bytes = serde_json::to_vec(&saved).map_err(std::io::Error::other)?;
+            crate::durability::replace(&dir.join("raft-snapshot.json"), &bytes)?;
+        }
+        Ok(())
+    }
+
     fn apply_one(state: &mut MetadataState, req: &Request) -> Response {
         match req {
             Request::RegisterAgent {
@@ -143,6 +209,7 @@ impl StateMachineStore {
 
 impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
+        let _publication = self.publication.lock().unwrap();
         let (data, last_applied, membership) = {
             let state = self.state.read().unwrap();
             // bincode, not JSON: snapshotting holds the state read lock, so
@@ -161,8 +228,15 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
         let meta = SnapshotMeta {
             last_log_id: last_applied,
             last_membership: membership,
-            snapshot_id: format!("snapshot-{idx}"),
+            snapshot_id: format!(
+                "snapshot-{}-{idx}",
+                last_applied.map(|l| l.index).unwrap_or(0)
+            ),
         };
+        // A snapshot must be durable BEFORE it is returned: OpenRaft may
+        // now discard the only log entries containing this metadata.
+        self.persist_snapshot(&meta, &data)
+            .map_err(|e| StorageIOError::write_state_machine(&e))?;
         *self.snapshot.write().unwrap() = Some((meta.clone(), data.clone()));
 
         Ok(Snapshot {
@@ -222,9 +296,11 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let data = snapshot.into_inner();
-        let (new_state, _): (MetadataState, _) =
-            bincode::serde::decode_from_slice(&data, bincode::config::standard())
-                .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
+        let _publication = self.publication.lock().unwrap();
+        let new_state = Self::decode_snapshot(meta, &data)
+            .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
+        self.persist_snapshot(meta, &data)
+            .map_err(|e| StorageIOError::write_state_machine(&e))?;
         *self.state.write().unwrap() = new_state;
         *self.snapshot.write().unwrap() = Some((meta.clone(), data));
         Ok(())
@@ -242,5 +318,86 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
                 meta,
                 snapshot: Box::new(Cursor::new(data)),
             }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn installed_snapshot_is_durable_and_rejects_mismatched_metadata() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let mut source = StateMachineStore::open(source_dir.path().to_owned()).unwrap();
+        let a = AgentId::from_verifying_key(
+            &ed25519_dalek::SigningKey::from_bytes(&[17; 32]).verifying_key(),
+        );
+        StateMachineStore::apply_one(
+            &mut source.state.write().unwrap(),
+            &Request::RegisterAgent {
+                agent: a,
+                display_name: "installed".to_string(),
+            },
+        );
+        let snap = source.build_snapshot().await.unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let mut target = StateMachineStore::open(target_dir.path().to_owned()).unwrap();
+        target
+            .install_snapshot(&snap.meta, snap.snapshot)
+            .await
+            .unwrap();
+        drop(target);
+        let mut target = StateMachineStore::open(target_dir.path().to_owned()).unwrap();
+        assert_eq!(
+            target.state.read().unwrap().agents[&a].display_name,
+            "installed"
+        );
+        let good = target.get_current_snapshot().await.unwrap().unwrap();
+        let mut bad_meta = good.meta.clone();
+        bad_meta.last_log_id = Some(openraft::LogId::new(
+            openraft::CommittedLeaderId::new(1, 1),
+            90,
+        ));
+        assert!(target
+            .install_snapshot(&bad_meta, good.snapshot)
+            .await
+            .is_err());
+        drop(target);
+        assert!(StateMachineStore::open(target_dir.path().to_owned())
+            .unwrap()
+            .state
+            .read()
+            .unwrap()
+            .agents
+            .contains_key(&a));
+    }
+
+    #[tokio::test]
+    async fn unfinished_snapshot_replacement_does_not_replace_published_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = StateMachineStore::open(dir.path().to_owned()).unwrap();
+        let snap = store.build_snapshot().await.unwrap();
+        drop(store);
+        std::fs::write(
+            dir.path().join("raft-snapshot.pending"),
+            b"interrupted replacement",
+        )
+        .unwrap();
+        let mut recovered = StateMachineStore::open(dir.path().to_owned()).unwrap();
+        assert_eq!(
+            recovered
+                .get_current_snapshot()
+                .await
+                .unwrap()
+                .unwrap()
+                .meta,
+            snap.meta
+        );
+        std::fs::write(
+            dir.path().join("raft-snapshot.json"),
+            b"corrupt published snapshot",
+        )
+        .unwrap();
+        assert!(StateMachineStore::open(dir.path().to_owned()).is_err());
     }
 }

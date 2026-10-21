@@ -77,6 +77,8 @@ impl RaftNetworkFactory<TypeConfig> for HttpNetworkFactory {
 }
 
 impl HttpNetwork {
+    // The RPC error representation is required by OpenRaft's network trait.
+    #[allow(clippy::result_large_err)]
     async fn rpc<Req, Resp, E>(
         &self,
         path: &str,

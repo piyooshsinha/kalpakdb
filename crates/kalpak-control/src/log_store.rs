@@ -35,6 +35,8 @@ const META_FILE: &str = "raft-meta.json";
 struct Meta {
     vote: Option<Vote<NodeId>>,
     last_purged: Option<LogId>,
+    #[serde(default)]
+    committed: Option<LogId>,
 }
 
 #[derive(Default)]
@@ -42,6 +44,7 @@ struct Inner {
     log: BTreeMap<u64, Entry>,
     last_purged: Option<LogId>,
     vote: Option<Vote<NodeId>>,
+    committed: Option<LogId>,
     /// Open append handle for the log file, present in durable mode.
     log_file: Option<File>,
     dir: Option<PathBuf>,
@@ -57,11 +60,10 @@ impl Inner {
         let meta = Meta {
             vote: self.vote,
             last_purged: self.last_purged,
+            committed: self.committed,
         };
-        let tmp = dir.join(format!("{META_FILE}.tmp"));
         let bytes = serde_json::to_vec(&meta).map_err(io_err)?;
-        std::fs::write(&tmp, bytes).map_err(io_err)?;
-        std::fs::rename(&tmp, dir.join(META_FILE)).map_err(io_err)?;
+        crate::durability::replace(&dir.join(META_FILE), &bytes).map_err(io_err)?;
         Ok(())
     }
 
@@ -78,6 +80,7 @@ impl Inner {
             f.sync_data().map_err(io_err)?;
         }
         std::fs::rename(&tmp, dir.join(LOG_FILE)).map_err(io_err)?;
+        crate::durability::sync_directory(dir).map_err(io_err)?;
         self.log_file = Some(
             OpenOptions::new()
                 .append(true)
@@ -126,18 +129,19 @@ impl LogStore {
         };
 
         let mut log = BTreeMap::new();
-        match std::fs::read_to_string(dir.join(LOG_FILE)) {
+        let mut valid_len = 0;
+        match std::fs::read(dir.join(LOG_FILE)) {
             Ok(content) => {
-                for line in content.lines() {
-                    if line.is_empty() {
-                        continue;
-                    }
-                    // A torn tail line from a crash mid-append is dropped;
-                    // Raft re-replicates anything that wasn't acknowledged.
-                    let Ok(entry) = serde_json::from_str::<Entry>(line) else {
+                for line in content.split_inclusive(|b| *b == b'\n') {
+                    // Only an unterminated tail is a recoverable append.
+                    // Complete malformed records are corruption: never hide
+                    // later acknowledged entries by silently stopping.
+                    if !line.ends_with(b"\n") {
                         break;
-                    };
+                    }
+                    let entry: Entry = serde_json::from_slice(line).map_err(io_err)?;
                     log.insert(entry.log_id.index, entry);
+                    valid_len += line.len() as u64;
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -149,12 +153,18 @@ impl LogStore {
             .append(true)
             .open(dir.join(LOG_FILE))
             .map_err(io_err)?;
+        // Remove the invalid suffix before any future append. Otherwise
+        // every subsequent restart stops at the same torn record forever.
+        log_file.set_len(valid_len).map_err(io_err)?;
+        log_file.sync_all().map_err(io_err)?;
+        crate::durability::sync_directory(&dir).map_err(io_err)?;
 
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
                 log,
                 last_purged: meta.last_purged,
                 vote: meta.vote,
+                committed: meta.committed,
                 log_file: Some(log_file),
                 dir: Some(dir),
             })),
@@ -203,6 +213,16 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         Ok(self.inner.lock().unwrap().vote)
     }
 
+    async fn save_committed(&mut self, committed: Option<LogId>) -> Result<(), StorageError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.committed = committed;
+        inner.persist_meta()
+    }
+
+    async fn read_committed(&mut self) -> Result<Option<LogId>, StorageError> {
+        Ok(self.inner.lock().unwrap().committed)
+    }
+
     async fn append<I>(
         &mut self,
         entries: I,
@@ -235,5 +255,91 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         inner.log.retain(|idx, _| *idx > log_id.index);
         inner.persist_meta()?;
         inner.rewrite_log()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(index: u64) -> Entry {
+        serde_json::from_value(serde_json::json!({
+            "log_id": {"leader_id": {"term": 1, "node_id": 1}, "index": index},
+            "payload": "Blank"
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn torn_tail_is_removed_before_later_appends_and_second_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LogStore::open(dir.path()).unwrap();
+        {
+            let mut inner = store.inner.lock().unwrap();
+            inner.append_durable(&entry(1)).unwrap();
+            inner.sync_log().unwrap();
+            inner
+                .log_file
+                .as_mut()
+                .unwrap()
+                .write_all(b"{\"torn\":\xff")
+                .unwrap();
+        }
+        drop(store);
+        let store = LogStore::open(dir.path()).unwrap();
+        {
+            let mut inner = store.inner.lock().unwrap();
+            inner.append_durable(&entry(2)).unwrap();
+            inner.sync_log().unwrap();
+        }
+        drop(store);
+        let mut reopened = LogStore::open(dir.path()).unwrap();
+        let entries = reopened.try_get_log_entries(0..3).await.unwrap();
+        assert_eq!(
+            entries.iter().map(|e| e.log_id.index).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn complete_corrupt_record_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(LOG_FILE), b"not-json\n").unwrap();
+        assert!(LogStore::open(dir.path()).is_err());
+    }
+
+    #[tokio::test]
+    async fn vote_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let vote = Vote::new(7, 2);
+        let mut store = LogStore::open(dir.path()).unwrap();
+        store.save_vote(&vote).await.unwrap();
+        drop(store);
+        assert_eq!(
+            LogStore::open(dir.path())
+                .unwrap()
+                .read_vote()
+                .await
+                .unwrap(),
+            Some(vote)
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_position_survives_reopen_and_old_metadata_remains_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        // Older deployments have no committed field in raft-meta.json.
+        std::fs::write(
+            dir.path().join(META_FILE),
+            br#"{"vote":null,"last_purged":null}"#,
+        )
+        .unwrap();
+        let mut store = LogStore::open(dir.path()).unwrap();
+        assert_eq!(store.read_committed().await.unwrap(), None);
+        let committed = entry(5).log_id;
+        store.save_committed(Some(committed)).await.unwrap();
+        drop(store);
+        let mut store = LogStore::open(dir.path()).unwrap();
+        assert_eq!(store.read_committed().await.unwrap(), Some(committed));
     }
 }
