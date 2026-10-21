@@ -17,9 +17,12 @@ for release blockers. Keep all listeners on a trusted private network.
   can restore stale state, and identity verification is not ownership ACLs.
 - **Transport**: client-facing API serves TLS (`--tls-cert/--tls-key`),
   no cleartext fallback. Optional mesh mTLS authenticates the peer listener,
-  but the public router still exposes Raft/admin routes. The internal HTTP
-  header no longer exempts signed writes from verification; that fix does
-  not close the broader control-plane/admin authorization gap. The optional
+  and mesh deployments hide Raft, cluster-management and administrative
+  routes on the public listener; use a cluster client certificate on the
+  mesh listener for these operations. Without mesh, those routes remain
+  unauthenticated: this mode is for trusted development networks only.
+  The internal HTTP header never exempts signed writes from verification.
+  Non-mesh internal-header trust remains a release blocker. The optional
   gRPC listener is not covered by the HTTP TLS options.
 - **Reads are open** (stats, metrics, lookups, block fetch by content
   hash). Do not expose nodes holding sensitive context to untrusted

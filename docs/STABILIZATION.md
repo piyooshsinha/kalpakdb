@@ -18,6 +18,9 @@ that the only remaining work needs external hardware.
 - Reverify signed mutations even when callers present the internal forwarding
   header. This closes that exemption, not the broader public Raft/admin issue.
 - Default CLI automatic GC to disabled; operators must explicitly opt in.
+- Hide Raft, cluster-management and admin namespaces on public listeners
+  when mesh mTLS is configured, including witnesses. Bootstrap advertises
+  the mesh address; witnesses start a mutually authenticated peer listener.
 
 The snapshot envelope is versioned (`raft-snapshot.json`, version 1) and
 contains the existing bincode state-machine payload plus Raft metadata.
@@ -27,9 +30,11 @@ Lost snapshots from older versions cannot be recreated by this change.
 
 ## Release-blocking work still pending
 
-1. **Public/internal isolation:** remove Raft RPCs from public listeners;
-   authenticate administrative operations; do not trust an HTTP header as
-   peer authentication. Cover witnesses and forwarding in negative tests.
+1. **Public/internal isolation:** mesh deployments now restrict privileged
+   routes to the certificate-authenticated listener. Non-mesh deployments
+   still expose unauthenticated Raft/admin operations and trust an internal
+   header; replace this legacy development behavior with secure defaults.
+   Expand witness, bootstrap and forwarding negative tests.
 2. **GC safety:** replace the active-segment-only grace assumption with
    upload leases and a coordinated GC watermark. Bind-versus-GC and follower
    lag races are not solved by the reader-generation fix. Until then, run

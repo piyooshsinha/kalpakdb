@@ -102,6 +102,30 @@ async fn cluster_replicates_over_mutual_tls() {
         }
     }
 
+    // The public port cannot bypass client-certificate requirements by
+    // reaching the same privileged routes or spoofing the internal header.
+    for path in [
+        "/raft/append",
+        "/raft/vote",
+        "/raft/snapshot",
+        "/v1/cluster/init",
+        "/v1/cluster/add-learner",
+        "/v1/cluster/promote",
+        "/v1/admin/compact",
+        "/v1/admin/backup",
+    ] {
+        for method in [reqwest::Method::GET, reqwest::Method::POST] {
+            let response = public
+                .request(method, format!("http://127.0.0.1:{p1}{path}"))
+                .header("x-kalpak-internal", "1")
+                .body("not valid JSON")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 404, "public route exposed: {path}");
+        }
+    }
+
     // 1. The mesh port rejects clients without the cluster identity.
     let trusts_ca_only = reqwest::Client::builder()
         .add_root_certificate(

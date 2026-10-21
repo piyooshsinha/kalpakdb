@@ -140,7 +140,8 @@ async fn boot_control(opts: &ServeOpts) -> Result<Arc<ControlPlane>, Box<dyn std
     )
     .await?;
     if opts.bootstrap {
-        let members = std::collections::BTreeMap::from([(opts.node_id, opts.addr.clone())]);
+        let peer_addr = opts.mesh.as_ref().map_or(&opts.addr, |mesh| &mesh.addr);
+        let members = std::collections::BTreeMap::from([(opts.node_id, peer_addr.clone())]);
         // Re-initialization of an already-formed cluster fails benignly on
         // restart: membership is already in the durable log.
         if let Err(e) = control.init_cluster(members).await {
@@ -249,15 +250,25 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
         // With a mesh listener present, internal semantics never apply to
         // public traffic: strip the header so it cannot be spoofed to skip
         // signature checks or fan-out suppression.
-        app = app.layer(axum::middleware::from_fn(strip_internal_header));
+        app = app.layer(axum::middleware::from_fn(mesh_public_boundary));
     }
     serve_app(app, &opts).await
 }
 
-async fn strip_internal_header(
+async fn mesh_public_boundary(
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
+    // These operations require a cluster client certificate, not merely
+    // server-side TLS or an observability read token. Deny the namespace,
+    // including future routes, before body parsing or handler execution.
+    let path = req.uri().path();
+    if ["/raft", "/v1/cluster", "/v1/admin"]
+        .iter()
+        .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     req.headers_mut().remove(INTERNAL_HEADER);
     next.run(req).await
 }
@@ -299,7 +310,23 @@ async fn serve_app(app: Router, opts: &ServeOpts) -> Result<(), Box<dyn std::err
 /// gives a two-box deployment strict quorum without a third storage machine.
 pub async fn serve_witness(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
     let control = boot_control(&opts).await?;
-    let app = witness_router(control.clone());
+    let mut app = witness_router(control.clone());
+    if let Some(mesh) = &opts.mesh {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let config = mesh.server_config()?;
+        let bind: std::net::SocketAddr = mesh.addr.parse()?;
+        let mesh_app = app.clone();
+        tokio::spawn(async move {
+            let config = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(config));
+            if let Err(error) = axum_server::bind_rustls(bind, config)
+                .serve(mesh_app.into_make_service())
+                .await
+            {
+                eprintln!("kalpakdb: witness mesh listener exited: {error}");
+            }
+        });
+        app = app.layer(axum::middleware::from_fn(mesh_public_boundary));
+    }
     eprintln!(
         "kalpakdb witness {} (control dir: {})",
         opts.node_id, opts.data_dir
