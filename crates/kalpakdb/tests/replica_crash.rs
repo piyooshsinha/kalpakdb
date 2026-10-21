@@ -435,4 +435,46 @@ async fn new_leader_repairs_after_permanent_origin_loss() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
+    // Corrupt a cold record while the node still has a correct warm copy.
+    // Verification must bypass RAM and append a replacement, not dedup it.
+    use std::io::{Seek, Write};
+    let segment = fresh.dir.join("seg-00000000.klpk");
+    let bytes = std::fs::read(&segment).unwrap();
+    let offset = bytes
+        .windows(payload.len())
+        .position(|window| window == payload)
+        .unwrap();
+    let old_len = bytes.len() as u64;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&segment)
+        .unwrap();
+    file.seek(std::io::SeekFrom::Start(offset as u64)).unwrap();
+    file.write_all(&[payload[0] ^ 0xff]).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let response = client
+            .get(fresh.url(&format!("/v1/admin/blocks/{id}/presence")))
+            .send()
+            .await
+            .unwrap();
+        if response.status().is_success() {
+            let value: serde_json::Value = response.json().await.unwrap();
+            if value["cold_verified"] == true
+                && std::fs::metadata(&segment).unwrap().len() > old_len
+            {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "indexed corruption was not replaced from a healthy peer"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    fresh.kill();
+    offline_copies(&fresh.dir, &[payload.to_vec()]);
 }

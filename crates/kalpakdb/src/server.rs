@@ -21,10 +21,11 @@ use serde_json::json;
 use tower_http::cors::CorsLayer;
 
 pub struct AppState {
+    scrub_slots: Arc<tokio::sync::Semaphore>,
     replica_pushes: std::sync::atomic::AtomicU64,
     pub(crate) repairs: crate::repair::RepairLog,
     pub(crate) uploads: crate::admission::UploadBudget,
-    pub store: TieredStore,
+    pub store: Arc<TieredStore>,
     pub data_dir: String,
     pub control: Arc<ControlPlane>,
     /// Client for node-to-node calls (leader forwarding, peer block fetch);
@@ -199,10 +200,11 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
         None => (reqwest::Client::new(), "http"),
     };
     let state = Arc::new(AppState {
+        scrub_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         replica_pushes: Default::default(),
         repairs,
         uploads,
-        store,
+        store: Arc::new(store),
         data_dir: opts.data_dir.clone(),
         control,
         http,
@@ -653,10 +655,23 @@ async fn block_presence(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let block: BlockId = id.parse()?;
+    let permit = state.scrub_slots.clone().try_acquire_owned().map_err(|_| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cold verification busy".to_string(),
+        )
+    })?;
+    let store = state.store.clone();
+    let verified = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        store.verify_cold(&block).is_ok()
+    })
+    .await
+    .map_err(|error| ApiError(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(
         json!({ "id": id, "node_id": state.control.metrics().id,
         "storage_generation": state.repairs.generation,
-        "present": state.store.contains(&block), "retained": state.repairs.retained(&block) }),
+        "present": verified, "cold_verified": verified, "retained": state.repairs.retained(&block) }),
     ))
 }
 
@@ -701,7 +716,10 @@ async fn probe_peer(state: &AppState, node: u64, addr: &str, ids: &[BlockId]) ->
         // Even an absent block can reveal that the entire node incarnation
         // changed. Invalidate observations before deciding what to upload.
         state.repairs.observe(&[], node, Some(generation)).ok()?;
-        if value["present"].as_bool() != Some(true) || value["retained"].as_bool() != Some(true) {
+        if value["present"].as_bool() != Some(true)
+            || value["cold_verified"].as_bool() != Some(true)
+            || value["retained"].as_bool() != Some(true)
+        {
             return None;
         }
         if incarnation.as_ref().is_some_and(|old| old != generation) {
@@ -720,6 +738,7 @@ pub(crate) async fn acknowledge_replicas(
     body: bytes::Bytes,
     expected: serde_json::Value,
     required: usize,
+    lease: crate::admission::UploadLease,
 ) -> Result<(), String> {
     if required == 1 {
         return Ok(());
@@ -730,6 +749,18 @@ pub(crate) async fn acknowledge_replicas(
         serde_json::from_value(expected["ids"].clone()).map_err(|_| "invalid replica block ids")?
     };
     commit_requirements(state, ids.clone(), required).await?;
+    let store = state.store.clone();
+    let local_ids = ids.clone();
+    tokio::task::spawn_blocking(move || {
+        let _lease = lease;
+        for id in local_ids {
+            store.verify_cold(&id)?;
+        }
+        Ok::<_, kalpak_core::Error>(())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())?;
     state
         .repairs
         .observe(
@@ -789,6 +820,7 @@ pub(crate) async fn acknowledge_replicas(
                     if let Some(value) = bounded_peer_json(response, 512 * 1024).await {
                         if value["node_id"].as_u64() == Some(node_id)
                             && value["retained"].as_bool() == Some(true)
+                            && value["cold_verified"].as_bool() == Some(true)
                             && value["storage_generation"]
                                 .as_str()
                                 .is_some_and(crate::repair::valid_generation)
@@ -888,7 +920,11 @@ async fn put_block(
             .record(&[BlockId::of(&body)], replicas)
             .map_err(kalpak_core::Error::from)?;
     }
-    let id = s.store.put(&body)?;
+    let id = if replicas > 1 || headers.contains_key("x-kalpak-retain-replica") {
+        s.store.repair(&BlockId::of(&body), &body)?
+    } else {
+        s.store.put(&body)?
+    };
     if replicas > 1 {
         acknowledge_replicas(
             &s,
@@ -896,6 +932,7 @@ async fn put_block(
             body.clone(),
             json!({"id": id.to_string()}),
             replicas,
+            lease.clone(),
         )
         .await
         .map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, e))?;
@@ -923,6 +960,7 @@ async fn put_block(
     Ok(Json(
         json!({ "id": id.to_string(), "bytes": body.len(), "node_id": s.control.metrics().id,
             "storage_generation": s.repairs.generation,
+            "cold_verified": replicas > 1 || headers.contains_key("x-kalpak-retain-replica"),
             "retained": replicas > 1 || headers.contains_key("x-kalpak-retain-replica") }),
     ))
 }
@@ -979,6 +1017,11 @@ async fn put_blocks_batch(
             .map_err(kalpak_core::Error::from)?;
     }
     let ids = s.store.put_many(payloads.iter().copied())?;
+    if replicas > 1 || headers.contains_key("x-kalpak-retain-replica") {
+        for (id, payload) in ids.iter().zip(&payloads) {
+            s.store.repair(id, payload)?;
+        }
+    }
     let ids_json = json!(ids.iter().map(|id| id.to_string()).collect::<Vec<_>>());
     if replicas > 1 {
         acknowledge_replicas(
@@ -987,6 +1030,7 @@ async fn put_blocks_batch(
             body.clone(),
             json!({"ids": ids_json}),
             replicas,
+            lease.clone(),
         )
         .await
         .map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, e))?;
@@ -1012,6 +1056,7 @@ async fn put_blocks_batch(
     Ok(Json(json!({
         "ids": ids_json, "node_id": s.control.metrics().id,
         "storage_generation": s.repairs.generation,
+        "cold_verified": replicas > 1 || headers.contains_key("x-kalpak-retain-replica"),
         "retained": replicas > 1 || headers.contains_key("x-kalpak-retain-replica")
     })))
 }

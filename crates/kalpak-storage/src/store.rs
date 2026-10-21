@@ -33,6 +33,20 @@ pub struct BlockStore<B: IoBackend = StdBackend> {
     /// Append position in the active (last) segment. Serializes writers.
     append: Mutex<u64>,
     roll_bytes: u64,
+    write_failed: std::sync::atomic::AtomicBool,
+}
+
+struct AppendAttempt<'a> {
+    failed: &'a std::sync::atomic::AtomicBool,
+    committed: bool,
+}
+impl Drop for AppendAttempt<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.failed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
 }
 
 /// Outcome of [`BlockStore::verify_all`].
@@ -106,6 +120,7 @@ impl<B: IoBackend> BlockStore<B> {
         }
         if files.is_empty() {
             files.push(Arc::new(backend.open(&segment_path(&dir, 0))?));
+            std::fs::File::open(&dir)?.sync_all()?;
             tail = 0;
         }
 
@@ -113,6 +128,7 @@ impl<B: IoBackend> BlockStore<B> {
             backend,
             dir,
             index: RwLock::new(index),
+            write_failed: std::sync::atomic::AtomicBool::new(false),
             files: RwLock::new(files),
             append: Mutex::new(tail),
             roll_bytes: DEFAULT_SEGMENT_ROLL_BYTES,
@@ -135,6 +151,22 @@ impl<B: IoBackend> BlockStore<B> {
     where
         I: IntoIterator<Item = &'a [u8]>,
     {
+        self.put_many_inner(payloads, false)
+    }
+
+    /// Replace an unreadable/corrupt indexed record by appending a verified
+    /// new generation. Never overwrite the damaged record in place.
+    pub fn repair(&self, id: &BlockId, payload: &[u8]) -> Result<BlockId, Error> {
+        if !id.verify(payload) {
+            return Err(Error::Corrupt { id: *id });
+        }
+        Ok(self.put_many_inner(std::iter::once(payload), true)?[0])
+    }
+
+    fn put_many_inner<'a, I>(&self, payloads: I, repair: bool) -> Result<Vec<BlockId>, Error>
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
         // Hash outside any lock.
         let prepared: Vec<(BlockId, &[u8])> =
             payloads.into_iter().map(|p| (BlockId::of(p), p)).collect();
@@ -142,6 +174,16 @@ impl<B: IoBackend> BlockStore<B> {
 
         // Writers serialize on the tail; readers are untouched by this lock.
         let mut tail = self.append.lock().unwrap();
+        if self.write_failed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(std::io::Error::other(
+                "append failed previously; restart storage before further writes",
+            )
+            .into());
+        }
+        let mut attempt = AppendAttempt {
+            failed: &self.write_failed,
+            committed: false,
+        };
         let mut active = {
             let files = self.files.read().unwrap();
             (files.len() as u32 - 1, Arc::clone(files.last().unwrap()))
@@ -150,13 +192,17 @@ impl<B: IoBackend> BlockStore<B> {
         // Records staged for the current active file, flushed as one
         // batched submission (a single ring round on the uring backend).
         let mut pending: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut rolled = false;
 
         for (id, payload) in &prepared {
             // The append lock is held, so the index check is race-free with
             // other writers; `staged` covers duplicates within this batch.
-            if self.index.read().unwrap().contains_key(id)
-                || staged.iter().any(|(sid, _)| sid == id)
-            {
+            let present = if repair {
+                self.get(id).is_ok()
+            } else {
+                self.index.read().unwrap().contains_key(id)
+            };
+            if present || staged.iter().any(|(sid, _)| sid == id) {
                 continue;
             }
             let record = segment::encode_record(id, payload);
@@ -175,6 +221,7 @@ impl<B: IoBackend> BlockStore<B> {
                     (seg_id, Arc::clone(files.last().unwrap()))
                 };
                 active = new_file;
+                rolled = true;
                 *tail = 0;
             }
 
@@ -195,6 +242,9 @@ impl<B: IoBackend> BlockStore<B> {
         // Readers keep reading sealed records throughout: no shared lock
         // is held here.
         flush_pending(active.1.as_ref(), &mut pending, true)?;
+        if rolled {
+            std::fs::File::open(&self.dir)?.sync_all()?;
+        }
 
         // Publish only after the data is durable.
         if !staged.is_empty() {
@@ -203,6 +253,7 @@ impl<B: IoBackend> BlockStore<B> {
                 index.insert(id, loc);
             }
         }
+        attempt.committed = true;
         Ok(ids)
     }
 
@@ -470,6 +521,57 @@ mod tests {
 
         let store = BlockStore::open(dir.path()).unwrap();
         assert!(matches!(store.get(&id), Err(Error::Corrupt { .. })));
+    }
+
+    #[test]
+    fn interrupted_repair_fails_closed_and_can_be_retried_after_restart() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Backend(Arc<AtomicBool>);
+        struct File(std::fs::File, Arc<AtomicBool>);
+        impl IoBackend for Backend {
+            type SegmentFile = File;
+            fn open(&self, path: &Path) -> std::io::Result<File> {
+                Ok(File(StdBackend.open(path)?, self.0.clone()))
+            }
+        }
+        impl SegmentFile for File {
+            fn len(&self) -> std::io::Result<u64> {
+                SegmentFile::len(&self.0)
+            }
+            fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+                self.0.read_at(buf, offset)
+            }
+            fn sync(&self) -> std::io::Result<()> {
+                SegmentFile::sync(&self.0)
+            }
+            fn write_at(&self, buf: &[u8], offset: u64) -> std::io::Result<()> {
+                if self.1.swap(false, Ordering::SeqCst) {
+                    self.0.write_at(&buf[..HEADER_LEN + 3], offset)?;
+                    return Err(std::io::Error::other("injected partial repair write"));
+                }
+                self.0.write_at(buf, offset)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let fail = Arc::new(AtomicBool::new(false));
+        let store = BlockStore::open_with(Backend(fail.clone()), dir.path()).unwrap();
+        let payload = b"repair-with-a-torn-replacement";
+        let id = store.put(payload).unwrap();
+        let path = dir.path().join("seg-00000000.klpk");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[HEADER_LEN] ^= 0xff;
+        std::fs::write(&path, bytes).unwrap();
+        fail.store(true, Ordering::SeqCst);
+        assert!(store.repair(&id, payload).is_err());
+        assert!(matches!(store.get(&id), Err(Error::Corrupt { .. })));
+        assert!(store.put(b"must-not-ack-after-append-error").is_err());
+        drop(store);
+        let store = BlockStore::open(dir.path()).unwrap();
+        store.repair(&id, payload).unwrap();
+        drop(store);
+        let store = BlockStore::open(dir.path()).unwrap();
+        assert_eq!(store.get(&id).unwrap(), payload);
+        assert!(store.verify_all().is_clean());
     }
 
     #[test]

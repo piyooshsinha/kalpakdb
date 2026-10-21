@@ -261,21 +261,21 @@ pub(crate) fn start(state: Arc<crate::server::AppState>) {
                         .repairs
                         .record(&[id], replicas)
                         .map_err(kalpak_core::Error::from)?;
-                    disk_state.store.get(&id)
+                    Ok::<_, kalpak_core::Error>(
+                        disk_state
+                            .store
+                            .verify_cold(&id)
+                            .and_then(|_| disk_state.store.get(&id)),
+                    )
                 })
                 .await;
-                if payload.is_err() {
+                let Ok(Ok(payload)) = payload else {
                     continue;
-                }
-                if let Ok(Err(ref error)) = payload {
-                    if !matches!(error, kalpak_core::Error::BlockNotFound(_)) {
-                        eprintln!("kalpakdb: repair {id} cannot prepare local source: {error}");
-                        continue;
-                    }
-                }
+                };
+                // Persisting the pin must succeed first. A subsequent cold
+                // read failure can safely trigger retrieval of a replacement.
                 let mut payload = payload
                     .ok()
-                    .and_then(Result::ok)
                     .map(|payload| bytes::Bytes::copy_from_slice(&payload));
                 if payload.is_none() {
                     // A newly elected leader need not have the tensor yet.
@@ -310,7 +310,7 @@ pub(crate) fn start(state: Arc<crate::server::AppState>) {
                                     let _lease = disk_lease;
                                     disk_state
                                         .store
-                                        .put(&bytes)
+                                        .repair(&id, &bytes)
                                         .map(|_| bytes::Bytes::from(bytes))
                                 })
                                 .await;
@@ -331,6 +331,7 @@ pub(crate) fn start(state: Arc<crate::server::AppState>) {
                         payload,
                         serde_json::json!({"id": id.to_string()}),
                         replicas,
+                        lease.clone(),
                     )
                     .await;
                     if let Err(error) = result {

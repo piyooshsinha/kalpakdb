@@ -50,7 +50,12 @@ responsibility transfer. Verified copy-location records are still pending.
 Local placement observations and fresh retained-presence probes now avoid
 re-uploading healthy peers. Durable storage generations distinguish a fresh
 directory at a reused node ID; a changed generation invalidates old hints.
-These observations are not replicated placement authority or integrity scrubs.
+These observations are not replicated placement authority. Peer probes now
+verify cold payload hashes under a one-at-a-time verification limit, bypass
+warm caches and quarantine detected corruption. Repair appends a verified,
+synced replacement rather than deduplicating a damaged record. Tests cover
+cached-good/cold-bad payloads, partial replacement writes, cold restart and
+repair from a healthy peer. Append errors fail closed until restart.
 
 The snapshot envelope is versioned (`raft-snapshot.json`, version 1) and
 contains a `KLPKSM02`-prefixed bincode payload plus Raft metadata. Legacy
@@ -77,7 +82,8 @@ Lost snapshots from older versions cannot be recreated by this change.
    after crashes; committed responsibility now survives origin loss through
    Raft and leader-owned repair. Local incarnation-aware placement hints now
    drive targeted uploads after fresh presence checks. Still add replicated
-   verified placement authority, capacity reclamation, indexed-corruption scrubbing/replacement,
+   verified placement authority, capacity reclamation, rate/bandwidth-limited
+   whole-store scrubbing and structural/header-corruption recovery,
    partition/cancellation and negative acknowledgement tests,
    power-loss validation and SDK convenience options. Process-crash and
    isolated-restart checks now cover both copies. This is not maintained

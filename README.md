@@ -248,7 +248,7 @@ curl --fail-with-body -X POST http://127.0.0.1:7411/v1/blocks \
 Write-time acknowledgements require a **Raft-committed replica requirement**
 as well as durable peer copies. This is not yet a replica-location catalog.
 Partial writes may remain after errors or cancellation; retry identical
-content. Mixed-version peers lacking node-ID, storage-generation or retention
+content. Mixed-version peers lacking node-ID, storage-generation, cold-verification or retention
 acknowledgements do not count.
 gRPC replicates completed blocks individually over the HTTP peer transport;
 it does not put tensors in Raft. Keep GC disabled. Use mesh mTLS for trusted
@@ -289,14 +289,28 @@ skipping an upload. Missing or unretained copies are uploaded; a partly
 missing HTTP batch may still resend its complete batch payload.
 
 Peer probes use `GET /v1/admin/blocks/{id}/presence`, restricted to the mesh
-listener in mTLS deployments. They check the local index, not disk contents.
+listener in mTLS deployments. Probes now read cold payloads and verify their
+content hashes, bypassing warm and pinned caches. One peer verification per
+node runs at a time on the blocking pool; excess probe requests return 503.
+Repair scans remain bounded by the existing batch/admission limits. This is
+not yet a rate-controlled whole-store background scrubber or I/O bandwidth
+budget. It costs disk reads even when it avoids network tensor transfers.
 Observations are local hints, not a Raft-replicated placement catalog or
-cryptographic storage proofs. `/v1/stats` exposes acknowledged replication
+cryptographic storage proofs. A cold verification confirms bytes at that
+instant, not future survival. `/v1/stats` exposes acknowledged replication
 upload attempts so redundant tensor transfers can be checked. Backups
 include the storage-generation ID and observations.
 
-This repairs missing copies, not disk bit rot: a corrupt block
-already indexed on a peer needs a separate scrub/quarantine/replace path.
+Detected payload corruption is quarantined from normal cache reads and stops
+counting as a healthy copy. Repair verifies incoming bytes, bypasses normal
+deduplication for damaged records, appends and syncs a replacement, then
+publishes its new location. The damaged record is not overwritten in place.
+The repair worker can retrieve a healthy copy from another peer. Runtime
+quarantine flags are not persisted; cold verification redetects damage after
+restart. Structural/header corruption and general I/O failures still need
+broader recovery handling; if no healthy source survives, repair cannot
+invent the missing data. A failed append blocks further writes until restart,
+preventing later writes from being acknowledged beyond an uncertain tail.
 This is not yet an always-maintained replica-count guarantee.
 
 Snapshot payloads now carry a `KLPKSM02` version prefix. The new binary reads

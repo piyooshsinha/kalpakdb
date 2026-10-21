@@ -91,7 +91,14 @@ impl BlockService for BlockGrpc {
                 disk_state
                     .store
                     .put_many(blocks.iter().map(|b| b.as_slice()))
-                    .map(|ids| (ids, blocks))
+                    .and_then(|ids| {
+                        if replicas > 1 {
+                            for (id, block) in ids.iter().zip(&blocks) {
+                                disk_state.store.repair(id, block)?;
+                            }
+                        }
+                        Ok((ids, blocks))
+                    })
             })
             .await
             .map_err(|e| Status::internal(e.to_string()))?
@@ -104,6 +111,7 @@ impl BlockService for BlockGrpc {
                         Bytes::from(block),
                         serde_json::json!({"id": id.to_string()}),
                         replicas,
+                        permit.clone(),
                     )
                     .await
                     .map_err(Status::unavailable)?;
