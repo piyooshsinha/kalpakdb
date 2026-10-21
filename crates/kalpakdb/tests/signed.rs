@@ -62,6 +62,32 @@ async fn signed_writes_are_enforced() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 401, "unsigned register must fail");
 
+    // A client can send the forwarding header itself. It must never grant
+    // signature exemption, with or without mesh TLS configured.
+    let bypass = http
+        .post(format!("http://{ADDR}/v1/agents"))
+        .header("x-kalpak-internal", "1")
+        .json(&json!({ "agent": agent, "display_name": "spoofed-peer" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bypass.status().as_u16(), 401);
+
+    // A correctly signed forwarded payload must still work after removing
+    // the exemption; forwarding is not itself grounds for rejection.
+    let forwarded_message = kalpak_core::signing::register_message(&agent, "forwarded");
+    let forwarded = http
+        .post(format!("http://{ADDR}/v1/agents"))
+        .header("x-kalpak-internal", "1")
+        .json(&json!({
+            "agent": agent, "display_name": "forwarded",
+            "signature": kalpak_core::signing::sign_hex(&signing, &forwarded_message)
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(forwarded.status().is_success());
+
     // 2. A signature from a DIFFERENT key over the same message is rejected.
     let msg = kalpak_core::signing::register_message(&agent, "forged");
     let intruder = SigningKey::from_bytes(&[99; 32]);

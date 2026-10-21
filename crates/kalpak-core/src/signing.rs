@@ -10,10 +10,10 @@
 //! counts are little-endian u32. Domain-separation prefixes keep a signature
 //! for one operation from ever validating another.
 //!
-//! Replay: signatures carry no nonce. All three mutations are idempotent
-//! (re-registering or re-binding identical content is a no-op), so replaying
-//! a captured signature reproduces state that already exists. Capture
-//! resistance on the wire is TLS's job, not the signature's.
+//! Replay: signatures carry no nonce or expected revision. Replaying an
+//! older valid request after a newer mutation can roll state back. TLS does
+//! not resolve that protocol limitation; replay protection needs a versioned
+//! signing format and state-machine enforcement before multi-tenant use.
 
 use ed25519_dalek::{Signature, Signer, SigningKey};
 

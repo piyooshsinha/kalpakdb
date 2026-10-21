@@ -4,6 +4,13 @@
 
 **A content-addressed, Raft-replicated database for AI agent state — the storage layer agent frameworks build on.**
 
+> **Status: experimental, not production-ready.** Correctness and security
+> stabilization is in progress. See [the stabilization checklist](docs/STABILIZATION.md)
+> for implemented fixes, known risks, and release-blocking work. In particular,
+> disable automatic compaction (`--compact-secs 0`) while coordinated GC safety
+> remains unresolved, and do not expose current administrative/Raft routes to
+> untrusted networks.
+
 The industry currently duct-tapes traditional databases together to handle AI memory and state: Redis for hot state, a vector database for embeddings, a graph database for facts, object storage for blobs — and the KV cache, the hottest and most expensive state in the entire stack, has no home at all and gets recomputed on every call. The bugs live in the seams between these systems: no atomicity across them, no shared lineage, no common identity.
 
 KalpakDB is one substrate for agent state, built so the seams disappear.
@@ -180,7 +187,10 @@ db = KalpakClient("http://127.0.0.1:7411", signer=Ed25519Signer(private_key_byte
 db.register_agent(db.signer.agent, "researcher")                   # signed
 ```
 
-Unsigned or forged mutations get `401`; reads stay open. Replay of a captured signature only reproduces the identical (idempotent) mutation — confidentiality and capture-resistance on the wire are TLS's job:
+Unsigned or forged mutations get `401`; reads stay open. The current signing
+format does **not** provide replay protection: an old signed bind can overwrite
+a newer binding. TLS protects transport but does not solve stored-request replay
+or ownership authorization. These remain stabilization blockers.
 
 ## TLS
 

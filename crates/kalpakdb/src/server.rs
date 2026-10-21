@@ -479,17 +479,16 @@ const INTERNAL_HEADER: &str = "x-kalpak-internal";
 
 /// Verify a mutation's signature when the node demands signed writes.
 ///
-/// Node-to-node requests (leader forwarding, replication) skip
-/// re-verification: the ingress node already verified before forwarding,
-/// matching the existing internal trust model.
+/// Forwarding preserves the signed payload. Verify it again even on peer
+/// requests: a caller-controlled loop-prevention header is not identity.
 fn verify_signature(
     s: &AppState,
-    headers: &axum::http::HeaderMap,
+    _headers: &axum::http::HeaderMap,
     agent: &AgentId,
     message: &[u8],
     signature: Option<&str>,
 ) -> Result<(), ApiError> {
-    if !s.require_signatures || headers.contains_key(INTERNAL_HEADER) {
+    if !s.require_signatures {
         return Ok(());
     }
     let Some(sig_hex) = signature else {
