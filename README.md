@@ -255,6 +255,14 @@ peer identities; local development HTTP cannot protect against malicious
 local processes. Default HTTP replication remains best-effort, and default
 gRPC writes remain local-only.
 
+The `replica_crash` integration test exercises acknowledged HTTP single,
+HTTP batch and gRPC writes with two real node processes. It kills the
+receiver, verifies the peer without read fallback, kills both processes,
+checks both stores offline, then restarts each node alone and checks every
+payload again. Isolated nodes must reject new two-replica writes. This is
+process-crash evidence, not a power-loss simulation or a maintained-replica
+guarantee.
+
 Observability reads can demand a token: `--read-token <t>` guards `/v1/stats`, `/v1/ws`, and the agent explorer with `Authorization: Bearer <t>` (the dashboard picks it up from `?token=`); `/metrics` stays open for Prometheus scrapers and the data path is governed by signatures, not the read token.
 
 Node-to-node traffic gets **mutual TLS**: `kalpakdb mesh-ca` generates a cluster CA and node certificates, and `--mesh <addr>,<ca>,<cert>,<key>` moves all Raft/replication RPCs onto a dedicated mTLS listener where presenting a CA-signed certificate *is* mesh membership — both sides authenticate, so neither a rogue client nor a rogue server can join the cluster path:

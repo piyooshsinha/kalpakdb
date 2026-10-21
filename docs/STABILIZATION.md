@@ -33,6 +33,9 @@ that the only remaining work needs external hardware.
 - Add per-request acknowledged replica counts for HTTP single/batch and gRPC
   uploads; validate peer node IDs and content acknowledgements, exclude
   duplicate endpoints and witnesses, and fail unavailable requirements.
+- Exercise acknowledged HTTP single/batch and gRPC copies through real
+  process kills, offline integrity checks and isolated cold restarts; read
+  fallback is suppressed and isolated two-replica writes must fail.
 
 The snapshot envelope is versioned (`raft-snapshot.json`, version 1) and
 contains the existing bincode state-machine payload plus Raft metadata.
@@ -54,8 +57,9 @@ Lost snapshots from older versions cannot be recreated by this change.
    with `--compact-secs 0` and avoid manual compaction on live deployments.
 3. **Data durability contract:** opt-in acknowledged replica counts now
    cover HTTP and gRPC. Still add persistent retry/repair and location
-   tracking, crash/restart verification of acknowledged copies, negative
-   acknowledgement tests and SDK convenience options. This is not maintained
+   tracking, partition/cancellation and negative acknowledgement tests,
+   power-loss validation and SDK convenience options. Process-crash and
+   isolated-restart checks now cover both copies. This is not maintained
    replica durability; default writes still promise only local storage.
 4. **Authorization and signing v2:** namespace ownership, replay-resistant
    revisions/nonces, unambiguous length-prefixed encoding and parent coverage.
