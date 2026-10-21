@@ -10,19 +10,51 @@ use serde::{Deserialize, Serialize};
 
 const MAX_RECORDS: usize = 16_384;
 
+pub(crate) fn valid_generation(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Requirements {
     version: u32,
     blocks: BTreeMap<BlockId, usize>,
+    #[serde(default)]
+    locations: BTreeMap<BlockId, BTreeMap<u64, String>>,
 }
 
 pub(crate) struct RepairLog {
+    pub(crate) generation: String,
     path: PathBuf,
     requirements: Mutex<Requirements>,
 }
 
 impl RepairLog {
     pub(crate) fn open(dir: &Path) -> io::Result<Self> {
+        let generation_path = dir.join("storage-generation");
+        let generation = match std::fs::read_to_string(&generation_path) {
+            Ok(value) => value,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let mut temporary = tempfile::NamedTempFile::new_in(dir)?;
+                let seed = format!(
+                    "{:?}-{:?}-{}",
+                    temporary.path(),
+                    std::time::SystemTime::now(),
+                    std::process::id()
+                );
+                let value = BlockId::of(seed.as_bytes()).to_string();
+                temporary.write_all(value.as_bytes())?;
+                temporary.as_file().sync_all()?;
+                temporary
+                    .persist(&generation_path)
+                    .map_err(|error| error.error)?;
+                File::open(dir)?.sync_all()?;
+                value
+            }
+            Err(error) => return Err(error),
+        };
+        if !valid_generation(&generation) {
+            return Err(io::Error::other("invalid storage generation"));
+        }
         let path = dir.join("replica-requirements.json");
         let requirements = match std::fs::read(&path) {
             Ok(bytes) => {
@@ -37,10 +69,18 @@ impl RepairLog {
         if requirements.version != 1
             || requirements.blocks.len() > MAX_RECORDS
             || requirements.blocks.values().any(|n| !(1..=16).contains(n))
+            || requirements.locations.iter().any(|(id, nodes)| {
+                !requirements.blocks.contains_key(id)
+                    || nodes.len() > 16
+                    || nodes
+                        .values()
+                        .any(|generation| !valid_generation(generation))
+            })
         {
             return Err(io::Error::other("invalid replica requirements"));
         }
         Ok(Self {
+            generation,
             path,
             requirements: Mutex::new(requirements),
         })
@@ -62,7 +102,13 @@ impl RepairLog {
         if next.blocks.len() > MAX_RECORDS {
             return Err(io::Error::other("replica requirement capacity exhausted"));
         }
-        let bytes = serde_json::to_vec(&next).map_err(io::Error::other)?;
+        self.publish(&next)?;
+        *current = next;
+        Ok(())
+    }
+
+    fn publish(&self, next: &Requirements) -> io::Result<()> {
+        let bytes = serde_json::to_vec(next).map_err(io::Error::other)?;
         let pending = self.path.with_extension("pending");
         let mut file = OpenOptions::new()
             .create(true)
@@ -73,7 +119,61 @@ impl RepairLog {
         file.sync_all()?;
         std::fs::rename(&pending, &self.path)?;
         File::open(self.path.parent().unwrap())?.sync_all()?;
-        *current = next;
+        Ok(())
+    }
+
+    pub(crate) fn retained(&self, id: &BlockId) -> bool {
+        self.requirements.lock().unwrap().blocks.contains_key(id)
+    }
+
+    pub(crate) fn known_nodes(&self, id: &BlockId) -> Vec<u64> {
+        self.requirements
+            .lock()
+            .unwrap()
+            .locations
+            .get(id)
+            .map(|nodes| nodes.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn observe(
+        &self,
+        ids: &[BlockId],
+        node: u64,
+        generation: Option<&str>,
+    ) -> io::Result<()> {
+        if generation.is_some_and(|generation| !valid_generation(generation)) {
+            return Err(io::Error::other("invalid peer storage generation"));
+        }
+        let mut current = self.requirements.lock().unwrap();
+        let mut next = current.clone();
+        // A changed incarnation invalidates every old observation for this
+        // node, not just the block currently being checked.
+        if let Some(generation) = generation {
+            for nodes in next.locations.values_mut() {
+                if nodes.get(&node).is_some_and(|old| old != generation) {
+                    nodes.remove(&node);
+                }
+            }
+        }
+        for id in ids {
+            if !next.blocks.contains_key(id) {
+                continue;
+            }
+            let nodes = next.locations.entry(*id).or_default();
+            if let Some(generation) = generation {
+                if !nodes.contains_key(&node) && nodes.len() >= 16 {
+                    nodes.pop_first();
+                }
+                nodes.insert(node, generation.to_string());
+            } else {
+                nodes.remove(&node);
+            }
+        }
+        if next.locations != current.locations {
+            self.publish(&next)?;
+            *current = next;
+        }
         Ok(())
     }
 
@@ -180,7 +280,10 @@ pub(crate) fn start(state: Arc<crate::server::AppState>) {
                 if payload.is_none() {
                     // A newly elected leader need not have the tensor yet.
                     // Fetch from a retained copy, never through cascading reads.
-                    for (_, peer) in state.control.peer_nodes() {
+                    let known = state.repairs.known_nodes(&id);
+                    let mut peers = state.control.peer_nodes();
+                    peers.sort_by_key(|(node, _)| (!known.contains(node), *node));
+                    for (_, peer) in peers {
                         let response = state
                             .http
                             .get(format!("{}://{peer}/v1/blocks/{id}", state.peer_scheme))
@@ -244,6 +347,34 @@ pub(crate) fn start(state: Arc<crate::server::AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observations_survive_restart_and_incarnation_changes_invalidate_old_locations() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = RepairLog::open(dir.path()).unwrap();
+        let local_generation = log.generation.clone();
+        let a = BlockId::of(b"a");
+        let b = BlockId::of(b"b");
+        let old = "a".repeat(64);
+        let new = "b".repeat(64);
+        log.record(&[a, b], 2).unwrap();
+        log.observe(&[a, b], 7, Some(&old)).unwrap();
+        drop(log);
+        let log = RepairLog::open(dir.path()).unwrap();
+        assert_eq!(log.generation, local_generation);
+        assert_eq!(log.requirements.lock().unwrap().locations[&b][&7], old);
+        log.observe(&[a], 7, Some(&new)).unwrap();
+        assert_eq!(log.requirements.lock().unwrap().locations[&a][&7], new);
+        assert!(!log.requirements.lock().unwrap().locations[&b].contains_key(&7));
+        log.observe(&[a], 7, None).unwrap();
+        assert!(!log.requirements.lock().unwrap().locations[&a].contains_key(&7));
+        assert!(log.observe(&[a], 7, Some("bad")).is_err());
+        let fresh = tempfile::tempdir().unwrap();
+        assert_ne!(
+            RepairLog::open(fresh.path()).unwrap().generation,
+            local_generation
+        );
+    }
 
     #[test]
     fn requirements_survive_reopen_and_never_downgrade() {

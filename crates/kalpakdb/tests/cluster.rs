@@ -235,6 +235,25 @@ async fn three_node_cluster_replicates_metadata() {
             "acknowledged-on-three-nodes"
         );
     }
+    let before = stats(&client, &n1).await["repair"]["acknowledged_replication_upload_attempts"]
+        .as_u64()
+        .unwrap();
+    let repeated = client
+        .post(format!("http://{n1}/v1/blocks"))
+        .header("x-kalpak-replicas", "3")
+        .body("acknowledged-on-three-nodes")
+        .send()
+        .await
+        .unwrap();
+    assert!(repeated.status().is_success());
+    let after = stats(&client, &n1).await["repair"]["acknowledged_replication_upload_attempts"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        before, after,
+        "healthy retained copies should be probed, not uploaded again"
+    );
+
     let mut batch = 2u32.to_le_bytes().to_vec();
     for payload in [b"replicated-batch-a".as_slice(), b"replicated-batch-b"] {
         batch.extend_from_slice(&(payload.len() as u32).to_le_bytes());

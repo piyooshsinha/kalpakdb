@@ -21,6 +21,7 @@ use serde_json::json;
 use tower_http::cors::CorsLayer;
 
 pub struct AppState {
+    replica_pushes: std::sync::atomic::AtomicU64,
     pub(crate) repairs: crate::repair::RepairLog,
     pub(crate) uploads: crate::admission::UploadBudget,
     pub store: TieredStore,
@@ -198,6 +199,7 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
         None => (reqwest::Client::new(), "http"),
     };
     let state = Arc::new(AppState {
+        replica_pushes: Default::default(),
         repairs,
         uploads,
         store,
@@ -421,6 +423,7 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/ws", get(ws_stats))
         .route("/v1/admin/compact", post(admin_compact))
         .route("/v1/admin/backup", get(admin_backup))
+        .route("/v1/admin/blocks/{id}/presence", get(block_presence))
         .route("/v1/agents/list", get(list_agents))
         .route("/v1/agents/{id}/bindings", get(agent_bindings))
         .with_state(state)
@@ -645,6 +648,70 @@ pub(crate) fn parse_replicas<E>(value: Option<Result<&str, E>>) -> Result<usize,
     }
 }
 
+async fn block_presence(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let block: BlockId = id.parse()?;
+    Ok(Json(
+        json!({ "id": id, "node_id": state.control.metrics().id,
+        "storage_generation": state.repairs.generation,
+        "present": state.store.contains(&block), "retained": state.repairs.retained(&block) }),
+    ))
+}
+
+async fn bounded_peer_json(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Option<serde_json::Value> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if chunk.len() > limit.saturating_sub(bytes.len()) {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+async fn probe_peer(state: &AppState, node: u64, addr: &str, ids: &[BlockId]) -> Option<String> {
+    let mut incarnation = None;
+    for id in ids {
+        let response = state
+            .http
+            .get(format!(
+                "{}://{addr}/v1/admin/blocks/{id}/presence",
+                state.peer_scheme
+            ))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let value = bounded_peer_json(response, 2048).await?;
+        let generation = value["storage_generation"].as_str()?;
+        if value["node_id"].as_u64() != Some(node)
+            || value["id"].as_str() != Some(&id.to_string())
+            || !crate::repair::valid_generation(generation)
+        {
+            return None;
+        }
+        // Even an absent block can reveal that the entire node incarnation
+        // changed. Invalidate observations before deciding what to upload.
+        state.repairs.observe(&[], node, Some(generation)).ok()?;
+        if value["present"].as_bool() != Some(true) || value["retained"].as_bool() != Some(true) {
+            return None;
+        }
+        if incarnation.as_ref().is_some_and(|old| old != generation) {
+            return None;
+        }
+        incarnation = Some(generation.to_string());
+    }
+    incarnation
+}
+
 /// Count only matching content acknowledgements from distinct membership
 /// identities. A witness has no ingest handler and therefore cannot count.
 pub(crate) async fn acknowledge_replicas(
@@ -662,8 +729,21 @@ pub(crate) async fn acknowledge_replicas(
     } else {
         serde_json::from_value(expected["ids"].clone()).map_err(|_| "invalid replica block ids")?
     };
-    commit_requirements(state, ids, required).await?;
-    let peers = state.control.peer_nodes();
+    commit_requirements(state, ids.clone(), required).await?;
+    state
+        .repairs
+        .observe(
+            &ids,
+            state.control.metrics().id,
+            Some(&state.repairs.generation),
+        )
+        .map_err(|error| error.to_string())?;
+    let mut peers = state.control.peer_nodes();
+    let known = ids
+        .first()
+        .map(|id| state.repairs.known_nodes(id))
+        .unwrap_or_default();
+    peers.sort_by_key(|(node, _)| (!known.contains(node), *node));
     if peers.len() + 1 < required {
         return Err(format!(
             "need {required} replicas, membership has only {} nodes; local write may already exist",
@@ -677,6 +757,24 @@ pub(crate) async fn acknowledge_replicas(
             if !endpoints.insert(addr.clone()) {
                 continue;
             }
+            if let Some(generation) = probe_peer(state, node_id, &addr, &ids).await {
+                state
+                    .repairs
+                    .observe(&ids, node_id, Some(&generation))
+                    .map_err(|error| error.to_string())?;
+                acknowledged += 1;
+                if acknowledged >= required {
+                    return Ok(());
+                }
+                continue;
+            }
+            state
+                .repairs
+                .observe(&ids, node_id, None)
+                .map_err(|error| error.to_string())?;
+            state
+                .replica_pushes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let response = state
                 .http
                 .post(format!("{}://{addr}{path}", state.peer_scheme))
@@ -688,15 +786,22 @@ pub(crate) async fn acknowledge_replicas(
                 .await;
             if let Ok(response) = response {
                 if response.status().is_success() {
-                    if let Ok(value) = response.json::<serde_json::Value>().await {
+                    if let Some(value) = bounded_peer_json(response, 512 * 1024).await {
                         if value["node_id"].as_u64() == Some(node_id)
                             && value["retained"].as_bool() == Some(true)
+                            && value["storage_generation"]
+                                .as_str()
+                                .is_some_and(crate::repair::valid_generation)
                             && expected
                                 .as_object()
                                 .unwrap()
                                 .iter()
                                 .all(|(k, v)| value.get(k) == Some(v))
                         {
+                            state
+                                .repairs
+                                .observe(&ids, node_id, value["storage_generation"].as_str())
+                                .map_err(|error| error.to_string())?;
                             acknowledged += 1;
                             if acknowledged >= required {
                                 return Ok(());
@@ -817,6 +922,7 @@ async fn put_block(
     }
     Ok(Json(
         json!({ "id": id.to_string(), "bytes": body.len(), "node_id": s.control.metrics().id,
+            "storage_generation": s.repairs.generation,
             "retained": replicas > 1 || headers.contains_key("x-kalpak-retain-replica") }),
     ))
 }
@@ -905,6 +1011,7 @@ async fn put_blocks_batch(
     }
     Ok(Json(json!({
         "ids": ids_json, "node_id": s.control.metrics().id,
+        "storage_generation": s.repairs.generation,
         "retained": replicas > 1 || headers.contains_key("x-kalpak-retain-replica")
     })))
 }
@@ -1321,6 +1428,7 @@ async fn admin_backup(State(s): State<Shared>) -> Result<Response, ApiError> {
             let (file, path) = tmp.keep().map_err(|e| e.error)?;
             let mut builder = tar::Builder::new(std::io::BufWriter::new(file));
             let root = std::path::Path::new(&data_dir);
+            builder.append_path_with_name(root.join("storage-generation"), "storage-generation")?;
             // Published intent is replaced atomically; never include its
             // unfinished .pending file. Capture it before segment traversal.
             let requirements = root.join("replica-requirements.json");
@@ -1393,6 +1501,9 @@ fn stats_payload(s: &AppState) -> serde_json::Value {
             "runs": s.gc_runs.load(std::sync::atomic::Ordering::Relaxed),
             "blocks_dropped": s.gc_blocks_dropped.load(std::sync::atomic::Ordering::Relaxed),
             "bytes_reclaimed": s.gc_bytes_reclaimed.load(std::sync::atomic::Ordering::Relaxed),
+        },
+        "repair": {
+            "acknowledged_replication_upload_attempts": s.replica_pushes.load(std::sync::atomic::Ordering::Relaxed),
         },
     })
 }

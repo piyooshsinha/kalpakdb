@@ -113,6 +113,7 @@ async fn cluster_replicates_over_mutual_tls() {
         "/v1/cluster/promote",
         "/v1/admin/compact",
         "/v1/admin/backup",
+        "/v1/admin/blocks/not-an-id/presence",
     ] {
         for method in [reqwest::Method::GET, reqwest::Method::POST] {
             let response = public

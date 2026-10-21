@@ -248,8 +248,8 @@ curl --fail-with-body -X POST http://127.0.0.1:7411/v1/blocks \
 Write-time acknowledgements require a **Raft-committed replica requirement**
 as well as durable peer copies. This is not yet a replica-location catalog.
 Partial writes may remain after errors or cancellation; retry identical
-content. Mixed-version peers lacking node-ID and retention acknowledgements
-do not count.
+content. Mixed-version peers lacking node-ID, storage-generation or retention
+acknowledgements do not count.
 gRPC replicates completed blocks individually over the HTTP peer transport;
 it does not put tensors in Raft. Keep GC disabled. Use mesh mTLS for trusted
 peer identities; local development HTTP cannot protect against malicious
@@ -280,9 +280,22 @@ hash and persist it before repairing other copies. Uncommitted local
 intents from failed/older uploads are promoted when a leader is reachable;
 only these uncommitted intents still depend on the source ledger surviving.
 Each ledger and the replicated requirement map are capped at 16,384 blocks.
-The worker currently re-uploads healthy
-copies rather than maintaining verified location records, which costs
-bandwidth. This repairs missing copies, not disk bit rot: a corrupt block
+The local ledger also persists bounded block/node/storage-generation
+observations (at most 16 locations per block). Each data directory has a
+durable `storage-generation` ID; a fresh directory gets a new ID. A new peer
+generation invalidates its old observations across blocks. Cached locations
+never count alone: fresh, retained-presence probes are required before
+skipping an upload. Missing or unretained copies are uploaded; a partly
+missing HTTP batch may still resend its complete batch payload.
+
+Peer probes use `GET /v1/admin/blocks/{id}/presence`, restricted to the mesh
+listener in mTLS deployments. They check the local index, not disk contents.
+Observations are local hints, not a Raft-replicated placement catalog or
+cryptographic storage proofs. `/v1/stats` exposes acknowledged replication
+upload attempts so redundant tensor transfers can be checked. Backups
+include the storage-generation ID and observations.
+
+This repairs missing copies, not disk bit rot: a corrupt block
 already indexed on a peer needs a separate scrub/quarantine/replace path.
 This is not yet an always-maintained replica-count guarantee.
 

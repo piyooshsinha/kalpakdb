@@ -402,4 +402,37 @@ async fn new_leader_repairs_after_permanent_origin_loss() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     local_copies(&client, &retained, &[payload.to_vec()]).await;
+
+    // Reuse node ID and endpoint with a genuinely empty storage directory.
+    // The old location must not be treated as proof that bytes survived.
+    let old_generation = std::fs::read_to_string(retained.dir.join("storage-generation")).unwrap();
+    retained.kill();
+    let mut fresh = Node {
+        child: None,
+        dir: temp.path().join("fresh-storage"),
+        id: 2,
+        port: 17882,
+    };
+    fresh.start();
+    fresh.wait(&client).await;
+    let new_generation = std::fs::read_to_string(fresh.dir.join("storage-generation")).unwrap();
+    assert_ne!(old_generation, new_generation);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let response = client
+            .get(fresh.url(&format!("/v1/blocks/{id}")))
+            .header("x-kalpak-internal", "1")
+            .send()
+            .await
+            .unwrap();
+        if response.status().is_success() {
+            assert_eq!(response.bytes().await.unwrap().as_ref(), payload);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fresh incarnation was mistaken for an existing copy"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
