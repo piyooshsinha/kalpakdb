@@ -196,11 +196,20 @@ or ownership authorization. These remain stabilization blockers.
 
 ```sh
 ./target/release/kalpakdb cert ./pki                       # self-signed dev cert
-./target/release/kalpakdb serve /data --addr 0.0.0.0:7411 \
+./target/release/kalpakdb serve /data --addr 127.0.0.1:7411 \
     --tls-cert ./pki/kalpak-cert.pem --tls-key ./pki/kalpak-key.pem
 ```
 
 Clients pass the CA: `KalpakClient::with_options(url, signer, Some(ca_pem))` in Rust, `KalpakClient(url, cafile="…")` in Python, `curl --cacert …`. There is no cleartext fallback on a TLS port.
+
+Without `--mesh`, HTTP must bind to a literal loopback address (`127.0.0.1`
+or `[::1]`): the development Raft/admin API is not authenticated. This also
+applies to witnesses and to server-only TLS. Remote HTTP bindings require
+mesh mTLS; privileged routes are then available only on the mesh listener.
+The optional gRPC listener is plaintext and must always bind to loopback,
+even when HTTP TLS or mesh is enabled. These restrictions are intentional
+breaking changes; legacy wildcard-bind/container examples need mesh setup.
+Loopback is not protection against other users or processes on the host.
 
 Observability reads can demand a token: `--read-token <t>` guards `/v1/stats`, `/v1/ws`, and the agent explorer with `Authorization: Bearer <t>` (the dashboard picks it up from `?token=`); `/metrics` stays open for Prometheus scrapers and the data path is governed by signatures, not the read token.
 

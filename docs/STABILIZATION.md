@@ -21,6 +21,9 @@ that the only remaining work needs external hardware.
 - Hide Raft, cluster-management and admin namespaces on public listeners
   when mesh mTLS is configured, including witnesses. Bootstrap advertises
   the mesh address; witnesses start a mutually authenticated peer listener.
+- Reject non-loopback HTTP binds without mesh and all non-loopback plaintext
+  gRPC binds before opening storage or starting background tasks. Hostnames
+  are rejected for these transports to avoid resolution/bind races.
 
 The snapshot envelope is versioned (`raft-snapshot.json`, version 1) and
 contains the existing bincode state-machine payload plus Raft metadata.
@@ -32,8 +35,9 @@ Lost snapshots from older versions cannot be recreated by this change.
 
 1. **Public/internal isolation:** mesh deployments now restrict privileged
    routes to the certificate-authenticated listener. Non-mesh deployments
-   still expose unauthenticated Raft/admin operations and trust an internal
-   header; replace this legacy development behavior with secure defaults.
+   are restricted to loopback but still expose unauthenticated Raft/admin
+   operations to local processes and trust an internal header; replace
+   this legacy development behavior with authenticated local access.
    Expand witness, bootstrap and forwarding negative tests.
 2. **GC safety:** replace the active-segment-only grace assumption with
    upload leases and a coordinated GC watermark. Bind-versus-GC and follower

@@ -20,10 +20,13 @@ for release blockers. Keep all listeners on a trusted private network.
   and mesh deployments hide Raft, cluster-management and administrative
   routes on the public listener; use a cluster client certificate on the
   mesh listener for these operations. Without mesh, those routes remain
-  unauthenticated: this mode is for trusted development networks only.
+  unauthenticated: startup restricts this mode to literal loopback binds.
+  Server-only TLS does not lift that restriction. Other local processes
+  can still access these routes; use mesh for authenticated administration.
   The internal HTTP header never exempts signed writes from verification.
   Non-mesh internal-header trust remains a release blocker. The optional
-  gRPC listener is not covered by the HTTP TLS options.
+  gRPC listener is not covered by the HTTP TLS options and is restricted
+  to literal loopback binds even when mesh is enabled.
 - **Reads are open** (stats, metrics, lookups, block fetch by content
   hash). Do not expose nodes holding sensitive context to untrusted
   networks; block ids are unguessable but lookups are not access-checked.

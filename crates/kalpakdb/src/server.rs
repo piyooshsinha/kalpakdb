@@ -151,7 +151,34 @@ async fn boot_control(opts: &ServeOpts) -> Result<Arc<ControlPlane>, Box<dyn std
     Ok(Arc::new(control))
 }
 
+/// Validate transport boundaries before opening storage or starting tasks.
+/// Server-only TLS does not authenticate callers of the legacy Raft API.
+fn validate_listeners(opts: &ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
+    if opts.mesh.is_none() {
+        require_loopback(&opts.addr, "HTTP without mesh mTLS")?;
+    }
+    if let Some(addr) = &opts.grpc_addr {
+        require_loopback(addr, "plaintext gRPC")?;
+    }
+    Ok(())
+}
+
+fn require_loopback(addr: &str, transport: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // Require a literal address: hostname resolution can change between
+    // validation and bind, and must not widen this security boundary.
+    let addr: std::net::SocketAddr = addr.parse().map_err(|_| {
+        format!("{transport} requires a literal loopback bind address (127.0.0.1 or [::1])")
+    })?;
+    if !addr.ip().is_loopback() {
+        return Err(format!(
+            "{transport} may bind only to loopback; configure --mesh for remote HTTP access; remote gRPC requires an authenticated transport not yet implemented"
+        ).into());
+    }
+    Ok(())
+}
+
 pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
+    validate_listeners(&opts)?;
     let store = TieredStore::open(&opts.data_dir, opts.warm_bytes)?;
     let control = boot_control(&opts).await?;
     let (http, peer_scheme) = match &opts.mesh {
@@ -309,6 +336,7 @@ async fn serve_app(app: Router, opts: &ServeOpts) -> Result<(), Box<dyn std::err
 /// but stores no data-plane blocks. This is the lightweight third vote that
 /// gives a two-box deployment strict quorum without a third storage machine.
 pub async fn serve_witness(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
+    validate_listeners(&opts)?;
     let control = boot_control(&opts).await?;
     let mut app = witness_router(control.clone());
     if let Some(mesh) = &opts.mesh {
@@ -1295,6 +1323,29 @@ async fn stream_stats(mut socket: WebSocket, s: Shared) {
         let payload = stats_payload(&s).to_string();
         if socket.send(Message::Text(payload.into())).await.is_err() {
             break;
+        }
+    }
+}
+
+#[cfg(test)]
+mod listener_tests {
+    use super::require_loopback;
+
+    #[test]
+    fn unauthenticated_transports_require_literal_loopback() {
+        for addr in ["127.0.0.1:7411", "127.0.0.2:7411", "[::1]:7411"] {
+            assert!(require_loopback(addr, "test").is_ok(), "{addr}");
+        }
+        for addr in [
+            "0.0.0.0:7411",
+            "[::]:7411",
+            "192.168.1.2:7411",
+            "[::ffff:127.0.0.1]:7411",
+            "localhost:7411",
+            "example.com:7411",
+            "not an address",
+        ] {
+            assert!(require_loopback(addr, "test").is_err(), "{addr}");
         }
     }
 }
