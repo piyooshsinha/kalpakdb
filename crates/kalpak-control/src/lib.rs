@@ -233,13 +233,21 @@ impl ControlPlane {
 
     /// Addresses of all current cluster members except this node.
     pub fn peer_addrs(&self) -> Vec<String> {
+        self.peer_nodes()
+            .into_iter()
+            .map(|(_, addr)| addr)
+            .collect()
+    }
+
+    /// Stable node identities paired with the current peer endpoints.
+    pub fn peer_nodes(&self) -> Vec<(u64, String)> {
         let metrics = self.metrics();
         let self_id = metrics.id;
         metrics
             .membership_config
             .nodes()
             .filter(|(id, _)| **id != self_id)
-            .map(|(_, node)| node.addr.clone())
+            .map(|(id, node)| (*id, node.addr.clone()))
             .collect()
     }
 

@@ -230,6 +230,31 @@ cancellation may leave earlier batches persisted. Content-addressed retries
 deduplicate those blocks. Read streams are not yet admission-controlled.
 HTTP binary batches are capped at 4,096 blocks and reject trailing bytes.
 
+### Opt-in acknowledged replicas
+
+Send `x-kalpak-replicas: N` on HTTP block/batch uploads or as gRPC
+`PutBlocks` request metadata (`N` is 1–16, default 1). A successful request
+with `N > 1` waits for the local write and matching content acknowledgements
+from `N-1` distinct membership nodes. Witnesses do not count. HTTP failures
+return 503; gRPC failures return `UNAVAILABLE`. Invalid policies return
+400 / `INVALID_ARGUMENT`. Peer requests have five-second deadlines and each
+acknowledgement operation has a 30-second deadline.
+
+```sh
+curl --fail-with-body -X POST http://127.0.0.1:7411/v1/blocks \
+    -H 'x-kalpak-replicas: 2' --data-binary @tensor.bin
+```
+
+This is **write-time replication**, not a promise of maintained replica
+count: there is no persistent repair queue or replica-location catalog yet.
+Partial writes may remain after errors or cancellation; retry identical
+content. Mixed-version peers lacking node-ID acknowledgements do not count.
+gRPC replicates completed blocks individually over the HTTP peer transport;
+it does not put tensors in Raft. Keep GC disabled. Use mesh mTLS for trusted
+peer identities; local development HTTP cannot protect against malicious
+local processes. Default HTTP replication remains best-effort, and default
+gRPC writes remain local-only.
+
 Observability reads can demand a token: `--read-token <t>` guards `/v1/stats`, `/v1/ws`, and the agent explorer with `Authorization: Bearer <t>` (the dashboard picks it up from `?token=`); `/metrics` stays open for Prometheus scrapers and the data path is governed by signatures, not the read token.
 
 Node-to-node traffic gets **mutual TLS**: `kalpakdb mesh-ca` generates a cluster CA and node certificates, and `--mesh <addr>,<ca>,<cert>,<key>` moves all Raft/replication RPCs onto a dedicated mTLS listener where presenting a CA-signed certificate *is* mesh membership — both sides authenticate, so neither a rogue client nor a rogue server can join the cluster path:

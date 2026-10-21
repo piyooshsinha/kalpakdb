@@ -50,6 +50,13 @@ impl BlockService for BlockGrpc {
         // without ever setting last_chunk would grow one block unbounded and
         // exhaust memory. No legitimate KV block approaches the default.
         let max_block_bytes = self.state.max_block_bytes;
+        let replicas = crate::server::parse_replicas(
+            request
+                .metadata()
+                .get("x-kalpak-replicas")
+                .map(|v| v.to_str()),
+        )
+        .map_err(Status::invalid_argument)?;
         let permit = self
             .state
             .uploads
@@ -68,15 +75,34 @@ impl BlockService for BlockGrpc {
         let flush = |blocks: Vec<Vec<u8>>,
                      state: Arc<AppState>,
                      permit: Arc<tokio::sync::OwnedSemaphorePermit>| async move {
-            tokio::task::spawn_blocking(move || {
+            let disk_state = state.clone();
+            let disk_permit = permit.clone();
+            let (ids, blocks) = tokio::task::spawn_blocking(move || {
                 // Cancellation cannot release admission while an already
                 // submitted blocking disk operation is still running.
-                let _permit = permit;
-                state.store.put_many(blocks.iter().map(|b| b.as_slice()))
+                let _permit = disk_permit;
+                disk_state
+                    .store
+                    .put_many(blocks.iter().map(|b| b.as_slice()))
+                    .map(|ids| (ids, blocks))
             })
             .await
             .map_err(|e| Status::internal(e.to_string()))?
-            .map_err(|e| Status::internal(e.to_string()))
+            .map_err(|e| Status::internal(e.to_string()))?;
+            if replicas > 1 {
+                for (id, block) in ids.iter().zip(blocks) {
+                    crate::server::acknowledge_replicas(
+                        &state,
+                        "/v1/blocks",
+                        Bytes::from(block),
+                        serde_json::json!({"id": id.to_string()}),
+                        replicas,
+                    )
+                    .await
+                    .map_err(Status::unavailable)?;
+                }
+            }
+            Ok::<_, Status>(ids)
         };
 
         while let Some(chunk) = tokio::time::timeout(CHUNK_IDLE_TIMEOUT, stream.message())

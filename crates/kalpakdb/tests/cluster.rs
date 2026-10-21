@@ -205,4 +205,79 @@ async fn three_node_cluster_replicates_metadata() {
         local.status().is_success(),
         "replicate-on-read did not stick"
     );
+
+    let replicated = client
+        .post(format!("http://{n1}/v1/blocks"))
+        .header("x-kalpak-replicas", "3")
+        .body("acknowledged-on-three-nodes")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        replicated.status().is_success(),
+        "{:?}",
+        replicated.text().await
+    );
+    let id = kalpak_core::BlockId::of(b"acknowledged-on-three-nodes");
+    for addr in [&n1, &n2, &n3] {
+        let response = client
+            .get(format!("http://{addr}/v1/blocks/{id}"))
+            .header("x-kalpak-internal", "1")
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "acknowledged copy absent on {addr}"
+        );
+        assert_eq!(
+            response.bytes().await.unwrap(),
+            "acknowledged-on-three-nodes"
+        );
+    }
+    let mut batch = 2u32.to_le_bytes().to_vec();
+    for payload in [b"replicated-batch-a".as_slice(), b"replicated-batch-b"] {
+        batch.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        batch.extend_from_slice(payload);
+    }
+    let response = client
+        .post(format!("http://{n1}/v1/blocks/batch"))
+        .header("x-kalpak-replicas", "3")
+        .body(batch)
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    for addr in [&n2, &n3] {
+        for payload in [b"replicated-batch-a".as_slice(), b"replicated-batch-b"] {
+            let id = kalpak_core::BlockId::of(payload);
+            let response = client
+                .get(format!("http://{addr}/v1/blocks/{id}"))
+                .header("x-kalpak-internal", "1")
+                .send()
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+            assert_eq!(response.bytes().await.unwrap().as_ref(), payload);
+        }
+    }
+
+    let impossible = client
+        .post(format!("http://{n1}/v1/blocks"))
+        .header("x-kalpak-replicas", "4")
+        .body("not-four-copies")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(impossible.status(), 503);
+    for value in ["0", "17", "abc"] {
+        let invalid = client
+            .post(format!("http://{n1}/v1/blocks"))
+            .header("x-kalpak-replicas", value)
+            .body("invalid-policy")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), 400);
+    }
 }

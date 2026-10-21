@@ -30,6 +30,9 @@ that the only remaining work needs external hardware.
 - Share conservative upload reservations between HTTP (before body buffering),
   gRPC and pending HTTP replication. Bound HTTP batch counts and reject
   trailing framing bytes; apply HTTP upload and per-peer replication timeouts.
+- Add per-request acknowledged replica counts for HTTP single/batch and gRPC
+  uploads; validate peer node IDs and content acknowledgements, exclude
+  duplicate endpoints and witnesses, and fail unavailable requirements.
 
 The snapshot envelope is versioned (`raft-snapshot.json`, version 1) and
 contains the existing bincode state-machine payload plus Raft metadata.
@@ -49,9 +52,11 @@ Lost snapshots from older versions cannot be recreated by this change.
    upload leases and a coordinated GC watermark. Bind-versus-GC and follower
    lag races are not solved by the reader-generation fix. Until then, run
    with `--compact-secs 0` and avoid manual compaction on live deployments.
-3. **Data durability contract:** choose acknowledged replica counts, add
-   retry/repair and location tracking, and bring gRPC onto the same path.
-   Metadata replication alone does not guarantee surviving block copies.
+3. **Data durability contract:** opt-in acknowledged replica counts now
+   cover HTTP and gRPC. Still add persistent retry/repair and location
+   tracking, crash/restart verification of acknowledged copies, negative
+   acknowledgement tests and SDK convenience options. This is not maintained
+   replica durability; default writes still promise only local storage.
 4. **Authorization and signing v2:** namespace ownership, replay-resistant
    revisions/nonces, unambiguous length-prefixed encoding and parent coverage.
 5. **Backup consistency:** coordinate metadata and segment generations with

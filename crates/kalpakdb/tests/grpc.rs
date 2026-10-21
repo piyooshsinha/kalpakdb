@@ -273,4 +273,14 @@ async fn grpc_rejects_unbounded_single_block() {
         .unwrap()
         .into_inner();
     assert_eq!(ok.ids.len(), 1);
+
+    let mut request = tonic::Request::new(tokio_stream::iter([PutBlockChunk {
+        data: b"requires-two-copies".to_vec().into(),
+        last_chunk: true,
+    }]));
+    request
+        .metadata_mut()
+        .insert("x-kalpak-replicas", "2".parse().unwrap());
+    let error = client.put_blocks(request).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable);
 }

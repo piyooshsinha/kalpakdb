@@ -134,6 +134,18 @@ async fn witness_gives_two_data_nodes_quorum() {
         "witness must not accept data-plane blocks"
     );
 
+    // Consensus voters and data replicas are different counts.
+    for (required, status) in [(2, 200), (3, 503)] {
+        let response = client
+            .post(format!("http://{}/v1/blocks", storage.addr))
+            .header("x-kalpak-replicas", required.to_string())
+            .body("witness-is-not-a-data-replica")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), status);
+    }
+
     // Kill the compute node: storage + witness = 2 of 3 votes, quorum holds.
     compute.kill.send(()).unwrap();
 

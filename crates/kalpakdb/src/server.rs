@@ -625,17 +625,104 @@ async fn forward_to_leader(
     }
 }
 
+pub(crate) fn parse_replicas<E>(value: Option<Result<&str, E>>) -> Result<usize, String> {
+    match value {
+        None => Ok(1),
+        Some(Ok(value)) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=16).contains(n))
+            .ok_or_else(|| "x-kalpak-replicas must be an integer from 1 to 16".to_string()),
+        Some(Err(_)) => Err("invalid x-kalpak-replicas encoding".to_string()),
+    }
+}
+
+/// Count only matching content acknowledgements from distinct membership
+/// identities. A witness has no ingest handler and therefore cannot count.
+pub(crate) async fn acknowledge_replicas(
+    state: &AppState,
+    path: &str,
+    body: bytes::Bytes,
+    expected: serde_json::Value,
+    required: usize,
+) -> Result<(), String> {
+    if required == 1 {
+        return Ok(());
+    }
+    let peers = state.control.peer_nodes();
+    if peers.len() + 1 < required {
+        return Err(format!(
+            "need {required} replicas, membership has only {} nodes; local write may already exist",
+            peers.len() + 1
+        ));
+    }
+    let operation = async {
+        let mut acknowledged = 1usize;
+        let mut endpoints = std::collections::HashSet::new();
+        for (node_id, addr) in peers {
+            if !endpoints.insert(addr.clone()) {
+                continue;
+            }
+            let response = state
+                .http
+                .post(format!("{}://{addr}{path}", state.peer_scheme))
+                .header(INTERNAL_HEADER, "1")
+                .body(body.clone())
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await;
+            if let Ok(response) = response {
+                if response.status().is_success() {
+                    if let Ok(value) = response.json::<serde_json::Value>().await {
+                        if value["node_id"].as_u64() == Some(node_id)
+                            && expected
+                                .as_object()
+                                .unwrap()
+                                .iter()
+                                .all(|(k, v)| value.get(k) == Some(v))
+                        {
+                            acknowledged += 1;
+                            if acknowledged >= required {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Err(format!("need {required} replicas, received {acknowledged} durable acknowledgements; partial writes may exist"))
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), operation)
+        .await
+        .map_err(|_| {
+            "replica acknowledgement deadline exceeded; partial writes may exist".to_string()
+        })?
+}
+
 async fn put_block(
     State(s): State<Shared>,
     axum::Extension(lease): axum::Extension<crate::admission::UploadLease>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let replicas = parse_replicas(headers.get("x-kalpak-replicas").map(|v| v.to_str()))
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
     let id = s.store.put(&body)?;
+    if replicas > 1 {
+        acknowledge_replicas(
+            &s,
+            "/v1/blocks",
+            body.clone(),
+            json!({"id": id.to_string()}),
+            replicas,
+        )
+        .await
+        .map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    }
     // Proactive replication: push the block to every data peer in the
     // background so reads anywhere are local. Witnesses simply reject the
     // route. Internal pushes never fan out further.
-    if !headers.contains_key(INTERNAL_HEADER) {
+    if replicas == 1 && !headers.contains_key(INTERNAL_HEADER) {
         let state = s.clone();
         let payload = body.clone();
         tokio::spawn(async move {
@@ -652,7 +739,9 @@ async fn put_block(
             }
         });
     }
-    Ok(Json(json!({ "id": id.to_string(), "bytes": body.len() })))
+    Ok(Json(
+        json!({ "id": id.to_string(), "bytes": body.len(), "node_id": s.control.metrics().id }),
+    ))
 }
 
 /// Batch block upload with one group-committed fsync.
@@ -665,6 +754,8 @@ async fn put_blocks_batch(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let replicas = parse_replicas(headers.get("x-kalpak-replicas").map(|v| v.to_str()))
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
     let bad = |m: &str| ApiError(StatusCode::BAD_REQUEST, m.to_string());
     if body.len() < 4 {
         return Err(bad("truncated batch header"));
@@ -696,8 +787,20 @@ async fn put_blocks_batch(
         return Err(bad("trailing bytes after batch"));
     }
     let ids = s.store.put_many(payloads.iter().copied())?;
+    let ids_json = json!(ids.iter().map(|id| id.to_string()).collect::<Vec<_>>());
+    if replicas > 1 {
+        acknowledge_replicas(
+            &s,
+            "/v1/blocks/batch",
+            body.clone(),
+            json!({"ids": ids_json}),
+            replicas,
+        )
+        .await
+        .map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    }
 
-    if !headers.contains_key(INTERNAL_HEADER) {
+    if replicas == 1 && !headers.contains_key(INTERNAL_HEADER) {
         let state = s.clone();
         let raw = body.clone();
         tokio::spawn(async move {
@@ -715,7 +818,7 @@ async fn put_blocks_batch(
         });
     }
     Ok(Json(json!({
-        "ids": ids.iter().map(|i| i.to_string()).collect::<Vec<_>>()
+        "ids": ids_json, "node_id": s.control.metrics().id
     })))
 }
 
