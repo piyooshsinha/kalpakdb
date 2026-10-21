@@ -2,8 +2,8 @@
 //!
 //! Carries ONLY block bytes — metadata stays on the Raft-backed HTTP path.
 //! `PutBlocks` accumulates a chunked client stream and commits every block
-//! under a single fsync (group commit), so streaming a multi-chunk context
-//! costs one flush regardless of size. `GetBlock` streams payloads out in
+//! in bounded group-commit batches. Large streams may require multiple
+//! flushes and are not atomic. `GetBlock` streams payloads out in
 //! fixed-size chunks; the chunks are zero-copy slices of the warm-tier
 //! buffer (`Bytes::slice` over one shared allocation).
 
@@ -20,13 +20,22 @@ use crate::server::AppState;
 
 /// Outbound chunk size for GetBlock streams.
 const CHUNK_BYTES: usize = 1024 * 1024;
+const MAX_STREAM_BLOCKS: usize = 4096;
+const MAX_BATCH_BLOCKS: usize = 256;
+const MAX_STREAM_CHUNKS: usize = 65_536;
+const MAX_UPLOADS: usize = 4;
+const CHUNK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub struct BlockGrpc {
     state: Arc<AppState>,
+    uploads: Arc<tokio::sync::Semaphore>,
 }
 
 pub fn service(state: Arc<AppState>) -> BlockServiceServer<BlockGrpc> {
-    BlockServiceServer::new(BlockGrpc { state })
+    BlockServiceServer::new(BlockGrpc {
+        state,
+        uploads: Arc::new(tokio::sync::Semaphore::new(MAX_UPLOADS)),
+    })
 }
 
 #[tonic::async_trait]
@@ -46,15 +55,29 @@ impl BlockService for BlockGrpc {
         // without ever setting last_chunk would grow one block unbounded and
         // exhaust memory. No legitimate KV block approaches the default.
         let max_block_bytes = self.state.max_block_bytes;
+        let permit = Arc::new(
+            self.uploads
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| Status::resource_exhausted("too many concurrent block uploads"))?,
+        );
 
         let mut stream = request.into_inner();
         let mut blocks: Vec<Vec<u8>> = Vec::new();
         let mut staged_bytes = 0usize;
         let mut current: Vec<u8> = Vec::new();
         let mut ids: Vec<String> = Vec::new();
+        let mut block_count = 0usize;
+        let mut chunk_count = 0usize;
+        let mut block_open = false;
 
-        let flush = |blocks: Vec<Vec<u8>>, state: Arc<AppState>| async move {
+        let flush = |blocks: Vec<Vec<u8>>,
+                     state: Arc<AppState>,
+                     permit: Arc<tokio::sync::OwnedSemaphorePermit>| async move {
             tokio::task::spawn_blocking(move || {
+                // Cancellation cannot release admission while an already
+                // submitted blocking disk operation is still running.
+                let _permit = permit;
                 state.store.put_many(blocks.iter().map(|b| b.as_slice()))
             })
             .await
@@ -62,32 +85,44 @@ impl BlockService for BlockGrpc {
             .map_err(|e| Status::internal(e.to_string()))
         };
 
-        while let Some(chunk) = stream.message().await? {
-            current.extend_from_slice(&chunk.data);
-            if current.len() > max_block_bytes {
+        while let Some(chunk) = tokio::time::timeout(CHUNK_IDLE_TIMEOUT, stream.message())
+            .await
+            .map_err(|_| Status::deadline_exceeded("block upload idle timeout"))??
+        {
+            chunk_count += 1;
+            if chunk_count > MAX_STREAM_CHUNKS {
+                return Err(Status::resource_exhausted("too many chunks in upload"));
+            }
+            if block_count == MAX_STREAM_BLOCKS {
+                return Err(Status::resource_exhausted("too many blocks in upload"));
+            }
+            if chunk.data.len() > max_block_bytes.saturating_sub(current.len()) {
                 return Err(Status::resource_exhausted(format!(
-                    "block exceeds {max_block_bytes} bytes without a last_chunk marker"
+                    "block exceeds {max_block_bytes} bytes"
                 )));
             }
+            current.extend_from_slice(&chunk.data);
+            block_open = !chunk.last_chunk;
             if chunk.last_chunk {
+                block_count += 1;
                 staged_bytes += current.len();
                 blocks.push(std::mem::take(&mut current));
-                if staged_bytes >= FLUSH_BYTES {
+                if staged_bytes >= FLUSH_BYTES || blocks.len() >= MAX_BATCH_BLOCKS {
                     let batch = std::mem::take(&mut blocks);
                     staged_bytes = 0;
-                    for id in flush(batch, self.state.clone()).await? {
+                    for id in flush(batch, self.state.clone(), permit.clone()).await? {
                         ids.push(id.to_string());
                     }
                 }
             }
         }
-        if !current.is_empty() {
+        if block_open {
             return Err(Status::invalid_argument(
                 "stream ended mid-block: missing last_chunk",
             ));
         }
         if !blocks.is_empty() {
-            for id in flush(blocks, self.state.clone()).await? {
+            for id in flush(blocks, self.state.clone(), permit.clone()).await? {
                 ids.push(id.to_string());
             }
         }

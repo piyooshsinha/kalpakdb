@@ -24,6 +24,9 @@ that the only remaining work needs external hardware.
 - Reject non-loopback HTTP binds without mesh and all non-loopback plaintext
   gRPC binds before opening storage or starting background tasks. Hostnames
   are rejected for these transports to avoid resolution/bind races.
+- Bound gRPC upload concurrency, total chunk/block counts, batch block counts
+  and idle waits. Keep admission held until submitted blocking flushes finish,
+  even if the client cancels. Reject an unfinished empty block as torn framing.
 
 The snapshot envelope is versioned (`raft-snapshot.json`, version 1) and
 contains the existing bincode state-machine payload plus Raft metadata.
@@ -51,8 +54,9 @@ Lost snapshots from older versions cannot be recreated by this change.
 5. **Backup consistency:** coordinate metadata and segment generations with
    compaction and replica placement. Current live-tar ordering is not a
    demonstrated concurrent snapshot protocol. Keep offline, verified copies.
-6. **Admission control:** aggregate byte budgets, stream/block count bounds,
-   timeouts, bounded replication queues and cancellation.
+6. **Admission control:** gRPC upload counts and idle waits are bounded;
+   still add aggregate byte budgets shared with HTTP and reads, absolute
+   request deadlines, bounded replication queues and cancellation coverage.
 7. **Deployment and CI:** resolve the failed master run, validate feature
    combinations and restart behavior on Linux/macOS, wire backend selection
    into the daemon, and pin a supported inference-engine configuration.

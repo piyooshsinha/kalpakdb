@@ -121,6 +121,47 @@ async fn grpc_streams_blocks_through_group_commit() {
         }]))
         .await;
     assert_eq!(torn.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+    // Empty chunks still carry framing: an unfinished empty block is torn.
+    let empty_torn = client
+        .put_blocks(tokio_stream::iter([PutBlockChunk {
+            data: Default::default(),
+            last_chunk: false,
+        }]))
+        .await;
+    assert_eq!(empty_torn.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+    // Zero-byte blocks cannot bypass payload-byte limits to accumulate an
+    // unbounded batch or an unbounded response ID vector.
+    let empty_blocks = || {
+        tokio_stream::iter((0..4096).map(|_| PutBlockChunk {
+            data: Default::default(),
+            last_chunk: true,
+        }))
+    };
+    let at_limit = client
+        .put_blocks(empty_blocks())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(at_limit.ids.len(), 4096);
+    let over_limit = client
+        .put_blocks(tokio_stream::iter((0..4097).map(|_| PutBlockChunk {
+            data: Default::default(),
+            last_chunk: true,
+        })))
+        .await
+        .unwrap_err();
+    assert_eq!(over_limit.code(), tonic::Code::ResourceExhausted);
+
+    let too_many_chunks = client
+        .put_blocks(tokio_stream::iter((0..65_537).map(|_| PutBlockChunk {
+            data: Default::default(),
+            last_chunk: false,
+        })))
+        .await
+        .unwrap_err();
+    assert_eq!(too_many_chunks.code(), tonic::Code::ResourceExhausted);
 }
 
 #[tokio::test(flavor = "multi_thread")]
