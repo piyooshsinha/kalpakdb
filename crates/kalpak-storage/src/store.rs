@@ -34,6 +34,20 @@ pub struct BlockStore<B: IoBackend = StdBackend> {
     append: Mutex<u64>,
     roll_bytes: u64,
     write_failed: std::sync::atomic::AtomicBool,
+    foreground_reads: std::sync::atomic::AtomicUsize,
+}
+
+struct ReadActivity<'a>(&'a std::sync::atomic::AtomicUsize);
+impl Drop for ReadActivity<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+pub(crate) struct SealedScrubView<F> {
+    pub file: Arc<F>,
+    pub generation: String,
+    pub length: u64,
 }
 
 struct AppendAttempt<'a> {
@@ -129,6 +143,7 @@ impl<B: IoBackend> BlockStore<B> {
             dir,
             index: RwLock::new(index),
             write_failed: std::sync::atomic::AtomicBool::new(false),
+            foreground_reads: std::sync::atomic::AtomicUsize::new(0),
             files: RwLock::new(files),
             append: Mutex::new(tail),
             roll_bytes: DEFAULT_SEGMENT_ROLL_BYTES,
@@ -259,6 +274,9 @@ impl<B: IoBackend> BlockStore<B> {
 
     /// Fetch a block, verifying its hash before returning.
     pub fn get(&self, id: &BlockId) -> Result<Vec<u8>, Error> {
+        self.foreground_reads
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let _activity = ReadActivity(&self.foreground_reads);
         // Capture the location and matching file generation under the same
         // index guard. Compaction takes these locks in this order too, so a
         // reader cannot combine an old offset with the replacement file.
@@ -285,8 +303,8 @@ impl<B: IoBackend> BlockStore<B> {
     /// window (put first, bind through consensus after), since anything not
     /// yet bound is still in or near the active segment.
     ///
-    /// Readers are never blocked: each rewrite happens into a tmp file that
-    /// atomically replaces the segment, and in-flight readers keep reading
+    /// Payload reads use pinned handles: each rewrite happens into a tmp file
+    /// that atomically replaces the segment, and in-flight readers keep reading
     /// their own `Arc`'d handle of the old file, which stays valid until
     /// dropped. The index and file table swap together under brief locks.
     pub fn compact(&self, live: impl Fn(&BlockId) -> bool) -> Result<CompactStats, Error> {
@@ -319,6 +337,12 @@ impl<B: IoBackend> BlockStore<B> {
             // through the current handle (no locks held during I/O).
             let old = Arc::clone(&self.files.read().unwrap()[seg as usize]);
             let tmp_path = self.dir.join(format!("seg-{seg:08}.klpk.compact"));
+            // A previous interrupted rewrite may have left a longer file.
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&tmp_path)?;
             let tmp = self.backend.open(&tmp_path)?;
             let mut new_locs: Vec<(BlockId, Location)> = Vec::with_capacity(keep.len());
             let mut offset = 0u64;
@@ -343,13 +367,14 @@ impl<B: IoBackend> BlockStore<B> {
             tmp.sync()?;
             drop_handle(tmp);
             let old_len = old.len()?;
-            std::fs::rename(&tmp_path, segment_path(&self.dir, seg))?;
-
             // Swap the handle and the index entries together.
-            let new_file = Arc::new(self.backend.open(&segment_path(&self.dir, seg))?);
+            let new_file = Arc::new(self.backend.open(&tmp_path)?);
             {
                 let mut index = self.index.write().unwrap();
                 let mut files = self.files.write().unwrap();
+                // Path identity and reader handles publish at the same
+                // boundary, including snapshots taken by the scrubber.
+                std::fs::rename(&tmp_path, segment_path(&self.dir, seg))?;
                 files[seg as usize] = new_file;
                 for (id, _) in &drop {
                     index.remove(id);
@@ -358,6 +383,7 @@ impl<B: IoBackend> BlockStore<B> {
                     index.insert(id, loc);
                 }
             }
+            std::fs::File::open(&self.dir)?.sync_all()?;
 
             stats.segments_rewritten += 1;
             stats.blocks_dropped += drop.len() as u64;
@@ -368,6 +394,42 @@ impl<B: IoBackend> BlockStore<B> {
 
     pub fn contains(&self, id: &BlockId) -> bool {
         self.index.read().unwrap().contains_key(id)
+    }
+
+    pub(crate) fn foreground_io_active(&self) -> bool {
+        self.foreground_reads
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+            || self.append.try_lock().is_err()
+    }
+
+    pub(crate) fn sealed_scrub_view(
+        &self,
+        segment: u32,
+    ) -> std::io::Result<Option<SealedScrubView<B::SegmentFile>>> {
+        let files = self.files.read().unwrap();
+        if segment as usize >= files.len().saturating_sub(1) {
+            return Ok(None);
+        }
+        let metadata = std::fs::metadata(segment_path(&self.dir, segment))?;
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt;
+            format!(
+                "{}:{}:{}:{}",
+                metadata.dev(),
+                metadata.ino(),
+                metadata.ctime(),
+                metadata.ctime_nsec()
+            )
+        };
+        #[cfg(not(unix))]
+        let identity = format!("{:?}", metadata.created()?);
+        Ok(Some(SealedScrubView {
+            file: Arc::clone(&files[segment as usize]),
+            generation: format!("{identity}:{}:{:?}", metadata.len(), metadata.modified()?),
+            length: metadata.len(),
+        }))
     }
 
     /// Full integrity check (fsck): re-read every indexed record and verify

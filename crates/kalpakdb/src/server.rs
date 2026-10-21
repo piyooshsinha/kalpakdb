@@ -21,7 +21,8 @@ use serde_json::json;
 use tower_http::cors::CorsLayer;
 
 pub struct AppState {
-    scrub_slots: Arc<tokio::sync::Semaphore>,
+    pub(crate) scrub_slots: Arc<tokio::sync::Semaphore>,
+    pub(crate) online_scrub: crate::online_scrub::Metrics,
     replica_pushes: std::sync::atomic::AtomicU64,
     pub(crate) repairs: crate::repair::RepairLog,
     pub(crate) uploads: crate::admission::UploadBudget,
@@ -182,10 +183,25 @@ fn require_loopback(addr: &str, transport: &str) -> Result<(), Box<dyn std::erro
 }
 
 pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
+    serve_with_scrub(opts, None).await
+}
+
+pub async fn serve_with_scrub(
+    opts: ServeOpts,
+    scrub_mib_per_sec: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if scrub_mib_per_sec.is_some_and(|rate| !(1..=1024).contains(&rate)) {
+        return Err("--scrub-mib-per-sec must be between 1 and 1024".into());
+    }
     validate_listeners(&opts)?;
     let uploads =
         crate::admission::UploadBudget::new(opts.max_block_bytes.unwrap_or(256 * 1024 * 1024))?;
     let store = TieredStore::open(&opts.data_dir, opts.warm_bytes)?;
+    let scanner = scrub_mib_per_sec
+        .map(|_| {
+            kalpak_storage::online_scrub::OnlineScrubber::open(std::path::Path::new(&opts.data_dir))
+        })
+        .transpose()?;
     let repairs = crate::repair::RepairLog::open(std::path::Path::new(&opts.data_dir))?;
     let control = boot_control(&opts).await?;
     let (http, peer_scheme) = match &opts.mesh {
@@ -201,6 +217,7 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
     };
     let state = Arc::new(AppState {
         scrub_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+        online_scrub: Default::default(),
         replica_pushes: Default::default(),
         repairs,
         uploads,
@@ -218,6 +235,9 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
     });
 
     crate::repair::start(state.clone());
+    if let (Some(scanner), Some(rate)) = (scanner, scrub_mib_per_sec) {
+        crate::online_scrub::start(state.clone(), scanner, rate);
+    }
 
     if opts.compact_secs > 0 {
         let state = state.clone();
@@ -655,10 +675,21 @@ async fn block_presence(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let block: BlockId = id.parse()?;
-    let permit = state.scrub_slots.clone().try_acquire_owned().map_err(|_| {
+    let permit = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        state.scrub_slots.clone().acquire_owned(),
+    )
+    .await
+    .map_err(|_| {
         ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
             "cold verification busy".to_string(),
+        )
+    })?
+    .map_err(|_| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cold verification unavailable".to_string(),
         )
     })?;
     let store = state.store.clone();
@@ -1550,6 +1581,7 @@ fn stats_payload(s: &AppState) -> serde_json::Value {
         "repair": {
             "acknowledged_replication_upload_attempts": s.replica_pushes.load(std::sync::atomic::Ordering::Relaxed),
         },
+        "online_scrub": s.online_scrub.snapshot(),
     })
 }
 

@@ -76,6 +76,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         [cmd, dir, rest @ ..] if cmd == "serve" || cmd == "witness" => {
+            let mut scrub_rate = None;
             let mut opts = server::ServeOpts {
                 data_dir: dir.clone(),
                 addr: "127.0.0.1:7411".to_string(),
@@ -96,6 +97,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut it = rest.iter();
             while let Some(flag) = it.next() {
                 match flag.as_str() {
+                    "--scrub-mib-per-sec" => {
+                        scrub_rate = Some(
+                            it.next()
+                                .ok_or("--scrub-mib-per-sec needs a value")?
+                                .parse()?,
+                        )
+                    }
                     "--addr" => opts.addr = it.next().ok_or("--addr needs a value")?.clone(),
                     "--warm-mb" => {
                         let mb: u64 = it.next().ok_or("--warm-mb needs a value")?.parse()?;
@@ -146,9 +154,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             let rt = tokio::runtime::Runtime::new()?;
             if cmd == "witness" {
+                if scrub_rate.is_some() {
+                    return Err("online scrub is only available on data nodes".into());
+                }
                 rt.block_on(server::serve_witness(opts))
             } else {
-                rt.block_on(server::serve(opts))
+                rt.block_on(server::serve_with_scrub(opts, scrub_rate))
             }
         }
         [cmd, url, rest @ ..] if cmd == "stress" => {

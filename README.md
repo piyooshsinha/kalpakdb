@@ -210,7 +210,33 @@ Changed file identities/sizes/modification times or damaged checkpoints fail
 closed. Start a deliberately new sweep with `--restart` after investigating
 changes; a completed checkpoint does not perform another sweep by default.
 This tool does not scrub Raft metadata or automatically repair structural
-damage. Online bandwidth-controlled scrubbing remains pending.
+damage.
+
+### Opt-in online sealed-segment scrub
+
+```sh
+kalpakdb serve /data/kalpak --scrub-mib-per-sec 8
+```
+
+The default is off. The online worker continuously inspects **sealed segments
+only**, with one header or at most 64 KiB of payload per blocking task. It
+paces page-rounded reads at 1–1024 MiB/s, yields when foreground cold reads
+or append/compaction activity is detected, and shares a verification slot
+with peer probes. This is best-effort scheduling, not a device bandwidth or
+foreground latency guarantee; read-ahead, metadata and durable checkpoint
+writes are outside the read budget. Sustained foreground load can starve it.
+
+Checksummed `online-scrub-progress.json` resumes at record boundaries.
+Compaction changes the segment generation and restarts that segment's scan;
+an old descriptor's results cannot advance the replacement's checkpoint.
+The active append tail is excluded: use offline scrub for a full physical
+sweep. `/v1/stats.online_scrub` reports running status, bytes read, verified
+records, physical findings, generation resets, yields and errors. Counters
+are process-local and count repeated sweeps, not unique blocks. The first
+16 findings per process are logged; operational errors stop the worker and
+increment its error counter. Findings can include obsolete records and are
+diagnostic only: they do not quarantine logical blocks or trigger repair.
+No Raft metadata scrub or automatic structural recovery is provided.
 
 ## Signed writes
 
@@ -330,10 +356,11 @@ missing HTTP batch may still resend its complete batch payload.
 Peer probes use `GET /v1/admin/blocks/{id}/presence`, restricted to the mesh
 listener in mTLS deployments. Probes now read cold payloads and verify their
 content hashes, bypassing warm and pinned caches. One peer verification per
-node runs at a time on the blocking pool; excess probe requests return 503.
-Repair scans remain bounded by the existing batch/admission limits. This is
-not yet a rate-controlled whole-store background scrubber or I/O bandwidth
-budget. It costs disk reads even when it avoids network tensor transfers.
+node runs at a time on the blocking pool; probes wait up to 100 ms for the
+shared verification slot before returning 503. Repair scans remain bounded
+by the existing batch/admission limits; the optional sealed-segment worker
+above does not rate-limit repair probes. Verification costs disk reads even
+when it avoids network tensor transfers.
 Observations are local hints, not a Raft-replicated placement catalog or
 cryptographic storage proofs. A cold verification confirms bytes at that
 instant, not future survival. `/v1/stats` exposes acknowledged replication

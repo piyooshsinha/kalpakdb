@@ -71,9 +71,13 @@ The offline `kalpakdb scrub --offline` diagnostic now streams all physical
 segment candidates with a 64 KiB payload buffer and page-rounded read pacing.
 Checksummed, atomic checkpoints resume completed-record progress after a
 process kill, rejecting changed layouts. It reports header/length damage and
-continues aligned inspection without changing segment bytes. This is not
-online scrubbing, index reconstruction or automatic structural repair, and
-the offline acknowledgement does not enforce a filesystem writer lock.
+continues aligned inspection without changing segment bytes. The opt-in
+`serve --scrub-mib-per-sec N` worker now scans sealed segments in bounded
+steps, checkpoints record progress and resets on compaction generations.
+It yields to detected foreground I/O and shares a slot with peer probes.
+Neither path reconstructs the index or repairs structural damage. The
+offline acknowledgement does not enforce a filesystem writer lock; online
+read pacing excludes metadata/checkpoint I/O and is not a device-level SLO.
 
 1. **Public/internal isolation:** mesh deployments now restrict privileged
    routes to the certificate-authenticated listener. Non-mesh deployments
@@ -91,7 +95,7 @@ the offline acknowledgement does not enforce a filesystem writer lock.
    Raft and leader-owned repair. Local incarnation-aware placement hints now
    drive targeted uploads after fresh presence checks. Still add replicated
    verified placement authority, capacity reclamation, rate/bandwidth-limited
-   online whole-store scrubbing and structural/header-corruption recovery,
+   active-tail/full-store scrubbing and structural/header-corruption recovery,
    partition/cancellation and negative acknowledgement tests,
    power-loss validation and SDK convenience options. Process-crash and
    isolated-restart checks now cover both copies. This is not maintained
