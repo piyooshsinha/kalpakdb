@@ -208,17 +208,15 @@ impl<B: IoBackend> BlockStore<B> {
 
     /// Fetch a block, verifying its hash before returning.
     pub fn get(&self, id: &BlockId) -> Result<Vec<u8>, Error> {
-        let loc = *self
-            .index
-            .read()
-            .unwrap()
-            .get(id)
-            .ok_or(Error::BlockNotFound(*id))?;
-
-        // Clone the segment handle under a brief lock, then read with no
-        // lock held: indexed records are immutable, and an in-flight fsync
-        // on the active segment cannot block this path.
-        let file = Arc::clone(&self.files.read().unwrap()[loc.segment as usize]);
+        // Capture the location and matching file generation under the same
+        // index guard. Compaction takes these locks in this order too, so a
+        // reader cannot combine an old offset with the replacement file.
+        let (loc, file) = {
+            let index = self.index.read().unwrap();
+            let loc = *index.get(id).ok_or(Error::BlockNotFound(*id))?;
+            let file = Arc::clone(&self.files.read().unwrap()[loc.segment as usize]);
+            (loc, file)
+        };
         let mut payload = vec![0u8; loc.payload_len as usize];
         file.read_at(&mut payload, loc.offset + HEADER_LEN as u64)?;
 
@@ -299,11 +297,9 @@ impl<B: IoBackend> BlockStore<B> {
             // Swap the handle and the index entries together.
             let new_file = Arc::new(self.backend.open(&segment_path(&self.dir, seg))?);
             {
+                let mut index = self.index.write().unwrap();
                 let mut files = self.files.write().unwrap();
                 files[seg as usize] = new_file;
-            }
-            {
-                let mut index = self.index.write().unwrap();
                 for (id, _) in &drop {
                     index.remove(id);
                 }
@@ -601,6 +597,54 @@ mod tests {
         let stats = store.compact(|_| false).unwrap();
         assert_eq!(stats.segments_rewritten, 0);
         assert_eq!(store.get(&id).unwrap(), b"unbound but recent");
+    }
+
+    #[test]
+    fn readers_use_the_matching_file_generation_during_compaction() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(BlockStore::open_with_roll(dir.path(), 16 * 1024).unwrap());
+        let ids: Vec<_> = (0..96u32)
+            .map(|i| store.put(&i.to_le_bytes().repeat(750)).unwrap())
+            .collect();
+        let keep: Vec<_> = ids
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 0)
+            .map(|(i, id)| (*id, (i as u32).to_le_bytes().repeat(750)))
+            .collect();
+        let stop = Arc::new(AtomicBool::new(false));
+        let barrier = Arc::new(std::sync::Barrier::new(5));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let store = store.clone();
+                let keep = keep.clone();
+                let stop = stop.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let mut rounds = 0;
+                    while rounds == 0 || !stop.load(Ordering::Acquire) {
+                        for (id, expected) in &keep {
+                            assert_eq!(store.get(id).unwrap(), *expected);
+                        }
+                        rounds += 1;
+                    }
+                })
+            })
+            .collect();
+        barrier.wait();
+        let result = store.compact(|id| keep.iter().any(|(live, _)| live == id));
+        stop.store(true, Ordering::Release);
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        assert!(result.unwrap().blocks_dropped > 0);
+        drop(store);
+        let reopened = BlockStore::open(dir.path()).unwrap();
+        for (id, expected) in keep {
+            assert_eq!(reopened.get(&id).unwrap(), expected);
+        }
     }
 
     #[test]
