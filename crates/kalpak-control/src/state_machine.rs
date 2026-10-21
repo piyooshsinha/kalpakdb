@@ -27,6 +27,7 @@ pub struct AgentRecord {
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct MetadataState {
+    pub replica_requirements: std::collections::BTreeMap<BlockId, usize>,
     pub agents: HashMap<AgentId, AgentRecord>,
     /// CacheKey -> ordered blocks; HashMap with serde needs string keys, so
     /// bindings are stored under the serialized key.
@@ -43,6 +44,19 @@ pub struct MetadataState {
     pub last_applied: Option<LogId>,
     pub membership: StoredMembership<NodeId, openraft::BasicNode>,
 }
+
+// Exact pre-replica-state bincode layout. serde defaults cannot make an
+// appended bincode struct field backward compatible.
+#[derive(Serialize, Deserialize)]
+struct LegacyMetadataState {
+    agents: HashMap<AgentId, AgentRecord>,
+    bindings: HashMap<String, BindingRecord>,
+    children: HashMap<String, Vec<String>>,
+    block_refs: HashMap<BlockId, u32>,
+    last_applied: Option<LogId>,
+    membership: StoredMembership<NodeId, openraft::BasicNode>,
+}
+const SNAPSHOT_V2: &[u8] = b"KLPKSM02";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BindingRecord {
@@ -101,13 +115,43 @@ impl StateMachineStore {
         data: &[u8],
     ) -> std::io::Result<MetadataState> {
         let (state, consumed): (MetadataState, usize) =
-            bincode::serde::decode_from_slice(data, bincode::config::standard())
-                .map_err(std::io::Error::other)?;
+            if let Some(payload) = data.strip_prefix(SNAPSHOT_V2) {
+                let (state, consumed) =
+                    bincode::serde::decode_from_slice(payload, bincode::config::standard())
+                        .map_err(std::io::Error::other)?;
+                (state, consumed + SNAPSHOT_V2.len())
+            } else {
+                let (legacy, consumed): (LegacyMetadataState, usize) =
+                    bincode::serde::decode_from_slice(data, bincode::config::standard())
+                        .map_err(std::io::Error::other)?;
+                (
+                    MetadataState {
+                        agents: legacy.agents,
+                        bindings: legacy.bindings,
+                        children: legacy.children,
+                        block_refs: legacy.block_refs,
+                        last_applied: legacy.last_applied,
+                        membership: legacy.membership,
+                        replica_requirements: Default::default(),
+                    },
+                    consumed,
+                )
+            };
         if consumed != data.len()
             || state.last_applied != meta.last_log_id
             || state.membership != meta.last_membership
         {
             return Err(std::io::Error::other("snapshot metadata/payload mismatch"));
+        }
+        if state.replica_requirements.len() > 16_384
+            || state
+                .replica_requirements
+                .values()
+                .any(|n| !(2..=16).contains(n))
+        {
+            return Err(std::io::Error::other(
+                "invalid snapshot replica requirements",
+            ));
         }
         Ok(state)
     }
@@ -131,6 +175,23 @@ impl StateMachineStore {
 
     fn apply_one(state: &mut MetadataState, req: &Request) -> Response {
         match req {
+            Request::RequireReplicas { blocks, replicas } => {
+                if !(2..=16).contains(replicas) || blocks.len() > 4096 {
+                    return Response::Rejected("invalid replica requirements".to_string());
+                }
+                let mut next = state.replica_requirements.clone();
+                for id in blocks {
+                    let n = next.entry(*id).or_insert(*replicas);
+                    *n = (*n).max(*replicas);
+                }
+                if next.len() > 16_384 {
+                    return Response::Rejected(
+                        "replica requirement capacity exhausted".to_string(),
+                    );
+                }
+                state.replica_requirements = next;
+                Response::ReplicasRequired
+            }
             Request::RegisterAgent {
                 agent,
                 display_name,
@@ -215,8 +276,10 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
             // bincode, not JSON: snapshotting holds the state read lock, so
             // serialization speed bounds how long writes can stall once the
             // binding map grows large.
-            let data = bincode::serde::encode_to_vec(&*state, bincode::config::standard())
+            let encoded = bincode::serde::encode_to_vec(&*state, bincode::config::standard())
                 .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let mut data = SNAPSHOT_V2.to_vec();
+            data.extend_from_slice(&encoded);
             (data, state.last_applied, state.membership.clone())
         };
 
@@ -324,6 +387,67 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_snapshot_layout_remains_readable() {
+        let legacy = LegacyMetadataState {
+            agents: Default::default(),
+            bindings: Default::default(),
+            children: Default::default(),
+            block_refs: Default::default(),
+            last_applied: None,
+            membership: Default::default(),
+        };
+        let bytes = bincode::serde::encode_to_vec(&legacy, bincode::config::standard()).unwrap();
+        let meta = SnapshotMeta {
+            last_log_id: None,
+            last_membership: Default::default(),
+            snapshot_id: "legacy".to_string(),
+        };
+        let recovered = StateMachineStore::decode_snapshot(&meta, &bytes).unwrap();
+        assert!(recovered.replica_requirements.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replica_requirements_survive_snapshot_and_reject_downgrades() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = StateMachineStore::open(dir.path().to_owned()).unwrap();
+        let id = BlockId::of(b"replicated-intent");
+        {
+            let mut state = store.state.write().unwrap();
+            assert!(matches!(
+                StateMachineStore::apply_one(
+                    &mut state,
+                    &Request::RequireReplicas {
+                        blocks: vec![id],
+                        replicas: 3
+                    }
+                ),
+                Response::ReplicasRequired
+            ));
+            StateMachineStore::apply_one(
+                &mut state,
+                &Request::RequireReplicas {
+                    blocks: vec![id],
+                    replicas: 2,
+                },
+            );
+            assert!(matches!(
+                StateMachineStore::apply_one(
+                    &mut state,
+                    &Request::RequireReplicas {
+                        blocks: vec![id],
+                        replicas: 17
+                    }
+                ),
+                Response::Rejected(_)
+            ));
+        }
+        store.build_snapshot().await.unwrap();
+        drop(store);
+        let recovered = StateMachineStore::open(dir.path().to_owned()).unwrap();
+        assert_eq!(recovered.state.read().unwrap().replica_requirements[&id], 3);
+    }
 
     #[tokio::test]
     async fn installed_snapshot_is_durable_and_rejects_mismatched_metadata() {

@@ -30,7 +30,7 @@ impl Node {
             "1",
         ]);
         if self.id == 1 {
-            command.args(["--grpc-addr", "127.0.0.1:17783"]);
+            command.args(["--grpc-addr", &format!("127.0.0.1:{}", self.port + 2)]);
         }
         self.child = Some(
             command
@@ -305,4 +305,101 @@ async fn acknowledged_http_batch_and_grpc_copies_survive_sigkill_and_isolated_re
         );
         assert!(response.text().await.unwrap().contains("retention"));
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn new_leader_repairs_after_permanent_origin_loss() {
+    let temp = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let mut origin = Node {
+        child: None,
+        dir: temp.path().join("origin"),
+        id: 1,
+        port: 17881,
+    };
+    let mut retained = Node {
+        child: None,
+        dir: temp.path().join("retained"),
+        id: 2,
+        port: 17882,
+    };
+    let mut replacement = Node {
+        child: None,
+        dir: temp.path().join("replacement"),
+        id: 3,
+        port: 17884,
+    };
+    for node in [&mut origin, &mut retained, &mut replacement] {
+        node.start();
+        node.wait(&client).await;
+    }
+    for (path, body) in [
+        (
+            "/v1/cluster/init",
+            json!({"members": {"1": "127.0.0.1:17881"}}),
+        ),
+        (
+            "/v1/cluster/add-learner",
+            json!({"node_id": 2, "addr": "127.0.0.1:17882"}),
+        ),
+        (
+            "/v1/cluster/add-learner",
+            json!({"node_id": 3, "addr": "127.0.0.1:17884"}),
+        ),
+        ("/v1/cluster/promote", json!({"voters": [1, 2, 3]})),
+    ] {
+        let response = client
+            .post(origin.url(path))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "{}",
+            response.text().await.unwrap()
+        );
+    }
+    let payload = b"repair-responsibility-outlives-origin";
+    let id = BlockId::of(payload);
+    // Keep the replacement offline during upload so no background scan can
+    // pre-populate it before the failure this test is meant to exercise.
+    replacement.kill();
+    let response = client
+        .post(origin.url("/v1/blocks"))
+        .header("x-kalpak-replicas", "2")
+        .body(payload.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    assert!(kalpak_storage::BlockStore::open(&replacement.dir)
+        .unwrap()
+        .get(&id)
+        .is_err());
+    origin.kill(); // deliberately never restart its process or read its ledger
+    replacement.start();
+    replacement.wait(&client).await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let response = client
+            .get(replacement.url(&format!("/v1/blocks/{id}")))
+            .header("x-kalpak-internal", "1")
+            .send()
+            .await
+            .unwrap();
+        if response.status().is_success() {
+            assert_eq!(response.bytes().await.unwrap().as_ref(), payload);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "new leader did not restore replica count"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    local_copies(&client, &retained, &[payload.to_vec()]).await;
 }

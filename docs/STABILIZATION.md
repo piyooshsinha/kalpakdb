@@ -42,8 +42,16 @@ that the only remaining work needs external hardware.
   intent lock while requirements/pins exist; include published repair
   metadata in online backups. Targets cannot be downgraded by retries.
 
+Replica requirements now commit through Raft before replicated success.
+The leader resumes repair from those requirements, fetching a source from
+retained peers when necessary; uncommitted source-local intents migrate
+through the leader. Permanent-origin-loss and leader-change tests cover this
+responsibility transfer. Verified copy-location records are still pending.
+
 The snapshot envelope is versioned (`raft-snapshot.json`, version 1) and
-contains the existing bincode state-machine payload plus Raft metadata.
+contains a `KLPKSM02`-prefixed bincode payload plus Raft metadata. Legacy
+unprefixed snapshots remain readable. Mixed-version rolling upgrades and
+downgrades are unsupported; upgrade the full experimental cluster together.
 Temporary `.pending` files are never recovery sources. Older directories
 without snapshots are supported only when their logs have not been purged.
 Lost snapshots from older versions cannot be recreated by this change.
@@ -62,7 +70,8 @@ Lost snapshots from older versions cannot be recreated by this change.
    with `--compact-secs 0` and avoid manual compaction on live deployments.
 3. **Data durability contract:** opt-in acknowledged replica counts now
    cover HTTP and gRPC. A source-local persistent retry ledger now resumes
-   after crashes. Still add replicated responsibility and verified location
+   after crashes; committed responsibility now survives origin loss through
+   Raft and leader-owned repair. Still add verified location
    tracking, capacity reclamation, indexed-corruption scrubbing/replacement,
    partition/cancellation and negative acknowledgement tests,
    power-loss validation and SDK convenience options. Process-crash and

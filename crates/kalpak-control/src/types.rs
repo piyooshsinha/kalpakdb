@@ -14,6 +14,11 @@ pub type NodeId = u64;
 /// A metadata mutation submitted to the replicated state machine.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Request {
+    /// Monotonic desired copy counts; raw payloads never enter consensus.
+    RequireReplicas {
+        blocks: Vec<BlockId>,
+        replicas: usize,
+    },
     /// Register (or re-register) an agent identity.
     RegisterAgent {
         agent: AgentId,
@@ -49,6 +54,8 @@ pub struct ChainBinding {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Response {
+    ReplicasRequired,
+    Rejected(String),
     Registered,
     Bound,
 }

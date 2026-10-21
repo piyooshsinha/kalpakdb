@@ -385,6 +385,7 @@ fn raft_router(control: Arc<ControlPlane>) -> Router {
         .route("/v1/cluster/init", post(cluster_init))
         .route("/v1/cluster/add-learner", post(cluster_add_learner))
         .route("/v1/cluster/promote", post(cluster_promote))
+        .route("/v1/cluster/replica-requirements", post(require_replicas))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .with_state(control)
@@ -656,6 +657,12 @@ pub(crate) async fn acknowledge_replicas(
     if required == 1 {
         return Ok(());
     }
+    let ids: Vec<BlockId> = if let Some(id) = expected.get("id").and_then(|v| v.as_str()) {
+        vec![id.parse().map_err(|_| "invalid replica block id")?]
+    } else {
+        serde_json::from_value(expected["ids"].clone()).map_err(|_| "invalid replica block ids")?
+    };
+    commit_requirements(state, ids, required).await?;
     let peers = state.control.peer_nodes();
     if peers.len() + 1 < required {
         return Err(format!(
@@ -706,6 +713,61 @@ pub(crate) async fn acknowledge_replicas(
         .map_err(|_| {
             "replica acknowledgement deadline exceeded; partial writes may exist".to_string()
         })?
+}
+
+pub(crate) async fn commit_requirements(
+    state: &AppState,
+    blocks: Vec<BlockId>,
+    replicas: usize,
+) -> Result<(), String> {
+    let operation = async {
+        match state
+            .control
+            .require_replicas(blocks.clone(), replicas)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(kalpak_control::ControlError::NotLeader {
+                leader_addr: Some(addr),
+            }) => {
+                let response = state
+                    .http
+                    .post(format!(
+                        "{}://{addr}/v1/cluster/replica-requirements",
+                        state.peer_scheme
+                    ))
+                    .json(&json!({"blocks": blocks, "replicas": replicas}))
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if response.status().is_success() {
+                    Ok(())
+                } else {
+                    Err("leader rejected replica requirements".to_string())
+                }
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), operation)
+        .await
+        .map_err(|_| "replica requirement consensus deadline exceeded".to_string())?
+}
+
+#[derive(Deserialize)]
+struct ReplicaRequirementsReq {
+    blocks: Vec<BlockId>,
+    replicas: usize,
+}
+
+async fn require_replicas(
+    State(control): State<Arc<ControlPlane>>,
+    Json(request): Json<ReplicaRequirementsReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    control
+        .require_replicas(request.blocks, request.replicas)
+        .await?;
+    Ok(Json(json!({"committed": true})))
 }
 
 async fn put_block(

@@ -245,8 +245,8 @@ curl --fail-with-body -X POST http://127.0.0.1:7411/v1/blocks \
     -H 'x-kalpak-replicas: 2' --data-binary @tensor.bin
 ```
 
-Write-time acknowledgements are complemented by a **source-local repair
-ledger**, not a cluster-wide replica-location catalog.
+Write-time acknowledgements require a **Raft-committed replica requirement**
+as well as durable peer copies. This is not yet a replica-location catalog.
 Partial writes may remain after errors or cancellation; retry identical
 content. Mixed-version peers lacking node-ID and retention acknowledgements
 do not count.
@@ -258,7 +258,9 @@ gRPC writes remain local-only unless a replica count is requested.
 
 For opt-in replicated uploads, requirements are persisted before local
 storage/acknowledgement in `replica-requirements.json` using file sync,
-atomic rename and directory sync. A serial worker resumes after restart,
+atomic rename and directory sync. Before returning replicated success, the
+desired copy count must also commit through Raft (five-second metadata
+deadline); no tensor bytes enter the log. A serial leader worker resumes after restart,
 visiting up to 16 records per five-second scan and re-uploading content to
 revalidate copies through the current membership. It shares upload admission
 and acknowledgement deadlines. The ledger holds at most 16,384 distinct
@@ -272,13 +274,22 @@ there is deliberately no release API yet. This avoids deleting repair
 sources but can prevent space reclamation. Online backups include published
 repair metadata, though concurrent backup consistency remains unproven.
 
-Repair metadata is **not replicated through Raft**. Permanent loss of the
-origin's ledger loses its repair responsibility; a retained peer copy alone
-does not inherit the target count. The worker currently re-uploads healthy
+Committed requirements survive origin loss and leader changes. The leader
+can fetch a missing local source from retained peers, verify its content
+hash and persist it before repairing other copies. Uncommitted local
+intents from failed/older uploads are promoted when a leader is reachable;
+only these uncommitted intents still depend on the source ledger surviving.
+Each ledger and the replicated requirement map are capped at 16,384 blocks.
+The worker currently re-uploads healthy
 copies rather than maintaining verified location records, which costs
 bandwidth. This repairs missing copies, not disk bit rot: a corrupt block
 already indexed on a peer needs a separate scrub/quarantine/replace path.
 This is not yet an always-maintained replica-count guarantee.
+
+Snapshot payloads now carry a `KLPKSM02` version prefix. The new binary reads
+legacy snapshots, but old binaries cannot read new commands/snapshots:
+upgrade the entire experimental cluster together, with verified backups;
+mixed-version rolling upgrades and downgrades are unsupported.
 
 The `replica_crash` integration test exercises acknowledged HTTP single,
 HTTP batch and gRPC writes with two real node processes. It kills the

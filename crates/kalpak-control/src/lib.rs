@@ -176,6 +176,49 @@ impl ControlPlane {
         .map(|_| ())
     }
 
+    pub async fn require_replicas(
+        &self,
+        blocks: Vec<BlockId>,
+        replicas: usize,
+    ) -> Result<(), ControlError> {
+        if !(2..=16).contains(&replicas) || blocks.len() > 4096 {
+            return Err(ControlError::Write(
+                "invalid replica requirements".to_string(),
+            ));
+        }
+        if self.metrics().current_leader == Some(self.metrics().id)
+            && blocks.iter().all(|id| {
+                self.sm
+                    .state
+                    .read()
+                    .unwrap()
+                    .replica_requirements
+                    .get(id)
+                    .is_some_and(|n| *n >= replicas)
+            })
+        {
+            self.raft
+                .ensure_linearizable()
+                .await
+                .map_err(|e| ControlError::Write(e.to_string()))?;
+            return Ok(());
+        }
+        match self
+            .write(Request::RequireReplicas { blocks, replicas })
+            .await?
+        {
+            Response::ReplicasRequired => Ok(()),
+            Response::Rejected(message) => Err(ControlError::Write(message)),
+            _ => Err(ControlError::Write(
+                "unexpected replica response".to_string(),
+            )),
+        }
+    }
+
+    pub fn replica_requirements(&self) -> BTreeMap<BlockId, usize> {
+        self.sm.state.read().unwrap().replica_requirements.clone()
+    }
+
     pub async fn bind_prefix(
         &self,
         agent: AgentId,
