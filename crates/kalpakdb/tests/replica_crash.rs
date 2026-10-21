@@ -230,4 +230,79 @@ async fn acknowledged_http_batch_and_grpc_copies_survive_sigkill_and_isolated_re
         }
         node.kill();
     }
+
+    // A failed two-copy upload leaves durable repair intent. Kill its
+    // origin, bring the empty peer back first, then restart the origin.
+    // No client resubmission may be needed to create the missing copy.
+    let repair_payload = b"repair-me-after-origin-restart";
+    let repair_id = BlockId::of(repair_payload);
+    first.start();
+    first.wait(&client).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let response = client
+            .post(first.url("/v1/blocks"))
+            .header("x-kalpak-replicas", "2")
+            .body(repair_payload.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 503);
+        let local = client
+            .get(first.url(&format!("/v1/blocks/{repair_id}")))
+            .header("x-kalpak-internal", "1")
+            .send()
+            .await
+            .unwrap();
+        if local.status().is_success() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "failed upload did not persist locally"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    first.kill();
+    second.start();
+    second.wait(&client).await;
+    let absent = client
+        .get(second.url(&format!("/v1/blocks/{repair_id}")))
+        .header("x-kalpak-internal", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(absent.status(), 404);
+    first.start();
+    first.wait(&client).await;
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        let response = client
+            .get(second.url(&format!("/v1/blocks/{repair_id}")))
+            .header("x-kalpak-internal", "1")
+            .send()
+            .await
+            .unwrap();
+        if response.status().is_success() {
+            assert_eq!(response.bytes().await.unwrap().as_ref(), repair_payload);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "persistent repair did not restore peer copy"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    for node in [&first, &second] {
+        let response = client
+            .post(node.url("/v1/admin/compact"))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            !response.status().is_success(),
+            "retained replica allowed destructive GC"
+        );
+        assert!(response.text().await.unwrap().contains("retention"));
+    }
 }

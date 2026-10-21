@@ -71,6 +71,17 @@ async fn online_backup_restores_into_a_working_node() {
     .await
     .unwrap();
 
+    // Pin an existing copy as a peer would before acknowledging it. Repair
+    // intent must not silently disappear in a backup/restore cycle.
+    let response = reqwest::Client::new()
+        .post("http://127.0.0.1:17611/v1/blocks")
+        .header("x-kalpak-retain-replica", "1")
+        .body("kv-backup-0")
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+
     // Online backup from the live node.
     let tar_bytes = reqwest::get("http://127.0.0.1:17611/v1/admin/backup")
         .await
@@ -88,6 +99,14 @@ async fn online_backup_restores_into_a_working_node() {
     tar::Archive::new(tar_bytes.as_ref())
         .unpack(&restored)
         .unwrap();
+    let requirements: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(restored.join("replica-requirements.json")).unwrap())
+            .unwrap();
+    assert_eq!(requirements["version"], 1);
+    assert_eq!(
+        requirements["blocks"][kalpak_core::BlockId::of(b"kv-backup-0").to_string()],
+        1
+    );
 
     // The restored store passes fsck...
     let store = kalpak_storage::BlockStore::open(&restored).unwrap();

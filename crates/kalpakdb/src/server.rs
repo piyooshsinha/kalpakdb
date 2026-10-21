@@ -21,6 +21,7 @@ use serde_json::json;
 use tower_http::cors::CorsLayer;
 
 pub struct AppState {
+    pub(crate) repairs: crate::repair::RepairLog,
     pub(crate) uploads: crate::admission::UploadBudget,
     pub store: TieredStore,
     pub data_dir: String,
@@ -183,6 +184,7 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
     let uploads =
         crate::admission::UploadBudget::new(opts.max_block_bytes.unwrap_or(256 * 1024 * 1024))?;
     let store = TieredStore::open(&opts.data_dir, opts.warm_bytes)?;
+    let repairs = crate::repair::RepairLog::open(std::path::Path::new(&opts.data_dir))?;
     let control = boot_control(&opts).await?;
     let (http, peer_scheme) = match &opts.mesh {
         Some(m) => {
@@ -196,6 +198,7 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
         None => (reqwest::Client::new(), "http"),
     };
     let state = Arc::new(AppState {
+        repairs,
         uploads,
         store,
         data_dir: opts.data_dir.clone(),
@@ -210,6 +213,8 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
         gc_bytes_reclaimed: Default::default(),
     });
 
+    crate::repair::start(state.clone());
+
     if opts.compact_secs > 0 {
         let state = state.clone();
         let every = std::time::Duration::from_secs(opts.compact_secs);
@@ -221,7 +226,9 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
                 let live = state.control.bound_blocks();
                 let store_state = state.clone();
                 let swept = tokio::task::spawn_blocking(move || {
-                    store_state.store.compact(|id| live.contains(id))
+                    store_state
+                        .repairs
+                        .compact(|| store_state.store.compact(|id| live.contains(id)))
                 })
                 .await;
                 match swept {
@@ -667,6 +674,7 @@ pub(crate) async fn acknowledge_replicas(
                 .http
                 .post(format!("{}://{addr}{path}", state.peer_scheme))
                 .header(INTERNAL_HEADER, "1")
+                .header("x-kalpak-retain-replica", "1")
                 .body(body.clone())
                 .timeout(std::time::Duration::from_secs(5))
                 .send()
@@ -675,6 +683,7 @@ pub(crate) async fn acknowledge_replicas(
                 if response.status().is_success() {
                     if let Ok(value) = response.json::<serde_json::Value>().await {
                         if value["node_id"].as_u64() == Some(node_id)
+                            && value["retained"].as_bool() == Some(true)
                             && expected
                                 .as_object()
                                 .unwrap()
@@ -707,6 +716,11 @@ async fn put_block(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let replicas = parse_replicas(headers.get("x-kalpak-replicas").map(|v| v.to_str()))
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
+    if replicas > 1 || headers.contains_key("x-kalpak-retain-replica") {
+        s.repairs
+            .record(&[BlockId::of(&body)], replicas)
+            .map_err(kalpak_core::Error::from)?;
+    }
     let id = s.store.put(&body)?;
     if replicas > 1 {
         acknowledge_replicas(
@@ -740,7 +754,8 @@ async fn put_block(
         });
     }
     Ok(Json(
-        json!({ "id": id.to_string(), "bytes": body.len(), "node_id": s.control.metrics().id }),
+        json!({ "id": id.to_string(), "bytes": body.len(), "node_id": s.control.metrics().id,
+            "retained": replicas > 1 || headers.contains_key("x-kalpak-retain-replica") }),
     ))
 }
 
@@ -786,6 +801,15 @@ async fn put_blocks_batch(
     if at != body.len() {
         return Err(bad("trailing bytes after batch"));
     }
+    if replicas > 1 || headers.contains_key("x-kalpak-retain-replica") {
+        let ids: Vec<_> = payloads
+            .iter()
+            .map(|payload| BlockId::of(payload))
+            .collect();
+        s.repairs
+            .record(&ids, replicas)
+            .map_err(kalpak_core::Error::from)?;
+    }
     let ids = s.store.put_many(payloads.iter().copied())?;
     let ids_json = json!(ids.iter().map(|id| id.to_string()).collect::<Vec<_>>());
     if replicas > 1 {
@@ -818,7 +842,8 @@ async fn put_blocks_batch(
         });
     }
     Ok(Json(json!({
-        "ids": ids_json, "node_id": s.control.metrics().id
+        "ids": ids_json, "node_id": s.control.metrics().id,
+        "retained": replicas > 1 || headers.contains_key("x-kalpak-retain-replica")
     })))
 }
 
@@ -1147,9 +1172,13 @@ async fn raft_snapshot(
 async fn admin_compact(State(s): State<Shared>) -> Result<Json<serde_json::Value>, ApiError> {
     let live = s.control.bound_blocks();
     let state = s.clone();
-    let stats = tokio::task::spawn_blocking(move || state.store.compact(|id| live.contains(id)))
-        .await
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    let stats = tokio::task::spawn_blocking(move || {
+        state
+            .repairs
+            .compact(|| state.store.compact(|id| live.contains(id)))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
     s.record_gc(&stats);
     Ok(Json(json!({
         "segments_rewritten": stats.segments_rewritten,
@@ -1230,6 +1259,12 @@ async fn admin_backup(State(s): State<Shared>) -> Result<Response, ApiError> {
             let (file, path) = tmp.keep().map_err(|e| e.error)?;
             let mut builder = tar::Builder::new(std::io::BufWriter::new(file));
             let root = std::path::Path::new(&data_dir);
+            // Published intent is replaced atomically; never include its
+            // unfinished .pending file. Capture it before segment traversal.
+            let requirements = root.join("replica-requirements.json");
+            if requirements.exists() {
+                builder.append_path_with_name(requirements, "replica-requirements.json")?;
+            }
             // 1. control plane first (see ordering argument above)
             let control = root.join("control");
             if control.is_dir() {

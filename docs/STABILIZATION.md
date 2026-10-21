@@ -36,6 +36,11 @@ that the only remaining work needs external hardware.
 - Exercise acknowledged HTTP single/batch and gRPC copies through real
   process kills, offline integrity checks and isolated cold restarts; read
   fallback is suppressed and isolated two-replica writes must fail.
+- Persist bounded source-local repair requirements before local writes;
+  resume serial retries after restart using shared admission. Peers record
+  retention pins before acknowledging. Reject compaction under the same
+  intent lock while requirements/pins exist; include published repair
+  metadata in online backups. Targets cannot be downgraded by retries.
 
 The snapshot envelope is versioned (`raft-snapshot.json`, version 1) and
 contains the existing bincode state-machine payload plus Raft metadata.
@@ -56,8 +61,10 @@ Lost snapshots from older versions cannot be recreated by this change.
    lag races are not solved by the reader-generation fix. Until then, run
    with `--compact-secs 0` and avoid manual compaction on live deployments.
 3. **Data durability contract:** opt-in acknowledged replica counts now
-   cover HTTP and gRPC. Still add persistent retry/repair and location
-   tracking, partition/cancellation and negative acknowledgement tests,
+   cover HTTP and gRPC. A source-local persistent retry ledger now resumes
+   after crashes. Still add replicated responsibility and verified location
+   tracking, capacity reclamation, indexed-corruption scrubbing/replacement,
+   partition/cancellation and negative acknowledgement tests,
    power-loss validation and SDK convenience options. Process-crash and
    isolated-restart checks now cover both copies. This is not maintained
    replica durability; default writes still promise only local storage.

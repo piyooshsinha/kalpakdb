@@ -4,5 +4,6 @@
 mod admission;
 pub mod grpc;
 pub mod pki;
+mod repair;
 pub mod server;
 pub mod stress;

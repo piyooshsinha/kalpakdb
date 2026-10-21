@@ -245,21 +245,48 @@ curl --fail-with-body -X POST http://127.0.0.1:7411/v1/blocks \
     -H 'x-kalpak-replicas: 2' --data-binary @tensor.bin
 ```
 
-This is **write-time replication**, not a promise of maintained replica
-count: there is no persistent repair queue or replica-location catalog yet.
+Write-time acknowledgements are complemented by a **source-local repair
+ledger**, not a cluster-wide replica-location catalog.
 Partial writes may remain after errors or cancellation; retry identical
-content. Mixed-version peers lacking node-ID acknowledgements do not count.
+content. Mixed-version peers lacking node-ID and retention acknowledgements
+do not count.
 gRPC replicates completed blocks individually over the HTTP peer transport;
 it does not put tensors in Raft. Keep GC disabled. Use mesh mTLS for trusted
 peer identities; local development HTTP cannot protect against malicious
 local processes. Default HTTP replication remains best-effort, and default
-gRPC writes remain local-only.
+gRPC writes remain local-only unless a replica count is requested.
+
+For opt-in replicated uploads, requirements are persisted before local
+storage/acknowledgement in `replica-requirements.json` using file sync,
+atomic rename and directory sync. A serial worker resumes after restart,
+visiting up to 16 records per five-second scan and re-uploading content to
+revalidate copies through the current membership. It shares upload admission
+and acknowledgement deadlines. The ledger holds at most 16,384 distinct
+blocks; retries cannot lower a recorded target. A failed upload can leave
+repair intent and partial data. An intent recorded before a failed local
+write cannot be repaired until that source block is uploaded successfully.
+
+Acknowledged peers persist retention pins before accepting a copy. Manual
+and scheduled compaction are refused while any pins/requirements exist;
+there is deliberately no release API yet. This avoids deleting repair
+sources but can prevent space reclamation. Online backups include published
+repair metadata, though concurrent backup consistency remains unproven.
+
+Repair metadata is **not replicated through Raft**. Permanent loss of the
+origin's ledger loses its repair responsibility; a retained peer copy alone
+does not inherit the target count. The worker currently re-uploads healthy
+copies rather than maintaining verified location records, which costs
+bandwidth. This repairs missing copies, not disk bit rot: a corrupt block
+already indexed on a peer needs a separate scrub/quarantine/replace path.
+This is not yet an always-maintained replica-count guarantee.
 
 The `replica_crash` integration test exercises acknowledged HTTP single,
 HTTP batch and gRPC writes with two real node processes. It kills the
 receiver, verifies the peer without read fallback, kills both processes,
 checks both stores offline, then restarts each node alone and checks every
-payload again. Isolated nodes must reject new two-replica writes. This is
+payload again. It also checks that failed replication resumes after an
+origin crash and restores the returning peer without client resubmission.
+Isolated nodes must reject new two-replica writes. This is
 process-crash evidence, not a power-loss simulation or a maintained-replica
 guarantee.
 

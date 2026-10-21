@@ -81,6 +81,13 @@ impl BlockService for BlockGrpc {
                 // Cancellation cannot release admission while an already
                 // submitted blocking disk operation is still running.
                 let _permit = disk_permit;
+                if replicas > 1 {
+                    let ids: Vec<_> = blocks.iter().map(|block| BlockId::of(block)).collect();
+                    disk_state
+                        .repairs
+                        .record(&ids, replicas)
+                        .map_err(kalpak_core::Error::from)?;
+                }
                 disk_state
                     .store
                     .put_many(blocks.iter().map(|b| b.as_slice()))
