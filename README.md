@@ -173,6 +173,45 @@ kalpakdb restore backup.tar /data/restored           # unpack + fsck; then serve
 kalpakdb key <model> <tok> <layout> 1,2,3 4,5        # chained CacheKeys offline
 ```
 
+## Offline physical scrub
+
+Stop **all** processes using the data directory, then run:
+
+```sh
+kalpakdb scrub /data/kalpak --offline --mib-per-sec 8
+```
+
+This reads canonical segment files directly, including records not reachable
+through the current index. Payload hashing uses a 64 KiB buffer. Read pacing
+charges page-rounded coverage, including header probes; the configurable
+range is 1–1024 MiB/s. Filesystem read-ahead, metadata I/O and checkpoint
+writes are outside that application-level budget. Segment enumeration is
+bounded to 65,536 files. This is an offline tool, not an online background
+worker: `--offline` acknowledges that writers are stopped; it is **not** an
+exclusive filesystem lock.
+
+Findings and a final summary are JSON lines. Invalid magic/version, reserved
+header bytes, overflowing/truncated lengths, short headers and payload hash
+mismatches produce findings. After damage, the scanner examines subsequent
+4 KiB-aligned candidate boundaries rather than trusting the damaged length.
+These candidates are diagnostic, not a safe reconstruction of the index;
+embedded record-like payload bytes and obsolete damaged records can appear
+in physical findings. A nonzero exit means findings or an operational error.
+No segment bytes are changed. Preserve damaged files and investigate before
+starting writers; structural recovery is **not** implemented by this command.
+
+Checksummed `scrub-progress.json` is atomically published and synced at
+completed-record boundaries. Re-running resumes an interrupted sweep;
+unfinished records are rehashed, so a restart can repeat one large record.
+Previous findings remain in the cumulative summary but are not re-emitted.
+An uncheckpointed finding can be emitted again after a crash.
+Findings should therefore be saved separately when an audit trail is needed.
+Changed file identities/sizes/modification times or damaged checkpoints fail
+closed. Start a deliberately new sweep with `--restart` after investigating
+changes; a completed checkpoint does not perform another sweep by default.
+This tool does not scrub Raft metadata or automatically repair structural
+damage. Online bandwidth-controlled scrubbing remains pending.
+
 ## Signed writes
 
 Run a node with `--require-signatures` and every register/bind must carry an Ed25519 signature over a canonical binary message, verified against the agent's public key before the mutation enters Raft. Both SDKs sign transparently:

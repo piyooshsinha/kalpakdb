@@ -67,6 +67,14 @@ Lost snapshots from older versions cannot be recreated by this change.
 
 ## Release-blocking work still pending
 
+The offline `kalpakdb scrub --offline` diagnostic now streams all physical
+segment candidates with a 64 KiB payload buffer and page-rounded read pacing.
+Checksummed, atomic checkpoints resume completed-record progress after a
+process kill, rejecting changed layouts. It reports header/length damage and
+continues aligned inspection without changing segment bytes. This is not
+online scrubbing, index reconstruction or automatic structural repair, and
+the offline acknowledgement does not enforce a filesystem writer lock.
+
 1. **Public/internal isolation:** mesh deployments now restrict privileged
    routes to the certificate-authenticated listener. Non-mesh deployments
    are restricted to loopback but still expose unauthenticated Raft/admin
@@ -83,7 +91,7 @@ Lost snapshots from older versions cannot be recreated by this change.
    Raft and leader-owned repair. Local incarnation-aware placement hints now
    drive targeted uploads after fresh presence checks. Still add replicated
    verified placement authority, capacity reclamation, rate/bandwidth-limited
-   whole-store scrubbing and structural/header-corruption recovery,
+   online whole-store scrubbing and structural/header-corruption recovery,
    partition/cancellation and negative acknowledgement tests,
    power-loss validation and SDK convenience options. Process-crash and
    isolated-restart checks now cover both copies. This is not maintained
