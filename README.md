@@ -142,9 +142,15 @@ curl -X POST -H 'content-type: application/json' \
 ### Docker
 
 ```sh
-docker compose up -d        # two data nodes + a witness (see docker-compose.yml
-                            # for the cluster-formation curl commands)
+docker build -t kalpakdb:local .
+docker run -d --name kalpak kalpakdb:local
+docker exec kalpak curl -fsS http://127.0.0.1:7411/readyz
 ```
+
+The image defaults to container-local loopback. A published Docker port does
+not expose this development listener. Remote/container-to-container HTTP
+requires explicit mesh mTLS configuration; the legacy non-mesh Compose
+example must not be used unchanged with the hardened listener policy.
 
 ### Runnable example
 
