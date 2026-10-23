@@ -389,11 +389,25 @@ The diagnostic includes `local_guard.local_generation` (the last durable upload
 journal sequence for that hash, or null) and `storage_generation` (node storage
 incarnation). A repeated upload advances its local fence before payload I/O;
 duplicates within one batch advance once. Failed uploads may still advance it.
-These values are diagnostic prerequisites, not release certificates: bindings
-do not yet advance a Raft block-reuse fence, and restore/rollback can rewind
-local history. New journal records use `KLPKUL02`; legacy `KLPKUL01` records
+These values are diagnostic prerequisites, not release certificates: local and
+Raft fences are not yet checked by a coordinated release protocol, and
+restore/rollback can rewind local history. New journal records use `KLPKUL02`; legacy `KLPKUL01` records
 remain readable, but older binaries reject V2 records. Back up before upgrading;
 do not downgrade a directory once V2 writes have begun.
+
+`metadata.block_reference_fence` is the last successful Raft command position
+observed for that block's reference-affecting activity (binding, reservation,
+renewal, lease commit, or replica requirement). Binding replacement fences both
+removed and added blocks; successful retries may conservatively advance fences.
+Null means unknown history, including older imported snapshots, never zero or
+permission to delete. The fence map retains at most 65,536 distinct hashes;
+commands requiring new entries fail closed at capacity, without partial binding
+changes. Entries are not reclaimed. Cancellation, logical expiry, and unrelated
+commands do not advance this reuse fence. New control snapshots use `KLPKSM06`
+and read older formats; no mixed-version rollout or downgrade is supported.
+These positions are not cluster identities or release certificates. Cluster-bound
+authorization, linearizable validation, in-flight-write coordination and restore
+rollback protection are still required before guard release.
 
 Each new guard batch adds a metadata fsync before the payload fsync; no
 throughput improvement is claimed. Backups capture a stable journal after

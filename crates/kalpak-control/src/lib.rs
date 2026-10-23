@@ -432,14 +432,19 @@ impl ControlPlane {
         blocks: Vec<BlockId>,
         parent: Option<CacheKey>,
     ) -> Result<(), ControlError> {
-        self.write(Request::BindPrefix {
-            agent,
-            key,
-            blocks,
-            parent: parent.map(Box::new),
-        })
-        .await
-        .map(|_| ())
+        match self
+            .write(Request::BindPrefix {
+                agent,
+                key,
+                blocks,
+                parent: parent.map(Box::new),
+            })
+            .await?
+        {
+            Response::Bound => Ok(()),
+            Response::Rejected(message) => Err(ControlError::Rejected(message)),
+            _ => Err(ControlError::Write("unexpected bind response".into())),
+        }
     }
 
     /// Bind a whole prefix chain in ONE consensus round (one log fsync).
@@ -448,9 +453,11 @@ impl ControlPlane {
         agent: AgentId,
         bindings: Vec<ChainBinding>,
     ) -> Result<(), ControlError> {
-        self.write(Request::BindChain { agent, bindings })
-            .await
-            .map(|_| ())
+        match self.write(Request::BindChain { agent, bindings }).await? {
+            Response::Bound => Ok(()),
+            Response::Rejected(message) => Err(ControlError::Rejected(message)),
+            _ => Err(ControlError::Write("unexpected bind response".into())),
+        }
     }
 
     /// Blocks bound to the children of `key` in the prefix tree: the
@@ -622,6 +629,7 @@ impl ControlPlane {
         serde_json::json!({
             "last_applied": state.last_applied,
             "logical_tick": state.leases.clock,
+            "block_reference_fence": state.block_fences.get(id),
             "binding_references": state.block_refs.get(id).copied().unwrap_or(0),
             "required_replicas": state.replica_requirements.get(id).copied().unwrap_or(0),
             "leases": {"pending": pending, "committed": committed,
