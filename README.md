@@ -372,6 +372,70 @@ segment traversal; the journal-copy lock can delay uploads. Timed
 lease release, safe migration of legacy inventories and a Raft-coordinated
 GC watermark are still required before reclamation can be enabled.
 
+### Replicated upload reservations (opt-in)
+
+The Rust SDK now supports `begin_upload_lease` followed by
+`commit_upload_lease`. Reserve hashes **before** uploading bytes, then commit
+the exact ordered hashes and one binding in a single Raft operation:
+
+```rust,ignore
+let db = KalpakClient::with_signer(base_url, signing_key);
+let agent = db.agent_id().unwrap();
+db.register_agent(agent, "my-agent").await?;
+let block = BlockId::of(&payload);
+let lease = BlockId(unique_random_32_bytes); // application-generated, never reused
+db.begin_upload_lease(lease, vec![block]).await?;
+db.put_block(payload).await?;
+db.commit_upload_lease(lease, key, vec![block], None, 0).await?;
+```
+
+HTTP equivalents are `POST /v1/leases/begin` with
+`{lease, agent, blocks, signature}` and `POST /v1/leases/commit` with
+`{lease, agent, binding: {key, blocks, parent}, expected_revision, signature}`.
+Both endpoints **always** verify Ed25519 signatures, even without
+`--require-signatures` and on forwarded requests. Canonical messages are
+defined by `lease_begin_message` and `lease_commit_message` in `kalpak-core`:
+separate domains, length-prefixed fingerprint strings, ordered hashes,
+complete parent keys and the expected revision. An agent must be registered.
+Fingerprint fields are limited to 1,024 bytes each and parent fingerprints
+must match. These signatures are not cluster-bound; cross-cluster replay and
+the older signing APIs' broader replay limitations remain unresolved.
+
+Reservation IDs are globally single-use within the cluster. An exact begin
+retry acknowledges the existing reservation without reopening it; a changed
+owner or block list conflicts. Commit atomically consumes the reservation
+and updates the binding/refcounts. Exact commit retries acknowledge only:
+they never reapply an older binding. Reusing a consumed ID for a different
+commit, mismatched ownership/hashes or a stale revision returns 409.
+Concurrent first commits at one expected revision cannot both succeed.
+
+Use `lease_revision` from `GET /v1/agents/{agent}/bindings` for updates,
+including its usual read-token protection. Each binding and revision are
+captured under one state lock; the listing is still a local, potentially
+stale read. All binding mutations (including legacy bind and chain-bind)
+advance revisions after the first valid reservation activates the protocol.
+That common Raft command initializes fences at zero on every node, regardless
+of older snapshot positions. Read the revision **after reserving**. Zero
+means an absent key or an imported key not mutated since activation.
+A stale read is rejected at the commit's Raft CAS.
+Legacy writes themselves still do not enforce CAS or namespace ownership;
+this is not a completed multi-tenant authorization protocol.
+
+The current commit endpoint requires blocks locally on both the ingress
+data node and committing data leader; it checks index presence, not fresh
+replica durability. Prefer a data leader with the uploaded bytes; a witness
+leader cannot serve this endpoint. Reservations replicate only metadata and
+do not prove that an upload completed or the requested replica count exists.
+Bytes continue through the existing HTTP/gRPC data plane and local guards.
+
+Limits are 4,096 reservations total, 256 ordered block entries per reservation
+and 65,536 reserved block entries across the cluster. Consumed records remain
+as replay tombstones and still count toward capacity. There is no expiry,
+abort, release, tombstone-pruning or lease-capacity recovery API yet.
+`/v1/stats.replicated_leases` reports local pending/committed counts. Leases
+survive log replay, snapshots and leader changes. No timer releases local
+guards; **all daemon GC remains blocked** pending a safe reclamation protocol.
+
 Committed requirements survive origin loss and leader changes. The leader
 can fetch a missing local source from retained peers, verify its content
 hash and persist it before repairing other copies. Uncommitted local
@@ -412,7 +476,8 @@ invent the missing data. A failed append blocks further writes until restart,
 preventing later writes from being acknowledged beyond an uncertain tail.
 This is not yet an always-maintained replica-count guarantee.
 
-Snapshot payloads now carry a `KLPKSM02` version prefix. The new binary reads
+Snapshot payloads now carry a `KLPKSM03` version prefix, including replicated
+leases and binding revisions. The new binary reads `KLPKSM02` and
 legacy snapshots, but old binaries cannot read new commands/snapshots:
 upgrade the entire experimental cluster together, with verified backups;
 mixed-version rolling upgrades and downgrades are unsupported.

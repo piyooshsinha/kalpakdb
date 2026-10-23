@@ -60,14 +60,28 @@ async fn unbound_uploads_survive_compaction_requests_and_real_restart() {
         batch.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         batch.extend_from_slice(payload);
     }
-    assert!(client
-        .post(format!("{base}/v1/blocks/batch"))
-        .body(batch)
-        .send()
-        .await
-        .unwrap()
-        .status()
-        .is_success());
+    // The preceding public upload can still own admission while its
+    // background fan-out task finishes. Retry only documented backpressure;
+    // surface journal/storage errors with their response body.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let response = client
+            .post(format!("{base}/v1/blocks/batch"))
+            .body(batch.clone())
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        if status.is_success() {
+            break;
+        }
+        let body = response.text().await.unwrap();
+        assert!(
+            status == reqwest::StatusCode::SERVICE_UNAVAILABLE && Instant::now() < deadline,
+            "batch upload failed: {status}: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     drop(node); // SIGKILL; no orderly application shutdown
     let (_node, base) = start(dir.path()).await;
     let stats: serde_json::Value = client

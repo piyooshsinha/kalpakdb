@@ -3,6 +3,7 @@
 
 mod admission;
 pub mod grpc;
+mod leases;
 mod online_scrub;
 pub mod pki;
 mod repair;

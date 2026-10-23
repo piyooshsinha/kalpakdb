@@ -62,8 +62,11 @@ cached-good/cold-bad payloads, partial replacement writes, cold restart and
 repair from a healthy peer. Append errors fail closed until restart.
 
 The snapshot envelope is versioned (`raft-snapshot.json`, version 1) and
-contains a `KLPKSM02`-prefixed bincode payload plus Raft metadata. Legacy
-unprefixed snapshots remain readable. Mixed-version rolling upgrades and
+contains a `KLPKSM03`-prefixed bincode payload plus Raft metadata. Version 2
+(`KLPKSM02`) and legacy unprefixed snapshots remain readable, with empty
+lease state. The first valid reservation activates binding fences at a common
+Raft barrier, avoiding per-node revision drift from different old snapshot
+positions. Mixed-version rolling upgrades and
 downgrades are unsupported; upgrade the full experimental cluster together.
 Temporary `.pending` files are never recovery sources. Older directories
 without snapshots are supported only when their logs have not been purged.
@@ -90,8 +93,11 @@ read pacing excludes metadata/checkpoint I/O and is not a device-level SLO.
    this legacy development behavior with authenticated local access.
    Expand witness, bootstrap and forwarding negative tests.
 2. **GC safety:** durable non-expiring upload guards and a fail-closed daemon
-   compaction gate now prevent the unsafe local sweep. Still implement timed
-   lease release, legacy-inventory migration and a Raft-coordinated watermark,
+   compaction gate now prevent the unsafe local sweep. Opt-in signed Raft
+   reservations now atomically commit a binding with a revision fence and
+   single-use replay tombstone. Legacy writes advance the revision but are
+   not themselves CAS-protected. Still implement safe expiry/abort and local
+   guard release, legacy-inventory migration and a Raft-coordinated watermark,
    then test binds, leader transitions, lagging followers and GC cancellation.
    Keep `--compact-secs 0`; manual compaction returns 409. No reclamation or
    capacity-recovery workflow exists yet. Upload guards add metadata fsync

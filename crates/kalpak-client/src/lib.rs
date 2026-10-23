@@ -109,6 +109,66 @@ impl KalpakClient {
             .map(|k| kalpak_core::signing::sign_hex(k, message))
     }
 
+    /// Reserve hashes in Raft before uploading bytes. Requires a signer and
+    /// a registered agent. IDs must be fresh random 32-byte values, never
+    /// reused. Reservations do not expire or enable reclamation.
+    pub async fn begin_upload_lease(
+        &self,
+        lease: BlockId,
+        blocks: Vec<BlockId>,
+    ) -> Result<(), ClientError> {
+        let agent = self
+            .agent_id()
+            .ok_or_else(|| ClientError::Decode("upload leases require a signing key".into()))?;
+        let signature = self.sign(&kalpak_core::signing::lease_begin_message(
+            &agent, &lease, &blocks,
+        ));
+        let response = self
+            .http
+            .post(format!("{}/v1/leases/begin", self.base))
+            .json(
+                &json!({"lease": lease, "agent": agent, "blocks": blocks, "signature": signature}),
+            )
+            .send()
+            .await?;
+        Self::check(response).await.map(|_| ())
+    }
+
+    /// Atomically consume a reservation and bind its exact ordered hashes.
+    /// Read `lease_revision` from the agent binding listing for subsequent
+    /// updates, after reserving (zero for absent/imported keys). Stale revisions reject.
+    /// An exact consumed-lease retry acknowledges without reapplying a bind.
+    pub async fn commit_upload_lease(
+        &self,
+        lease: BlockId,
+        key: CacheKey,
+        blocks: Vec<BlockId>,
+        parent: Option<CacheKey>,
+        expected_revision: u64,
+    ) -> Result<(), ClientError> {
+        let agent = self
+            .agent_id()
+            .ok_or_else(|| ClientError::Decode("upload leases require a signing key".into()))?;
+        let signature = self.sign(&kalpak_core::signing::lease_commit_message(
+            &agent,
+            &lease,
+            &key,
+            &blocks,
+            parent.as_ref(),
+            expected_revision,
+        ));
+        let response = self
+            .http
+            .post(format!("{}/v1/leases/commit", self.base))
+            .json(
+                &json!({"lease": lease, "agent": agent, "binding": {"key": key, "blocks": blocks,
+                "parent": parent}, "expected_revision": expected_revision, "signature": signature}),
+            )
+            .send()
+            .await?;
+        Self::check(response).await.map(|_| ())
+    }
+
     async fn check(resp: reqwest::Response) -> Result<reqwest::Response, ClientError> {
         let status = resp.status();
         if status.is_success() {

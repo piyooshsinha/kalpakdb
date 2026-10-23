@@ -402,6 +402,8 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/keys", post(make_key))
         .route("/v1/manifest/bind", post(bind_prefix))
         .route("/v1/manifest/bind-chain", post(bind_chain))
+        .route("/v1/leases/begin", post(crate::leases::begin))
+        .route("/v1/leases/commit", post(crate::leases::commit))
         .route("/v1/manifest/lookup", post(lookup_prefix))
         .route("/v1/stats", get(stats))
         .route("/metrics", get(metrics))
@@ -479,7 +481,7 @@ async fn witness_stats(State(c): State<Arc<ControlPlane>>) -> Json<serde_json::V
     }))
 }
 
-struct ApiError(StatusCode, String);
+pub(crate) struct ApiError(pub(crate) StatusCode, pub(crate) String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -502,6 +504,7 @@ impl From<kalpak_control::ControlError> for ApiError {
     fn from(e: kalpak_control::ControlError) -> Self {
         let code = match &e {
             kalpak_control::ControlError::NotLeader { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            kalpak_control::ControlError::Rejected(_) => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         ApiError(code, e.to_string())
@@ -585,7 +588,7 @@ fn verify_signature(
 
 /// If a write failed because this node is a follower, transparently retry it
 /// against the leader and relay the leader's response.
-async fn forward_to_leader(
+pub(crate) async fn forward_to_leader(
     s: &AppState,
     err: kalpak_control::ControlError,
     path: &str,
@@ -1427,9 +1430,9 @@ async fn agent_bindings(
     let parents = s.control.parent_index();
     let bindings: Vec<_> = s
         .control
-        .bindings_of(&agent)
+        .bindings_with_revisions(&agent)
         .into_iter()
-        .map(|(key, blocks)| {
+        .map(|(key, blocks, revision)| {
             let extends = parents.get(&key).map(|p| {
                 serde_json::from_str::<serde_json::Value>(p)
                     .ok()
@@ -1441,6 +1444,7 @@ async fn agent_bindings(
                     .unwrap_or(serde_json::Value::String(key)),
                 "blocks": blocks.iter().map(|b| b.to_string()).collect::<Vec<_>>(),
                 "extends": extends,
+                "lease_revision": revision,
             })
         })
         .collect();
@@ -1511,6 +1515,7 @@ async fn admin_backup(State(s): State<Shared>) -> Result<Response, ApiError> {
 }
 
 fn stats_payload(s: &AppState) -> serde_json::Value {
+    let (lease_total, lease_pending) = s.control.upload_lease_counts();
     let cold = s.store.cold().stats();
     let tier = s.store.tier_stats();
     let raft = s.control.metrics();
@@ -1549,6 +1554,9 @@ fn stats_payload(s: &AppState) -> serde_json::Value {
         },
         "online_scrub": s.online_scrub.snapshot(),
         "upload_retention": s.retention.snapshot(),
+        "replicated_leases": {"total": lease_total, "pending": lease_pending,
+            "committed": lease_total - lease_pending, "capacity": kalpak_control::MAX_LEASES,
+            "automatic_expiry": false, "gc_enabled": false},
     })
 }
 

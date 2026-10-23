@@ -12,6 +12,7 @@
 //! methods. The Raft log and vote are durable when a data directory is given.
 
 mod durability;
+mod leases;
 mod log_store;
 mod network;
 mod state_machine;
@@ -29,6 +30,7 @@ use openraft::raft::{
 };
 use openraft::{BasicNode, Config, Raft};
 
+pub use leases::{LeaseState, UploadLease, MAX_LEASES, MAX_LEASE_BLOCKS};
 pub use state_machine::{AgentRecord, BindingRecord, MetadataState};
 pub use types::{ChainBinding, NodeId, Request, Response, TypeConfig};
 
@@ -43,6 +45,8 @@ pub enum ControlError {
     Init(String),
     #[error("raft write: {0}")]
     Write(String),
+    #[error("metadata request rejected: {0}")]
+    Rejected(String),
     #[error("raft membership: {0}")]
     Membership(String),
     /// This node is a follower; the caller should retry against the leader.
@@ -174,6 +178,87 @@ impl ControlPlane {
         })
         .await
         .map(|_| ())
+    }
+
+    pub async fn begin_upload_lease(
+        &self,
+        lease: BlockId,
+        agent: AgentId,
+        blocks: Vec<BlockId>,
+    ) -> Result<(), ControlError> {
+        match self
+            .write(Request::BeginUploadLease {
+                lease,
+                agent,
+                blocks,
+            })
+            .await?
+        {
+            Response::LeaseReserved => Ok(()),
+            Response::Rejected(message) => Err(ControlError::Rejected(message)),
+            _ => Err(ControlError::Write("unexpected lease response".into())),
+        }
+    }
+
+    pub async fn commit_upload_lease(
+        &self,
+        lease: BlockId,
+        agent: AgentId,
+        binding: ChainBinding,
+        expected_revision: u64,
+    ) -> Result<(), ControlError> {
+        match self
+            .write(Request::CommitUploadLease {
+                lease,
+                agent,
+                binding,
+                expected_revision,
+            })
+            .await?
+        {
+            Response::Bound => Ok(()),
+            Response::Rejected(message) => Err(ControlError::Rejected(message)),
+            _ => Err(ControlError::Write(
+                "unexpected lease commit response".into(),
+            )),
+        }
+    }
+
+    /// Local diagnostic view; callers needing authority must issue a Raft write.
+    pub fn upload_lease(&self, id: &BlockId) -> Option<UploadLease> {
+        self.sm
+            .state
+            .read()
+            .unwrap()
+            .leases
+            .records
+            .get(id)
+            .cloned()
+    }
+
+    pub fn upload_lease_counts(&self) -> (usize, usize) {
+        let state = self.sm.state.read().unwrap();
+        (
+            state.leases.records.len(),
+            state
+                .leases
+                .records
+                .values()
+                .filter(|lease| lease.committed.is_none())
+                .count(),
+        )
+    }
+
+    pub fn binding_revision(&self, key: &CacheKey) -> u64 {
+        self.sm
+            .state
+            .read()
+            .unwrap()
+            .leases
+            .revisions
+            .get(&binding_key(key))
+            .copied()
+            .unwrap_or(0)
     }
 
     pub async fn require_replicas(
@@ -350,6 +435,24 @@ impl ControlPlane {
             .iter()
             .filter(|(_, rec)| rec.agent == *agent)
             .map(|(k, rec)| (k.clone(), rec.blocks.clone()))
+            .collect()
+    }
+
+    /// Capture each binding and its revision under one state lock. A stale
+    /// local view is safe to use as a CAS hint, but not as GC authority.
+    pub fn bindings_with_revisions(&self, agent: &AgentId) -> Vec<(String, Vec<BlockId>, u64)> {
+        let state = self.sm.state.read().unwrap();
+        state
+            .bindings
+            .iter()
+            .filter(|(_, binding)| binding.agent == *agent)
+            .map(|(key, binding)| {
+                (
+                    key.clone(),
+                    binding.blocks.clone(),
+                    state.leases.revisions.get(key).copied().unwrap_or(0),
+                )
+            })
             .collect()
     }
 

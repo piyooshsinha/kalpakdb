@@ -41,6 +41,17 @@ pub enum Request {
         agent: AgentId,
         bindings: Vec<ChainBinding>,
     },
+    BeginUploadLease {
+        lease: BlockId,
+        agent: AgentId,
+        blocks: Vec<BlockId>,
+    },
+    CommitUploadLease {
+        lease: BlockId,
+        agent: AgentId,
+        binding: ChainBinding,
+        expected_revision: u64,
+    },
 }
 
 /// One link of an atomic chain bind.
@@ -58,6 +69,7 @@ pub enum Response {
     Rejected(String),
     Registered,
     Bound,
+    LeaseReserved,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
