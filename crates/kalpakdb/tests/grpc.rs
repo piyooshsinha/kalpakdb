@@ -172,32 +172,48 @@ async fn grpc_streams_blocks_through_group_commit() {
 
     // An HTTP body that has not arrived yet must reserve from the same
     // pool as gRPC, not after axum has already buffered it.
-    use tokio::io::AsyncWriteExt;
-    let mut slow_http = tokio::net::TcpStream::connect("127.0.0.1:17551")
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let slow_http = loop {
+        let mut stream = tokio::net::TcpStream::connect("127.0.0.1:17551")
+            .await
+            .unwrap();
+        stream.write_all(b"POST /v1/blocks HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nExpect: 100-continue\r\n\r\n").await.unwrap();
+        // Hyper emits Continue only once the admitted handler polls the body.
+        // A previous gRPC worker may still own its permit after returning an
+        // error; retry a rejected HTTP attempt, not unrelated gRPC uploads.
+        let mut header = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !header.ends_with(b"\r\n\r\n") {
+                assert!(header.len() < 4096, "oversized HTTP response header");
+                header.push(stream.read_u8().await.unwrap());
+            }
+        })
         .await
-        .unwrap();
-    slow_http
-        .write_all(b"POST /v1/blocks HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\n")
-        .await
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        let result = client
-            .put_blocks(tokio_stream::iter([PutBlockChunk {
-                data: b"admission-probe".to_vec().into(),
-                last_chunk: true,
-            }]))
-            .await;
-        if let Err(error) = result {
-            assert_eq!(error.code(), tonic::Code::ResourceExhausted);
-            break;
+        .expect("HTTP admission handshake timed out");
+        let header = String::from_utf8(header).unwrap();
+        if header.starts_with("HTTP/1.1 100 ") {
+            break stream;
         }
         assert!(
-            Instant::now() < deadline,
-            "HTTP failed to reserve shared budget"
+            header.starts_with("HTTP/1.1 503 "),
+            "unexpected admission response: {header}"
         );
+        assert!(
+            Instant::now() < deadline,
+            "previous upload did not release admission"
+        );
+        drop(stream);
         tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    };
+    let error = client
+        .put_blocks(tokio_stream::iter([PutBlockChunk {
+            data: b"admission-probe".to_vec().into(),
+            last_chunk: true,
+        }]))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
     drop(slow_http);
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
