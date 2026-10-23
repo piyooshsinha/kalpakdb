@@ -720,6 +720,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reclamation_evidence_keeps_shared_references_and_terminal_leases_distinct() {
+        let cp = ControlPlane::start_single_node(1).await.unwrap();
+        let owner = agent(91);
+        cp.register_agent(owner, "retention test").await.unwrap();
+        let block = BlockId::of(b"shared");
+        let pending = BlockId::of(b"pending lease");
+        let committed = BlockId::of(b"committed lease");
+        let cancelled = BlockId::of(b"cancelled lease");
+        let expired = BlockId::of(b"expired lease");
+        for lease in [pending, committed, cancelled, expired] {
+            cp.begin_upload_lease(lease, owner, vec![block])
+                .await
+                .unwrap();
+        }
+        cp.commit_upload_lease(
+            committed,
+            owner,
+            ChainBinding {
+                key: key(&[91]),
+                blocks: vec![block],
+                parent: None,
+            },
+            0,
+        )
+        .await
+        .unwrap();
+        cp.bind_prefix(owner, key(&[92]), vec![block], None)
+            .await
+            .unwrap();
+        cp.cancel_upload_lease(cancelled, owner).await.unwrap();
+        cp.renew_upload_lease(expired, owner, 0, 1).await.unwrap();
+        cp.advance_lease_clock(0).await.unwrap();
+        cp.require_replicas(vec![block], 3).await.unwrap();
+
+        // Due-but-unmarked expiry must already be classified as expired.
+        let evidence = cp.reclamation_evidence(&block);
+        assert_eq!(evidence["binding_references"], 2);
+        assert_eq!(evidence["required_replicas"], 3);
+        assert_eq!(evidence["logical_tick"], 1);
+        assert_eq!(
+            evidence["leases"],
+            serde_json::json!({
+                "pending": 1, "committed": 1, "cancelled": 1, "expired": 1
+            })
+        );
+        let position = evidence["last_applied"].clone();
+        for _ in 0..10 {
+            assert_eq!(cp.reclamation_evidence(&block), evidence);
+        }
+        let absent = cp.reclamation_evidence(&BlockId::of(b"unknown"));
+        assert_eq!(absent["last_applied"], position);
+        assert_eq!(absent["binding_references"], 0);
+        assert_eq!(absent["required_replicas"], 0);
+
+        // Removing one live binding does not erase the other reference or
+        // the committed lease's historical record.
+        cp.bind_prefix(owner, key(&[92]), vec![], None)
+            .await
+            .unwrap();
+        let after = cp.reclamation_evidence(&block);
+        assert_eq!(after["binding_references"], 1);
+        assert_eq!(after["leases"], evidence["leases"]);
+        cp.expire_upload_lease(expired, 1, 1).await.unwrap();
+        assert_eq!(
+            cp.reclamation_evidence(&block)["leases"],
+            evidence["leases"]
+        );
+    }
+
+    #[tokio::test]
     async fn single_node_elects_and_applies() {
         let cp = ControlPlane::start_single_node(1).await.unwrap();
         let a = agent(1);
