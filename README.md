@@ -430,6 +430,18 @@ not cover network staging before hashing, remote fan-out after local completion,
 offline writers, or provide an atomic exclusion barrier against new operations.
 A nonzero count blocks dry-run validation; zero never authorizes reclamation.
 
+An internal local release-check primitive now atomically verifies the expected
+durable upload generation, rejects active writers or another check, and reserves
+that hash against new guarded writes. It uses the same lock as write admission;
+conflicting batches fail before any journal mutation, while unrelated hashes
+can proceed. RAII cleanup drops the ephemeral reservation on completion, error,
+or unwinding. `local_guard.local_release_check` exposes the current reservation.
+The primitive is deliberately not wired to HTTP or a release coordinator:
+dry-run requests remain observational and never reserve blocks. It cannot
+release a durable guard, delete payloads, fence Raft bindings, or survive a
+process crash as authority. Cluster authorization and recovery semantics remain
+required before a real release workflow can use it. Physical GC stays disabled.
+
 Each new guard batch adds a metadata fsync before the payload fsync; no
 throughput improvement is claimed. Backups capture a stable journal after
 segment traversal; the journal-copy lock can delay uploads. Timed

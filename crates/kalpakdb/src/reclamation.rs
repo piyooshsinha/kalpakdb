@@ -44,6 +44,9 @@ pub(crate) fn validate(expected: &ExpectedFences, observation: Value) -> Value {
     if observation["local_guard"]["active_local_writes"].as_u64() != Some(0) {
         blockers.push("active_local_writes_present_or_unknown");
     }
+    if observation["local_guard"]["local_release_check"] != false {
+        blockers.push("local_release_check_present_or_unknown");
+    }
     for (value, reason) in [
         (
             &observation["metadata"]["binding_references"],
@@ -90,7 +93,7 @@ mod tests {
     }
     fn sample() -> Value {
         json!({"storage_generation": "incarnation",
-            "local_guard": {"guarded": true, "local_generation": 7, "write_failed": false, "active_local_writes": 0},
+            "local_guard": {"guarded": true, "local_generation": 7, "write_failed": false, "active_local_writes": 0, "local_release_check": false},
             "metadata": {"block_reference_fence": 11, "binding_references": 0,
                 "required_replicas": 0, "leases": {"pending": 0, "expired": 1}}})
     }

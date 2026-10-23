@@ -22,6 +22,7 @@ struct State {
     bytes: u64,
     failed: bool,
     active: HashMap<BlockId, usize>,
+    release_checks: HashSet<BlockId>,
 }
 
 pub(crate) struct Retention(Mutex<State>);
@@ -31,6 +32,26 @@ pub(crate) struct Retention(Mutex<State>);
 pub(crate) struct WriteGuard<'a> {
     retention: &'a Retention,
     ids: HashSet<BlockId>,
+}
+
+/// Local exclusion only, not authorization to release guards or delete bytes.
+/// Kept internal and unexposed until cluster authorization is implemented.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) struct ReleaseCheck<'a> {
+    retention: &'a Retention,
+    id: BlockId,
+}
+
+impl Drop for ReleaseCheck<'_> {
+    fn drop(&mut self) {
+        self.retention
+            .0
+            .lock()
+            .unwrap()
+            .release_checks
+            .remove(&self.id);
+    }
 }
 
 impl Drop for WriteGuard<'_> {
@@ -111,6 +132,7 @@ impl Retention {
             bytes,
             failed: false,
             active: HashMap::new(),
+            release_checks: HashSet::new(),
         })))
     }
 
@@ -129,6 +151,14 @@ impl Retention {
         // Collapse duplicates within a batch, but never across attempts:
         // reuse must invalidate any previously observed local fence.
         let requested: HashSet<_> = ids.iter().copied().collect();
+        // Check the whole batch before journal I/O or publishing any writers.
+        // The same lock serializes writer entry and release-check acquisition.
+        if requested.iter().any(|id| state.release_checks.contains(id)) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "block reserved by local release check",
+            ));
+        }
         if requested.is_empty() {
             return Ok(WriteGuard {
                 retention: self,
@@ -184,7 +214,40 @@ impl Retention {
         serde_json::json!({"guarded": state.ids.contains_key(id),
             "local_generation": state.ids.get(id),
             "active_local_writes": state.active.get(id).copied().unwrap_or(0),
+            "local_release_check": state.release_checks.contains(id),
             "journal_sequence": state.sequence, "write_failed": state.failed})
+    }
+
+    /// Atomically validate a durable local generation and exclude new guarded
+    /// writes. No network, Raft, guard removal, or payload deletion is performed.
+    /// Intentionally not called by the observational HTTP dry-run endpoint.
+    #[allow(dead_code)]
+    pub(crate) fn try_release_check(
+        &self,
+        id: BlockId,
+        expected_generation: u64,
+    ) -> io::Result<ReleaseCheck<'_>> {
+        let mut state = self.0.lock().unwrap();
+        if state.failed {
+            return Err(io::Error::other("retention journal failed"));
+        }
+        if expected_generation == 0 || state.ids.get(&id) != Some(&expected_generation) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unknown or stale local generation",
+            ));
+        }
+        if state.active.contains_key(&id) || state.release_checks.contains(&id) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "block has an active local operation",
+            ));
+        }
+        state.release_checks.insert(id);
+        Ok(ReleaseCheck {
+            retention: self,
+            id,
+        })
     }
 
     pub(crate) fn snapshot(&self) -> serde_json::Value {
@@ -214,6 +277,93 @@ pub(crate) fn gc_reason() -> &'static str {
 #[allow(unused_must_use)]
 mod tests {
     use super::*;
+    #[test]
+    fn release_check_rejects_busy_stale_unknown_and_failed_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Retention::open(dir.path()).unwrap();
+        let a = BlockId::of(b"excluded");
+        let b = BlockId::of(b"unrelated");
+        let writer = journal.protect(&[a]).unwrap();
+        assert!(journal.try_release_check(a, 1).is_err());
+        drop(writer);
+        assert!(journal.try_release_check(a, 0).is_err());
+        assert!(journal.try_release_check(b, 1).is_err());
+        let check = journal.try_release_check(a, 1).unwrap();
+        assert!(journal.try_release_check(a, 1).is_err());
+        let before = journal.snapshot();
+        assert_eq!(
+            journal.protect(&[a, b]).err().unwrap().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(journal.snapshot(), before);
+        assert_eq!(journal.evidence(&b)["guarded"], false);
+        // An unrelated writer can proceed, without changing a's fence.
+        drop(journal.protect(&[b]).unwrap());
+        assert_eq!(journal.evidence(&a)["local_release_check"], true);
+        drop(check);
+        drop(journal.protect(&[a]).unwrap());
+        assert!(journal.try_release_check(a, 1).is_err());
+        let check = journal.try_release_check(a, 3).unwrap();
+        drop(check);
+        journal.0.lock().unwrap().failed = true;
+        assert!(journal.try_release_check(a, 3).is_err());
+    }
+
+    #[test]
+    fn competing_writer_and_release_check_cannot_both_enter() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Retention::open(dir.path()).unwrap();
+        let id = BlockId::of(b"race");
+        drop(journal.protect(&[id]).unwrap());
+        for _ in 0..32 {
+            let generation = journal.evidence(&id)["local_generation"].as_u64().unwrap();
+            let start = std::sync::Barrier::new(2);
+            let finish = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                let writer = scope.spawn(|| {
+                    start.wait();
+                    let guard = journal.protect(&[id]);
+                    let entered = guard.is_ok();
+                    finish.wait(); // Hold winner until both attempts finish.
+                    drop(guard);
+                    entered
+                });
+                let checker = scope.spawn(|| {
+                    start.wait();
+                    let guard = journal.try_release_check(id, generation);
+                    let entered = guard.is_ok();
+                    finish.wait();
+                    drop(guard);
+                    entered
+                });
+                assert_ne!(writer.join().unwrap(), checker.join().unwrap());
+            });
+            assert_eq!(journal.evidence(&id)["active_local_writes"], 0);
+            assert_eq!(journal.evidence(&id)["local_release_check"], false);
+        }
+    }
+
+    #[test]
+    fn release_check_is_ephemeral_and_never_removes_durable_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Retention::open(dir.path()).unwrap();
+        let id = BlockId::of(b"retained");
+        drop(journal.protect(&[id]).unwrap());
+        let before = journal.snapshot();
+        let result = std::panic::catch_unwind(|| {
+            let _check = journal.try_release_check(id, 1).unwrap();
+            panic!("simulate failed release coordinator");
+        });
+        assert!(result.is_err());
+        assert_eq!(journal.evidence(&id)["local_release_check"], false);
+        assert_eq!(journal.snapshot(), before);
+        drop(journal);
+        let journal = Retention::open(dir.path()).unwrap();
+        assert_eq!(journal.evidence(&id)["guarded"], true);
+        assert_eq!(journal.evidence(&id)["local_generation"], 1);
+        assert_eq!(journal.evidence(&id)["local_release_check"], false);
+    }
+
     #[tokio::test]
     async fn cancelling_async_waiter_keeps_submitted_disk_write_visible() {
         let dir = tempfile::tempdir().unwrap();
