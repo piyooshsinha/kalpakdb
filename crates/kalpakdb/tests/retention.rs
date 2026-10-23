@@ -117,6 +117,39 @@ async fn unbound_uploads_survive_compaction_requests_and_real_restart() {
         assert_eq!(plan["local_payload_present"], present);
         assert_eq!(plan["metadata"]["binding_references"], 0);
         assert_eq!(plan["metadata"]["leases"]["pending"], 0);
+        let mut validation_url =
+            reqwest::Url::parse(&format!("{base}/v1/reclamation/{id}/validate")).unwrap();
+        validation_url.query_pairs_mut().extend_pairs([
+            (
+                "storage_generation",
+                plan["storage_generation"].as_str().unwrap().to_owned(),
+            ),
+            (
+                "local_generation",
+                plan["local_guard"]["local_generation"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .to_string(),
+            ),
+            ("block_reference_fence", "0".to_owned()),
+        ]);
+        let report: serde_json::Value = client
+            .get(validation_url)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(report["release_authorized"], false);
+        assert_eq!(report["observed_fences_match"], false); // reference history unknown
+        assert_eq!(report["observation"]["local_guard"], plan["local_guard"]);
+        assert_eq!(
+            report["observation"]["metadata"]["last_applied"],
+            plan["metadata"]["last_applied"]
+        );
     }
     assert_eq!(
         client

@@ -410,6 +410,7 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/manifest/lookup", post(lookup_prefix))
         .route("/v1/stats", get(stats))
         .route("/v1/reclamation/{id}", get(reclamation_plan))
+        .route("/v1/reclamation/{id}/validate", get(reclamation_validate))
         .route("/metrics", get(metrics))
         .route("/v1/ws", get(ws_stats))
         .route("/v1/admin/compact", post(admin_compact))
@@ -1072,6 +1073,31 @@ async fn put_blocks_batch(
     })))
 }
 
+async fn reclamation_validate(
+    State(s): State<Shared>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    query: Result<
+        axum::extract::Query<crate::reclamation::ExpectedFences>,
+        axum::extract::rejection::QueryRejection,
+    >,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_read_token(&s, &headers, None)?;
+    let id: BlockId = id
+        .parse()
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid block ID".into()))?;
+    let axum::extract::Query(expected) = query.map_err(|_| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            "expected storage_generation, local_generation and block_reference_fence".into(),
+        )
+    })?;
+    Ok(Json(crate::reclamation::validate(
+        &expected,
+        reclamation_observation(&s, &id),
+    )))
+}
+
 async fn get_block(
     State(s): State<Shared>,
     Path(id): Path<String>,
@@ -1576,21 +1602,25 @@ async fn reclamation_plan(
     let id: BlockId = id
         .parse()
         .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid block ID".into()))?;
-    Ok(Json(json!({
+    Ok(Json(reclamation_observation(&s, &id)))
+}
+
+fn reclamation_observation(s: &AppState, id: &BlockId) -> serde_json::Value {
+    json!({
         "block": id,
         "mode": "diagnostic_only",
         "authoritative": false,
         "reclaimable": false,
         "gc_enabled": false,
         "blocked_reason": crate::retention::gc_reason(),
-        "metadata": s.control.reclamation_evidence(&id),
-        "local_guard": s.retention.evidence(&id),
+        "metadata": s.control.reclamation_evidence(id),
+        "local_guard": s.retention.evidence(id),
         "storage_generation": s.repairs.generation,
-        "local_payload_present": s.store.contains(&id),
+        "local_payload_present": s.store.contains(id),
         "unknowns": ["in_flight_writes", "legacy_provenance", "cluster_gc_watermark",
             "linearizable_release_validation", "replica_health"],
         "consistency": "local observations taken separately; may be stale or change during capture"
-    })))
+    })
 }
 
 async fn stats(

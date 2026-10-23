@@ -409,6 +409,17 @@ These positions are not cluster identities or release certificates. Cluster-boun
 authorization, linearizable validation, in-flight-write coordination and restore
 rollback protection are still required before guard release.
 
+`GET /v1/reclamation/{block_id}/validate?storage_generation=...&local_generation=...&block_reference_fence=...`
+compares supplied fences with fresh local observations and returns a dry-run
+blocker list. It uses the same observability bearer token; all three query
+fields are required and unknown fields are rejected. `observed_fences_match`
+only describes that sample, not cluster-wide validity. Unknown/stale fences,
+live binding references, pending leases, replica requirements and failed journal
+health are reported. Even matching fences always return `release_authorized:
+false` and `reclaimable: false`: in-flight writes, legacy provenance, the GC
+watermark, linearizable authorization and restore rollback remain unresolved.
+The endpoint performs no Raft writes, guard release, or payload deletion.
+
 Each new guard batch adds a metadata fsync before the payload fsync; no
 throughput improvement is claimed. Backups capture a stable journal after
 segment traversal; the journal-copy lock can delay uploads. Timed
