@@ -230,6 +230,7 @@ pub async fn serve_with_scrub(
     });
 
     crate::repair::start(state.clone());
+    crate::leases::start_expiry(state.clone());
     if let (Some(scanner), Some(rate)) = (scanner, scrub_mib_per_sec) {
         crate::online_scrub::start(state.clone(), scanner, rate);
     }
@@ -405,6 +406,7 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/leases/begin", post(crate::leases::begin))
         .route("/v1/leases/commit", post(crate::leases::commit))
         .route("/v1/leases/cancel", post(crate::leases::cancel))
+        .route("/v1/leases/renew", post(crate::leases::renew))
         .route("/v1/manifest/lookup", post(lookup_prefix))
         .route("/v1/stats", get(stats))
         .route("/metrics", get(metrics))
@@ -1516,8 +1518,7 @@ async fn admin_backup(State(s): State<Shared>) -> Result<Response, ApiError> {
 }
 
 fn stats_payload(s: &AppState) -> serde_json::Value {
-    let (lease_pending, lease_committed, lease_cancelled) =
-        s.control.upload_lease_lifecycle_counts();
+    let leases = s.control.upload_lease_status();
     let cold = s.store.cold().stats();
     let tier = s.store.tier_stats();
     let raft = s.control.metrics();
@@ -1556,9 +1557,11 @@ fn stats_payload(s: &AppState) -> serde_json::Value {
         },
         "online_scrub": s.online_scrub.snapshot(),
         "upload_retention": s.retention.snapshot(),
-        "replicated_leases": {"total": lease_pending + lease_committed + lease_cancelled, "pending": lease_pending,
-            "committed": lease_committed, "cancelled": lease_cancelled, "capacity": kalpak_control::MAX_LEASES,
-            "automatic_expiry": false, "gc_enabled": false},
+        "replicated_leases": {"total": leases.total, "pending": leases.pending,
+            "committed": leases.committed, "cancelled": leases.cancelled, "expired": leases.expired,
+            "current_tick": leases.current_tick, "expiry_markers": leases.expiry_markers,
+            "capacity": kalpak_control::MAX_LEASES, "expiry_mode": "opt_in_logical_ticks",
+            "automatic_expiry": true, "gc_enabled": false},
     })
 }
 

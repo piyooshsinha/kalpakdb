@@ -1,5 +1,5 @@
-//! Replicated reservations and single-use binding commits. No expiration or
-//! reclamation authority is implied by a committed reservation.
+//! Replicated reservations and optional logical-tick expiry. No lifecycle
+//! transition is authority to reclaim physical data.
 use crate::{ChainBinding, MetadataState, Response};
 use kalpak_core::{AgentId, BlockId};
 use serde::{Deserialize, Serialize};
@@ -8,6 +8,25 @@ use std::collections::{BTreeMap, HashMap};
 pub const MAX_LEASES: usize = 4096;
 pub const MAX_LEASE_BLOCKS: usize = 256;
 pub const MAX_RESERVED_BLOCKS: usize = 65_536;
+pub const MAX_TTL_TICKS: u64 = 86_400;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LeaseDeadline {
+    pub generation: u64,
+    pub deadline_tick: u64,
+    pub ttl_ticks: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LeaseStatusCounts {
+    pub total: usize,
+    pub pending: usize,
+    pub committed: usize,
+    pub cancelled: usize,
+    pub expired: usize,
+    pub current_tick: u64,
+    pub expiry_markers: usize,
+}
 
 fn valid_binding(binding: &ChainBinding) -> bool {
     let valid_key = |key: &kalpak_core::CacheKey| {
@@ -52,11 +71,33 @@ pub struct LeaseState {
     /// First cancellation's Raft log position. IDs and hashes remain retained
     /// as replay tombstones; cancellation is never physical GC authority.
     pub cancelled: BTreeMap<BlockId, u64>,
+    pub clock: u64,
+    pub deadlines: BTreeMap<BlockId, LeaseDeadline>,
+    pub expired: BTreeMap<BlockId, u64>,
 }
 
 impl LeaseState {
     pub(crate) fn validate(&self) -> std::io::Result<()> {
         if self.records.len() > MAX_LEASES
+            || self.deadlines.iter().any(|(id, deadline)| {
+                !self.records.contains_key(id)
+                    || deadline.generation == 0
+                    || !(1..=MAX_TTL_TICKS).contains(&deadline.ttl_ticks)
+                    || deadline
+                        .deadline_tick
+                        .checked_sub(deadline.ttl_ticks)
+                        .is_none_or(|issued| issued > self.clock)
+            })
+            || self.expired.keys().any(|id| {
+                self.records
+                    .get(id)
+                    .is_none_or(|lease| lease.committed.is_some())
+                    || self.cancelled.contains_key(id)
+                    || self
+                        .deadlines
+                        .get(id)
+                        .is_none_or(|deadline| deadline.deadline_tick > self.clock)
+            })
             || self.cancelled.iter().any(|(id, _)| {
                 self.records
                     .get(id)
@@ -106,7 +147,9 @@ pub(crate) fn reserve(
     }
     if let Some(old) = state.leases.records.get(&id) {
         return if old.agent == agent && old.blocks == blocks {
-            if state.leases.cancelled.contains_key(&id) {
+            if state.leases.is_expired(&id) {
+                Response::Rejected("upload lease expired".into())
+            } else if state.leases.cancelled.contains_key(&id) {
                 Response::Rejected("upload lease cancelled".into())
             } else {
                 Response::LeaseReserved
@@ -158,6 +201,9 @@ pub(crate) fn validate_commit(
     if state.leases.cancelled.contains_key(id) {
         return Err("upload lease cancelled".into());
     }
+    if state.leases.is_expired(id) {
+        return Err("upload lease expired".into());
+    }
     if let Some(old) = &lease.committed {
         return if old.expected_revision == expected_revision
             && old.binding.key == binding.key
@@ -194,10 +240,140 @@ pub(crate) fn cancel(state: &mut MetadataState, id: BlockId, agent: AgentId) -> 
     if lease.committed.is_some() {
         return Response::Rejected("committed upload lease cannot be cancelled".into());
     }
+    if state.leases.is_expired(&id) {
+        return Response::Rejected("upload lease expired".into());
+    }
     state
         .leases
         .cancelled
         .entry(id)
         .or_insert_with(|| state.last_applied.map(|id| id.index).unwrap_or(0));
     Response::LeaseCancelled
+}
+
+impl LeaseState {
+    pub fn is_expired(&self, id: &BlockId) -> bool {
+        self.records
+            .get(id)
+            .is_some_and(|lease| lease.committed.is_none())
+            && !self.cancelled.contains_key(id)
+            && (self.expired.contains_key(id)
+                || self
+                    .deadlines
+                    .get(id)
+                    .is_some_and(|deadline| deadline.deadline_tick <= self.clock))
+    }
+
+    pub fn status_counts(&self) -> LeaseStatusCounts {
+        let committed = self
+            .records
+            .values()
+            .filter(|lease| lease.committed.is_some())
+            .count();
+        let expired = self.records.keys().filter(|id| self.is_expired(id)).count();
+        LeaseStatusCounts {
+            total: self.records.len(),
+            pending: self.records.len() - committed - expired - self.cancelled.len(),
+            committed,
+            cancelled: self.cancelled.len(),
+            expired,
+            current_tick: self.clock,
+            expiry_markers: self.expired.len(),
+        }
+    }
+}
+
+pub(crate) fn renew(
+    state: &mut MetadataState,
+    id: BlockId,
+    agent: AgentId,
+    expected: u64,
+    ttl: u64,
+) -> Response {
+    let Some(lease) = state.leases.records.get(&id) else {
+        return Response::Rejected("unknown upload lease".into());
+    };
+    if lease.agent != agent
+        || lease.committed.is_some()
+        || state.leases.cancelled.contains_key(&id)
+        || state.leases.is_expired(&id)
+    {
+        return Response::Rejected("lease is not pending for this owner".into());
+    }
+    if !(1..=MAX_TTL_TICKS).contains(&ttl) || expected == u64::MAX {
+        return Response::Rejected("invalid TTL or renewal generation".into());
+    }
+    if let Some(old) = state.leases.deadlines.get(&id) {
+        if old.generation == expected + 1 && old.ttl_ticks == ttl {
+            return Response::LeaseRenewed {
+                generation: old.generation,
+                deadline_tick: old.deadline_tick,
+            };
+        }
+    }
+    let current = state
+        .leases
+        .deadlines
+        .get(&id)
+        .map(|old| old.generation)
+        .unwrap_or(0);
+    if expected != current {
+        return Response::Rejected("lease renewal generation conflict".into());
+    }
+    let Some(deadline_tick) = state.leases.clock.checked_add(ttl) else {
+        return Response::Rejected("lease clock exhausted".into());
+    };
+    if state
+        .leases
+        .deadlines
+        .get(&id)
+        .is_some_and(|old| old.deadline_tick >= deadline_tick)
+    {
+        return Response::Rejected("renewal must extend the deadline".into());
+    }
+    let generation = current + 1;
+    state.leases.deadlines.insert(
+        id,
+        LeaseDeadline {
+            generation,
+            deadline_tick,
+            ttl_ticks: ttl,
+        },
+    );
+    Response::LeaseRenewed {
+        generation,
+        deadline_tick,
+    }
+}
+
+pub(crate) fn advance(state: &mut MetadataState, expected: u64) -> Response {
+    if expected < state.leases.clock {
+        return Response::LeaseClockAdvanced;
+    }
+    if expected != state.leases.clock {
+        return Response::Rejected("lease clock conflict".into());
+    }
+    let Some(next) = expected.checked_add(1) else {
+        return Response::Rejected("lease clock exhausted".into());
+    };
+    state.leases.clock = next;
+    Response::LeaseClockAdvanced
+}
+
+pub(crate) fn expire(
+    state: &mut MetadataState,
+    id: BlockId,
+    generation: u64,
+    deadline_tick: u64,
+) -> Response {
+    if !state.leases.is_expired(&id)
+        || state.leases.deadlines.get(&id).is_none_or(|deadline| {
+            deadline.generation != generation || deadline.deadline_tick != deadline_tick
+        })
+    {
+        return Response::Rejected("stale or premature lease expiry".into());
+    }
+    let at = state.last_applied.map(|id| id.index).unwrap_or(0);
+    state.leases.expired.entry(id).or_insert(at);
+    Response::LeaseExpired
 }

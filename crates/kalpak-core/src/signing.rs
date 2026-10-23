@@ -135,6 +135,20 @@ pub fn lease_cancel_message(agent: &AgentId, lease: &BlockId) -> Vec<u8> {
     buf
 }
 
+pub fn lease_renew_message(
+    agent: &AgentId,
+    lease: &BlockId,
+    expected_generation: u64,
+    ttl_ticks: u64,
+) -> Vec<u8> {
+    let mut buf = b"KLPK/lease/renew/v1\0".to_vec();
+    buf.extend_from_slice(&agent.0);
+    buf.extend_from_slice(lease.as_bytes());
+    buf.extend_from_slice(&expected_generation.to_le_bytes());
+    buf.extend_from_slice(&ttl_ticks.to_le_bytes());
+    buf
+}
+
 pub fn lease_commit_message(
     agent: &AgentId,
     lease: &BlockId,
@@ -220,6 +234,24 @@ mod tests {
         let other = AgentId::from_verifying_key(&SigningKey::from_bytes(&[44; 32]).verifying_key());
         assert!(other
             .verify(&lease_cancel_message(&other, &lease), &signature)
+            .is_err());
+    }
+
+    #[test]
+    fn renewal_signatures_bind_generation_ttl_and_operation() {
+        let (key, agent) = agent_and_key();
+        let lease = BlockId::of(b"renew-signature");
+        let message = lease_renew_message(&agent, &lease, 3, 100);
+        let signature = signature_from_hex(&sign_hex(&key, &message)).unwrap();
+        agent.verify(&message, &signature).unwrap();
+        assert!(agent
+            .verify(&lease_renew_message(&agent, &lease, 4, 100), &signature)
+            .is_err());
+        assert!(agent
+            .verify(&lease_renew_message(&agent, &lease, 3, 101), &signature)
+            .is_err());
+        assert!(agent
+            .verify(&lease_cancel_message(&agent, &lease), &signature)
             .is_err());
     }
 

@@ -146,6 +146,7 @@ async fn signed_reservation_survives_origin_loss_and_retries_cannot_rebind_old_d
         .unwrap(); // follower -> leader
     let cancelled = BlockId::of(b"cancel-after-failover");
     db.begin_upload_lease(cancelled, vec![block]).await.unwrap();
+    let timed = db.renew_upload_lease(cancelled, 0, 60).await.unwrap();
     let key = CacheKey::root(
         ModelFingerprint::new("lease/model", "tokenizer", "layout"),
         &[1],
@@ -171,6 +172,12 @@ async fn signed_reservation_survives_origin_loss_and_retries_cannot_rebind_old_d
     nodes[old_leader].stop();
     let current = leader(&client, &nodes, Some(old_id)).await;
     let db = KalpakClient::with_signer(nodes[current].base(), signer);
+    let renewed = db
+        .renew_upload_lease(cancelled, timed.generation, 120)
+        .await
+        .unwrap();
+    assert_eq!(renewed.generation, timed.generation + 1);
+    assert!(renewed.deadline_tick > timed.deadline_tick);
     db.cancel_upload_lease(cancelled).await.unwrap();
     db.cancel_upload_lease(cancelled).await.unwrap();
     assert!(db.begin_upload_lease(cancelled, vec![block]).await.is_err());
@@ -280,6 +287,196 @@ async fn signed_reservation_survives_origin_loss_and_retries_cannot_rebind_old_d
         db.lookup(&[key]).await.unwrap().unwrap().blocks,
         vec![block_two]
     );
+}
+
+#[tokio::test]
+async fn logical_expiry_rejects_late_writes_and_retains_bytes_across_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let mut nodes = vec![node(dir.path(), 1).await];
+    post(
+        &client,
+        &nodes[0].base(),
+        "/v1/cluster/init",
+        json!({"members": {"1": nodes[0].addr}}),
+    )
+    .await;
+    leader(&client, &nodes, None).await;
+    let signer = ed25519_dalek::SigningKey::from_bytes(&[98; 32]);
+    let db = KalpakClient::with_signer(nodes[0].base(), signer.clone());
+    let agent = db.agent_id().unwrap();
+    db.register_agent(agent, "timed").await.unwrap();
+    let block = db
+        .put_block(b"retained after expiry".to_vec())
+        .await
+        .unwrap();
+    let lease = BlockId::of(b"autonomous-expiry");
+    db.begin_upload_lease(lease, vec![block]).await.unwrap();
+    let renewal = db.renew_upload_lease(lease, 0, 3).await.unwrap();
+    let duplicate = db.renew_upload_lease(lease, 0, 3).await.unwrap();
+    assert_eq!(renewal, duplicate, "retry must not move the deadline");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let stats: Value = client
+            .get(format!("{}/v1/stats", nodes[0].base()))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if stats["replicated_leases"]["expiry_markers"] == 1 {
+            assert_eq!(stats["replicated_leases"]["expired"], 1);
+            assert_eq!(stats["replicated_leases"]["pending"], 0);
+            assert_eq!(stats["upload_retention"]["guarded_blocks"], 1);
+            assert!(
+                stats["replicated_leases"]["current_tick"].as_u64().unwrap()
+                    >= renewal.deadline_tick
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "data leader did not order expiry"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let key = CacheKey::root(ModelFingerprint::new("expiry", "tok", "layout"), &[1]);
+    assert!(matches!(
+        db.commit_upload_lease(lease, key.clone(), vec![block], None, 0)
+            .await,
+        Err(kalpak_client::ClientError::Server { status: 409, .. })
+    ));
+    assert!(matches!(
+        db.renew_upload_lease(lease, renewal.generation, 10).await,
+        Err(kalpak_client::ClientError::Server { status: 409, .. })
+    ));
+    assert!(db.cancel_upload_lease(lease).await.is_err());
+    assert!(db.begin_upload_lease(lease, vec![block]).await.is_err());
+    // Clock/expiry operations are not unauthenticated HTTP routes.
+    assert_eq!(
+        client
+            .post(format!("{}/v1/leases/tick", nodes[0].base()))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    let address = nodes[0].addr.clone();
+    nodes[0].stop();
+    nodes[0] = node_at(dir.path(), 1, Some(address)).await;
+    leader(&client, &nodes, None).await;
+    let db = KalpakClient::with_signer(nodes[0].base(), signer);
+    assert!(matches!(
+        db.renew_upload_lease(lease, renewal.generation, 10).await,
+        Err(kalpak_client::ClientError::Server { status: 409, .. })
+    ));
+    assert_eq!(
+        db.get_block(&block).await.unwrap(),
+        b"retained after expiry"
+    );
+    assert!(db.lookup(&[key]).await.unwrap().is_none());
+    let stats: Value = client
+        .get(format!("{}/v1/stats", nodes[0].base()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stats["replicated_leases"]["expired"], 1);
+    assert_eq!(stats["replicated_leases"]["expiry_markers"], 1);
+    assert_eq!(stats["upload_retention"]["guarded_blocks"], 1);
+    assert_eq!(stats["upload_retention"]["gc_enabled"], false);
+}
+
+#[tokio::test]
+async fn isolated_leader_cannot_advance_expiry_without_a_quorum() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let mut nodes = vec![
+        node(&dir.path().join("a"), 1).await,
+        node(&dir.path().join("b"), 2).await,
+        node(&dir.path().join("c"), 3).await,
+    ];
+    post(
+        &client,
+        &nodes[0].base(),
+        "/v1/cluster/init",
+        json!({"members": {"1": nodes[0].addr}}),
+    )
+    .await;
+    for (index, id) in [(1, 2), (2, 3)] {
+        post(
+            &client,
+            &nodes[0].base(),
+            "/v1/cluster/add-learner",
+            json!({"node_id": id, "addr": nodes[index].addr}),
+        )
+        .await;
+    }
+    post(
+        &client,
+        &nodes[0].base(),
+        "/v1/cluster/promote",
+        json!({"voters": [1, 2, 3]}),
+    )
+    .await;
+    let current = leader(&client, &nodes, None).await;
+    let db = KalpakClient::with_signer(
+        nodes[current].base(),
+        ed25519_dalek::SigningKey::from_bytes(&[99; 32]),
+    );
+    db.register_agent(db.agent_id().unwrap(), "quorum-clock")
+        .await
+        .unwrap();
+    let block = db.put_block(b"partition guard".to_vec()).await.unwrap();
+    let lease = BlockId::of(b"partitioned-timer");
+    db.begin_upload_lease(lease, vec![block]).await.unwrap();
+    let deadline = db.renew_upload_lease(lease, 0, 4).await.unwrap();
+    for (index, node) in nodes.iter_mut().enumerate() {
+        if index != current {
+            node.stop();
+        }
+    }
+    // Drain any tick that had already obtained quorum before isolation.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let before: Value = client
+        .get(format!("{}/v1/stats", nodes[current].base()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        before["replicated_leases"]["current_tick"]
+            .as_u64()
+            .unwrap()
+            < deadline.deadline_tick
+    );
+    // More wall seconds than the TTL's nominal cadence must not locally expire it.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let after: Value = client
+        .get(format!("{}/v1/stats", nodes[current].base()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        after["replicated_leases"]["current_tick"],
+        before["replicated_leases"]["current_tick"]
+    );
+    assert_eq!(after["replicated_leases"]["expired"], 0);
+    assert_eq!(after["replicated_leases"]["pending"], 1);
+    assert_eq!(after["upload_retention"]["guarded_blocks"], 1);
+    assert_eq!(db.get_block(&block).await.unwrap(), b"partition guard");
 }
 
 #[tokio::test]
