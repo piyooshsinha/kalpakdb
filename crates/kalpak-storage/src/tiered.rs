@@ -24,6 +24,7 @@ use crate::io::{IoBackend, StdBackend};
 use crate::store::BlockStore;
 
 pub struct TieredStore<B: IoBackend = StdBackend> {
+    quarantined: std::sync::RwLock<std::collections::HashSet<BlockId>>,
     cold: BlockStore<B>,
     warm: moka::sync::Cache<BlockId, Arc<Vec<u8>>>,
     warm_budget: u64,
@@ -66,6 +67,7 @@ impl<B: IoBackend> TieredStore<B> {
             })
             .build();
         Self {
+            quarantined: Default::default(),
             cold,
             warm,
             warm_budget: warm_budget_bytes,
@@ -129,6 +131,9 @@ impl<B: IoBackend> TieredStore<B> {
     /// Pinned (structurally important) blocks are checked first and are
     /// immune to recency eviction.
     pub fn get(&self, id: &BlockId) -> Result<Arc<Vec<u8>>, Error> {
+        if self.quarantined.read().unwrap().contains(id) {
+            return Err(Error::Corrupt { id: *id });
+        }
         if let Some(payload) = self.pinned.read().unwrap().get(id) {
             self.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(Arc::clone(payload));
@@ -144,7 +149,37 @@ impl<B: IoBackend> TieredStore<B> {
     }
 
     pub fn contains(&self, id: &BlockId) -> bool {
-        self.cold.contains(id)
+        !self.quarantined.read().unwrap().contains(id) && self.cold.contains(id)
+    }
+
+    /// Verify cold bytes even when a correct warm/pinned copy masks damage.
+    /// Quarantine is runtime state; cold reads detect the damage again after
+    /// restart. Existing damaged records remain on disk for diagnosis.
+    pub fn verify_cold(&self, id: &BlockId) -> Result<(), Error> {
+        match self.cold.get(id) {
+            Ok(_) => {
+                self.quarantined.write().unwrap().remove(id);
+                Ok(())
+            }
+            Err(error) => {
+                if !matches!(error, Error::BlockNotFound(_)) {
+                    self.quarantined.write().unwrap().insert(*id);
+                    self.warm.invalidate(id);
+                    if let Some(payload) = self.pinned.write().unwrap().remove(id) {
+                        self.pinned_bytes
+                            .fetch_sub(payload.len() as u64, Ordering::Relaxed);
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    pub fn repair(&self, id: &BlockId, payload: &[u8]) -> Result<BlockId, Error> {
+        self.cold.repair(id, payload)?;
+        self.quarantined.write().unwrap().remove(id);
+        self.warm_insert(*id, Arc::new(payload.to_vec()));
+        Ok(*id)
     }
 
     pub fn cold(&self) -> &BlockStore<B> {
@@ -329,6 +364,33 @@ mod tests {
         assert_eq!(after.hits, before.hits + 1, "pinned read must be a hit");
         assert_eq!(after.misses, before.misses, "pinned read never hits disk");
         assert_eq!(after.pinned_blocks, 1);
+    }
+
+    #[test]
+    fn cold_verification_quarantines_warm_and_pinned_copies_and_repair_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"cold-corruption-hidden-by-warm-cache";
+        let store = TieredStore::open(dir.path(), 1024 * 1024).unwrap();
+        let id = store.put(payload).unwrap();
+        assert!(store.pin(&id).unwrap());
+        let segment = dir.path().join("seg-00000000.klpk");
+        let mut bytes = std::fs::read(&segment).unwrap();
+        bytes[crate::segment::HEADER_LEN] ^= 0xff;
+        std::fs::write(&segment, bytes).unwrap();
+        assert_eq!(store.get(&id).unwrap().as_slice(), payload);
+        assert!(matches!(store.verify_cold(&id), Err(Error::Corrupt { .. })));
+        assert!(!store.contains(&id));
+        assert!(store.get(&id).is_err());
+        assert_eq!(store.tier_stats().pinned_blocks, 0);
+        assert!(store.repair(&id, b"wrong bytes").is_err());
+        assert!(store.get(&id).is_err());
+        store.repair(&id, payload).unwrap();
+        store.verify_cold(&id).unwrap();
+        assert_eq!(store.get(&id).unwrap().as_slice(), payload);
+        drop(store);
+        let reopened = TieredStore::open(dir.path(), 0).unwrap();
+        reopened.verify_cold(&id).unwrap();
+        assert_eq!(reopened.get(&id).unwrap().as_slice(), payload);
     }
 
     #[test]

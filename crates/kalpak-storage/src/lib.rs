@@ -12,6 +12,8 @@
 
 pub mod io;
 mod manifest;
+pub mod online_scrub;
+pub mod scrub;
 mod segment;
 mod store;
 mod tiered;

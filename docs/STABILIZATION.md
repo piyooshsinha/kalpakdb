@@ -1,0 +1,142 @@
+# Correctness and security stabilization
+
+KalpakDB is experimental. A release tag or passing happy-path tests is not
+a production-readiness guarantee. This checklist supersedes earlier claims
+that the only remaining work needs external hardware.
+
+## Implemented in the current working change
+
+- Persist locally built and received Raft snapshots before advertising them
+  to OpenRaft; recover applied state and membership before opening Raft.
+- Publish control files using write, file sync, rename, directory sync.
+- Persist the committed log position as well as votes and purge metadata.
+- Remove an unfinished log suffix before appending again; reject complete
+  malformed log records rather than silently hiding subsequent entries.
+- Fail startup when purged logs have no covering durable snapshot.
+- Capture a storage record location and its segment generation together;
+  publish rewritten segment handles and index locations under the same locks.
+- Reverify signed mutations even when callers present the internal forwarding
+  header. This closes that exemption, not the broader public Raft/admin issue.
+- Block daemon manual GC and reject nonzero automatic-GC intervals until a
+  coordinated watermark exists; local bindings alone are not a safe live set.
+- Sync checksummed upload retention batches before new daemon payload writes;
+  recover torn journal tails, reject complete corruption and poison guarded
+  writes after journal I/O failure. Guards are bounded and non-expiring.
+- Hide Raft, cluster-management and admin namespaces on public listeners
+  when mesh mTLS is configured, including witnesses. Bootstrap advertises
+  the mesh address; witnesses start a mutually authenticated peer listener.
+- Reject non-loopback HTTP binds without mesh and all non-loopback plaintext
+  gRPC binds before opening storage or starting background tasks. Hostnames
+  are rejected for these transports to avoid resolution/bind races.
+- Bound gRPC upload concurrency, total chunk/block counts, batch block counts
+  and idle waits. Keep admission held until submitted blocking flushes finish,
+  even if the client cancels. Reject an unfinished empty block as torn framing.
+- Share conservative upload reservations between HTTP (before body buffering),
+  gRPC and pending HTTP replication. Bound HTTP batch counts and reject
+  trailing framing bytes; apply HTTP upload and per-peer replication timeouts.
+- Add per-request acknowledged replica counts for HTTP single/batch and gRPC
+  uploads; validate peer node IDs and content acknowledgements, exclude
+  duplicate endpoints and witnesses, and fail unavailable requirements.
+- Exercise acknowledged HTTP single/batch and gRPC copies through real
+  process kills, offline integrity checks and isolated cold restarts; read
+  fallback is suppressed and isolated two-replica writes must fail.
+- Persist bounded source-local repair requirements before local writes;
+  resume serial retries after restart using shared admission. Peers record
+  retention pins before acknowledging. Reject compaction under the same
+  intent lock while requirements/pins exist; include published repair
+  metadata in online backups. Targets cannot be downgraded by retries.
+
+Replica requirements now commit through Raft before replicated success.
+The leader resumes repair from those requirements, fetching a source from
+retained peers when necessary; uncommitted source-local intents migrate
+through the leader. Permanent-origin-loss and leader-change tests cover this
+responsibility transfer. Verified copy-location records are still pending.
+Local placement observations and fresh retained-presence probes now avoid
+re-uploading healthy peers. Durable storage generations distinguish a fresh
+directory at a reused node ID; a changed generation invalidates old hints.
+These observations are not replicated placement authority. Peer probes now
+verify cold payload hashes under a one-at-a-time verification limit, bypass
+warm caches and quarantine detected corruption. Repair appends a verified,
+synced replacement rather than deduplicating a damaged record. Tests cover
+cached-good/cold-bad payloads, partial replacement writes, cold restart and
+repair from a healthy peer. Append errors fail closed until restart.
+
+The snapshot envelope is versioned (`raft-snapshot.json`, version 1) and
+contains a `KLPKSM03`-prefixed bincode payload plus Raft metadata. Version 2
+(`KLPKSM02`) and legacy unprefixed snapshots remain readable, with empty
+lease state. The first valid reservation activates binding fences at a common
+Raft barrier, avoiding per-node revision drift from different old snapshot
+positions. Mixed-version rolling upgrades and
+downgrades are unsupported; upgrade the full experimental cluster together.
+Temporary `.pending` files are never recovery sources. Older directories
+without snapshots are supported only when their logs have not been purged.
+Lost snapshots from older versions cannot be recreated by this change.
+
+## Release-blocking work still pending
+
+The offline `kalpakdb scrub --offline` diagnostic now streams all physical
+segment candidates with a 64 KiB payload buffer and page-rounded read pacing.
+Checksummed, atomic checkpoints resume completed-record progress after a
+process kill, rejecting changed layouts. It reports header/length damage and
+continues aligned inspection without changing segment bytes. The opt-in
+`serve --scrub-mib-per-sec N` worker now scans sealed segments in bounded
+steps, checkpoints record progress and resets on compaction generations.
+It yields to detected foreground I/O and shares a slot with peer probes.
+Neither path reconstructs the index or repairs structural damage. The
+offline acknowledgement does not enforce a filesystem writer lock; online
+read pacing excludes metadata/checkpoint I/O and is not a device-level SLO.
+
+1. **Public/internal isolation:** mesh deployments now restrict privileged
+   routes to the certificate-authenticated listener. Non-mesh deployments
+   are restricted to loopback but still expose unauthenticated Raft/admin
+   operations to local processes and trust an internal header; replace
+   this legacy development behavior with authenticated local access.
+   Expand witness, bootstrap and forwarding negative tests.
+2. **GC safety:** durable non-expiring upload guards and a fail-closed daemon
+   compaction gate now prevent the unsafe local sweep. Opt-in signed Raft
+   reservations now atomically commit a binding with a revision fence and
+   single-use replay tombstone. Legacy writes advance the revision but are
+   not themselves CAS-protected. Still implement safe expiry/abort and local
+   guard release, legacy-inventory migration and a Raft-coordinated watermark,
+   then test binds, leader transitions, lagging followers and GC cancellation.
+   Keep `--compact-secs 0`; manual compaction returns 409. No reclamation or
+   capacity-recovery workflow exists yet. Upload guards add metadata fsync
+   overhead and are not a maintained-replication contract.
+3. **Data durability contract:** opt-in acknowledged replica counts now
+   cover HTTP and gRPC. A source-local persistent retry ledger now resumes
+   after crashes; committed responsibility now survives origin loss through
+   Raft and leader-owned repair. Local incarnation-aware placement hints now
+   drive targeted uploads after fresh presence checks. Still add replicated
+   verified placement authority, capacity reclamation, rate/bandwidth-limited
+   active-tail/full-store scrubbing and structural/header-corruption recovery,
+   partition/cancellation and negative acknowledgement tests,
+   power-loss validation and SDK convenience options. Process-crash and
+   isolated-restart checks now cover both copies. This is not maintained
+   replica durability; default writes still promise only local storage.
+4. **Authorization and signing v2:** namespace ownership, replay-resistant
+   revisions/nonces, unambiguous length-prefixed encoding and parent coverage.
+5. **Backup consistency:** coordinate metadata and segment generations with
+   compaction and replica placement. Current live-tar ordering is not a
+   demonstrated concurrent snapshot protocol. Keep offline, verified copies.
+6. **Admission control:** gRPC upload counts and idle waits are bounded;
+   HTTP and gRPC now share a logical payload reservation pool, also held by
+   pending HTTP replication. Still account for storage/allocator copies and
+   reads, add absolute gRPC deadlines, durable replication retries and broader
+   cancellation coverage. This is not a total resident-memory guarantee.
+7. **Deployment and CI:** resolve the failed master run, validate feature
+   combinations and restart behavior on Linux/macOS, wire backend selection
+   into the daemon, and pin a supported inference-engine configuration.
+8. **Workload validation:** vLLM GPU correctness and reproducible TTFT/memory/
+   throughput comparisons against no external cache and LMCache.
+
+## Verification rules
+
+- Run commands directly and gate on exit status; never infer a green suite
+  by counting `test result: ok` lines in a failed process.
+- Include restart after actual log purging, repeated torn-tail recovery,
+  received-snapshot recovery, corrupt-snapshot rejection, and concurrent
+  compaction readers in the durability checks.
+- SIGKILL tests do not simulate power loss. Sync ordering is implemented,
+  but device/filesystem power-loss validation remains a separate exercise.
+- Do not publish a new release or claim production readiness until the
+  release-blocking invariants above have adversarial regression coverage.

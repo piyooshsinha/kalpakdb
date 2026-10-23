@@ -66,6 +66,13 @@ async fn grpc_streams_blocks_through_group_commit() {
         .unwrap()
         .into_inner();
     assert_eq!(resp.ids.len(), 3);
+    let stats: serde_json::Value = reqwest::get("http://127.0.0.1:17551/v1/stats")
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stats["upload_retention"]["guarded_blocks"], 3);
 
     // Content addressing holds across the wire.
     assert_eq!(
@@ -121,6 +128,95 @@ async fn grpc_streams_blocks_through_group_commit() {
         }]))
         .await;
     assert_eq!(torn.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+    // Empty chunks still carry framing: an unfinished empty block is torn.
+    let empty_torn = client
+        .put_blocks(tokio_stream::iter([PutBlockChunk {
+            data: Default::default(),
+            last_chunk: false,
+        }]))
+        .await;
+    assert_eq!(empty_torn.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+    // Zero-byte blocks cannot bypass payload-byte limits to accumulate an
+    // unbounded batch or an unbounded response ID vector.
+    let empty_blocks = || {
+        tokio_stream::iter((0..4096).map(|_| PutBlockChunk {
+            data: Default::default(),
+            last_chunk: true,
+        }))
+    };
+    let at_limit = client
+        .put_blocks(empty_blocks())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(at_limit.ids.len(), 4096);
+    let over_limit = client
+        .put_blocks(tokio_stream::iter((0..4097).map(|_| PutBlockChunk {
+            data: Default::default(),
+            last_chunk: true,
+        })))
+        .await
+        .unwrap_err();
+    assert_eq!(over_limit.code(), tonic::Code::ResourceExhausted);
+
+    let too_many_chunks = client
+        .put_blocks(tokio_stream::iter((0..65_537).map(|_| PutBlockChunk {
+            data: Default::default(),
+            last_chunk: false,
+        })))
+        .await
+        .unwrap_err();
+    assert_eq!(too_many_chunks.code(), tonic::Code::ResourceExhausted);
+
+    // An HTTP body that has not arrived yet must reserve from the same
+    // pool as gRPC, not after axum has already buffered it.
+    use tokio::io::AsyncWriteExt;
+    let mut slow_http = tokio::net::TcpStream::connect("127.0.0.1:17551")
+        .await
+        .unwrap();
+    slow_http
+        .write_all(b"POST /v1/blocks HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\n")
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let result = client
+            .put_blocks(tokio_stream::iter([PutBlockChunk {
+                data: b"admission-probe".to_vec().into(),
+                last_chunk: true,
+            }]))
+            .await;
+        if let Err(error) = result {
+            assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "HTTP failed to reserve shared budget"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(slow_http);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if client
+            .put_blocks(tokio_stream::iter([PutBlockChunk {
+                data: b"after-http-cancel".to_vec().into(),
+                last_chunk: true,
+            }]))
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cancelled HTTP request leaked budget"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -184,4 +280,14 @@ async fn grpc_rejects_unbounded_single_block() {
         .unwrap()
         .into_inner();
     assert_eq!(ok.ids.len(), 1);
+
+    let mut request = tonic::Request::new(tokio_stream::iter([PutBlockChunk {
+        data: b"requires-two-copies".to_vec().into(),
+        last_chunk: true,
+    }]));
+    request
+        .metadata_mut()
+        .insert("x-kalpak-replicas", "2".parse().unwrap());
+    let error = client.put_blocks(request).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable);
 }

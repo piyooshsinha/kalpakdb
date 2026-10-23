@@ -4,6 +4,13 @@
 
 **A content-addressed, Raft-replicated database for AI agent state — the storage layer agent frameworks build on.**
 
+> **Status: experimental, not production-ready.** Correctness and security
+> stabilization is in progress. See [the stabilization checklist](docs/STABILIZATION.md)
+> for implemented fixes, known risks, and release-blocking work. In particular,
+> daemon compaction is blocked while coordinated GC safety remains unresolved
+> (`--compact-secs` must be zero). Do not expose current administrative/Raft routes to
+> untrusted networks.
+
 The industry currently duct-tapes traditional databases together to handle AI memory and state: Redis for hot state, a vector database for embeddings, a graph database for facts, object storage for blobs — and the KV cache, the hottest and most expensive state in the entire stack, has no home at all and gets recomputed on every call. The bugs live in the seams between these systems: no atomicity across them, no shared lineage, no common identity.
 
 KalpakDB is one substrate for agent state, built so the seams disappear.
@@ -30,7 +37,7 @@ The name draws on Sanskrit roots that describe exactly what this database is for
 | `kalpak-core` | Block identity, chained prefix cache keys, Ed25519 agent identity, canonical signed-write messages |
 | `kalpak-storage` | Append-only content-addressed segments, crash recovery, group commit, two-tier RAM/SSD store (moka), mark-and-sweep GC, Linux `io_uring` + `O_DIRECT` backend (`--features uring`) |
 | `kalpak-control` | Raft control plane (`openraft`): durable log, dynamic membership, witness nodes, leader forwarding, snapshot compaction, atomic chain binds |
-| `kalpakdb` | Node binary: HTTP/WS memory API, gRPC data plane, cluster management, speculative + lookahead prefetch, scheduled GC, TLS, signed-write enforcement, Prometheus metrics, `/healthz` + `/readyz` probes, `bench`/`stress`/`cert` tools |
+| `kalpakdb` | Node binary: HTTP/WS memory API, gRPC data plane, cluster management, speculative + lookahead prefetch, durable upload retention (daemon GC blocked), TLS, signed-write enforcement, Prometheus metrics, `/healthz` + `/readyz` probes, `bench`/`stress`/`cert` tools |
 | `kalpak-proto` | gRPC streaming protocol (chunked block streams into one group commit) |
 | `kalpak-client` | Rust SDK: full agent workflow, transparent signing, TLS root-CA support, optional gRPC streaming (`--features grpc`) |
 | `clients/python` | Zero-dependency Python client (same workflow, server-side key hashing; optional Ed25519 signing via `cryptography`) |
@@ -135,9 +142,15 @@ curl -X POST -H 'content-type: application/json' \
 ### Docker
 
 ```sh
-docker compose up -d        # two data nodes + a witness (see docker-compose.yml
-                            # for the cluster-formation curl commands)
+docker build -t kalpakdb:local .
+docker run -d --name kalpak kalpakdb:local
+docker exec kalpak curl -fsS http://127.0.0.1:7411/readyz
 ```
+
+The image defaults to container-local loopback. A published Docker port does
+not expose this development listener. Remote/container-to-container HTTP
+requires explicit mesh mTLS configuration; the legacy non-mesh Compose
+example must not be used unchanged with the hardened listener policy.
 
 ### Runnable example
 
@@ -166,6 +179,71 @@ kalpakdb restore backup.tar /data/restored           # unpack + fsck; then serve
 kalpakdb key <model> <tok> <layout> 1,2,3 4,5        # chained CacheKeys offline
 ```
 
+## Offline physical scrub
+
+Stop **all** processes using the data directory, then run:
+
+```sh
+kalpakdb scrub /data/kalpak --offline --mib-per-sec 8
+```
+
+This reads canonical segment files directly, including records not reachable
+through the current index. Payload hashing uses a 64 KiB buffer. Read pacing
+charges page-rounded coverage, including header probes; the configurable
+range is 1–1024 MiB/s. Filesystem read-ahead, metadata I/O and checkpoint
+writes are outside that application-level budget. Segment enumeration is
+bounded to 65,536 files. This is an offline tool, not an online background
+worker: `--offline` acknowledges that writers are stopped; it is **not** an
+exclusive filesystem lock.
+
+Findings and a final summary are JSON lines. Invalid magic/version, reserved
+header bytes, overflowing/truncated lengths, short headers and payload hash
+mismatches produce findings. After damage, the scanner examines subsequent
+4 KiB-aligned candidate boundaries rather than trusting the damaged length.
+These candidates are diagnostic, not a safe reconstruction of the index;
+embedded record-like payload bytes and obsolete damaged records can appear
+in physical findings. A nonzero exit means findings or an operational error.
+No segment bytes are changed. Preserve damaged files and investigate before
+starting writers; structural recovery is **not** implemented by this command.
+
+Checksummed `scrub-progress.json` is atomically published and synced at
+completed-record boundaries. Re-running resumes an interrupted sweep;
+unfinished records are rehashed, so a restart can repeat one large record.
+Previous findings remain in the cumulative summary but are not re-emitted.
+An uncheckpointed finding can be emitted again after a crash.
+Findings should therefore be saved separately when an audit trail is needed.
+Changed file identities/sizes/modification times or damaged checkpoints fail
+closed. Start a deliberately new sweep with `--restart` after investigating
+changes; a completed checkpoint does not perform another sweep by default.
+This tool does not scrub Raft metadata or automatically repair structural
+damage.
+
+### Opt-in online sealed-segment scrub
+
+```sh
+kalpakdb serve /data/kalpak --scrub-mib-per-sec 8
+```
+
+The default is off. The online worker continuously inspects **sealed segments
+only**, with one header or at most 64 KiB of payload per blocking task. It
+paces page-rounded reads at 1–1024 MiB/s, yields when foreground cold reads
+or append/compaction activity is detected, and shares a verification slot
+with peer probes. This is best-effort scheduling, not a device bandwidth or
+foreground latency guarantee; read-ahead, metadata and durable checkpoint
+writes are outside the read budget. Sustained foreground load can starve it.
+
+Checksummed `online-scrub-progress.json` resumes at record boundaries.
+Compaction changes the segment generation and restarts that segment's scan;
+an old descriptor's results cannot advance the replacement's checkpoint.
+The active append tail is excluded: use offline scrub for a full physical
+sweep. `/v1/stats.online_scrub` reports running status, bytes read, verified
+records, physical findings, generation resets, yields and errors. Counters
+are process-local and count repeated sweeps, not unique blocks. The first
+16 findings per process are logged; operational errors stop the worker and
+increment its error counter. Findings can include obsolete records and are
+diagnostic only: they do not quarantine logical blocks or trigger repair.
+No Raft metadata scrub or automatic structural recovery is provided.
+
 ## Signed writes
 
 Run a node with `--require-signatures` and every register/bind must carry an Ed25519 signature over a canonical binary message, verified against the agent's public key before the mutation enters Raft. Both SDKs sign transparently:
@@ -180,17 +258,245 @@ db = KalpakClient("http://127.0.0.1:7411", signer=Ed25519Signer(private_key_byte
 db.register_agent(db.signer.agent, "researcher")                   # signed
 ```
 
-Unsigned or forged mutations get `401`; reads stay open. Replay of a captured signature only reproduces the identical (idempotent) mutation — confidentiality and capture-resistance on the wire are TLS's job:
+Unsigned or forged mutations get `401`; reads stay open. The current signing
+format does **not** provide replay protection: an old signed bind can overwrite
+a newer binding. TLS protects transport but does not solve stored-request replay
+or ownership authorization. These remain stabilization blockers.
 
 ## TLS
 
 ```sh
 ./target/release/kalpakdb cert ./pki                       # self-signed dev cert
-./target/release/kalpakdb serve /data --addr 0.0.0.0:7411 \
+./target/release/kalpakdb serve /data --addr 127.0.0.1:7411 \
     --tls-cert ./pki/kalpak-cert.pem --tls-key ./pki/kalpak-key.pem
 ```
 
 Clients pass the CA: `KalpakClient::with_options(url, signer, Some(ca_pem))` in Rust, `KalpakClient(url, cafile="…")` in Python, `curl --cacert …`. There is no cleartext fallback on a TLS port.
+
+Without `--mesh`, HTTP must bind to a literal loopback address (`127.0.0.1`
+or `[::1]`): the development Raft/admin API is not authenticated. This also
+applies to witnesses and to server-only TLS. Remote HTTP bindings require
+mesh mTLS; privileged routes are then available only on the mesh listener.
+The optional gRPC listener is plaintext and must always bind to loopback,
+even when HTTP TLS or mesh is enabled. These restrictions are intentional
+breaking changes; legacy wildcard-bind/container examples need mesh setup.
+Loopback is not protection against other users or processes on the host.
+
+HTTP and gRPC uploads share a 512 MiB logical reservation pool. Each upload
+reserves its configured maximum block size plus a 64 MiB batch allowance,
+rounded up to MiB, with a minimum 128 MiB reservation. At the default block
+size, one upload is admitted at a time; small-block configurations allow up
+to four. `--max-block-mb` cannot exceed 448. HTTP overload returns 503 and
+gRPC overload returns `RESOURCE_EXHAUSTED`; retry with backoff. Reservations
+also cover pending best-effort replication, with a 30-second timeout per
+peer. HTTP uploads have a 60-second handler deadline. This is not a hard
+RSS cap: caches, reads, storage copies and allocator overhead are separate.
+
+gRPC uploads have additional safety limits:
+4,096 blocks and 65,536 chunks per request, and a 30-second inter-chunk idle
+timeout. Completed blocks flush at 64 MiB or 256 blocks; the configured
+per-block limit is checked before appending payload bytes. Split larger
+uploads into separate requests. Uploads are **not atomic**: an error or
+cancellation may leave earlier batches persisted. Content-addressed retries
+deduplicate those blocks. Read streams are not yet admission-controlled.
+HTTP binary batches are capped at 4,096 blocks and reject trailing bytes.
+
+### Opt-in acknowledged replicas
+
+Send `x-kalpak-replicas: N` on HTTP block/batch uploads or as gRPC
+`PutBlocks` request metadata (`N` is 1–16, default 1). A successful request
+with `N > 1` waits for the local write and matching content acknowledgements
+from `N-1` distinct membership nodes. Witnesses do not count. HTTP failures
+return 503; gRPC failures return `UNAVAILABLE`. Invalid policies return
+400 / `INVALID_ARGUMENT`. Peer requests have five-second deadlines and each
+acknowledgement operation has a 30-second deadline.
+
+```sh
+curl --fail-with-body -X POST http://127.0.0.1:7411/v1/blocks \
+    -H 'x-kalpak-replicas: 2' --data-binary @tensor.bin
+```
+
+Write-time acknowledgements require a **Raft-committed replica requirement**
+as well as durable peer copies. This is not yet a replica-location catalog.
+Partial writes may remain after errors or cancellation; retry identical
+content. Mixed-version peers lacking node-ID, storage-generation, cold-verification or retention
+acknowledgements do not count.
+gRPC replicates completed blocks individually over the HTTP peer transport;
+it does not put tensors in Raft. Keep GC disabled. Use mesh mTLS for trusted
+peer identities; local development HTTP cannot protect against malicious
+local processes. Default HTTP replication remains best-effort, and default
+gRPC writes remain local-only unless a replica count is requested.
+
+For opt-in replicated uploads, requirements are persisted before local
+storage/acknowledgement in `replica-requirements.json` using file sync,
+atomic rename and directory sync. Before returning replicated success, the
+desired copy count must also commit through Raft (five-second metadata
+deadline); no tensor bytes enter the log. A serial leader worker resumes after restart,
+visiting up to 16 records per five-second scan and re-uploading content to
+revalidate copies through the current membership. It shares upload admission
+and acknowledgement deadlines. The ledger holds at most 16,384 distinct
+blocks; retries cannot lower a recorded target. A failed upload can leave
+repair intent and partial data. An intent recorded before a failed local
+write cannot be repaired until that source block is uploaded successfully.
+
+Acknowledged peers persist retention pins before accepting a copy. All daemon
+compaction is now refused, even when no replica pins exist: a local binding
+snapshot is not a distributed GC watermark. There is no release API yet.
+Online backups include published repair metadata and upload retention,
+though concurrent backup consistency remains unproven.
+
+### Upload retention and GC safety
+
+Before HTTP single/batch, gRPC batch, repair and replicate-on-read payload
+writes, the daemon syncs non-expiring block guards to `upload-retention.log`.
+Only content hashes enter this journal; tensors still bypass Raft. A guard
+is durable before the payload append or response. Retried hashes deduplicate;
+cancelled/failed requests may leave conservative guards for absent data.
+Bindings do not release guards. These are local retention intents, not yet
+a distributed lease/commit protocol or a guarantee of maintained replication.
+
+Checksummed, sequenced journal batches recover across process crashes. A
+partial final record is truncated and synced before new appends; complete
+corrupt records fail startup. This is process-crash recovery, not proof
+against post-fsync media loss. A write/sync error poisons further guarded
+writes until restart. Capacity is bounded to 1,048,576 distinct hashes and
+128 MiB of journal data; new guards fail closed at capacity. Existing guards
+never expire automatically. `/v1/stats.upload_retention` exposes counts,
+capacity, write-failure status and the GC-blocked reason.
+
+`POST /v1/admin/compact` returns 409; nonzero `--compact-secs` is rejected
+before storage initialization. This protects both new uploads and legacy
+unguarded blocks from unsafe daemon reclamation. The storage library's
+low-level compaction primitive remains available for controlled tests, not
+as an online GC workaround. Older/offline CLI writes do not create daemon
+guards. Do not share a data directory between processes or delete retention
+metadata to reclaim capacity. There is no safe reclamation workflow yet.
+
+Each new guard batch adds a metadata fsync before the payload fsync; no
+throughput improvement is claimed. Backups capture a stable journal after
+segment traversal; the journal-copy lock can delay uploads. Timed
+lease release, safe migration of legacy inventories and a Raft-coordinated
+GC watermark are still required before reclamation can be enabled.
+
+### Replicated upload reservations (opt-in)
+
+The Rust SDK now supports `begin_upload_lease` followed by
+`commit_upload_lease`. Reserve hashes **before** uploading bytes, then commit
+the exact ordered hashes and one binding in a single Raft operation:
+
+```rust,ignore
+let db = KalpakClient::with_signer(base_url, signing_key);
+let agent = db.agent_id().unwrap();
+db.register_agent(agent, "my-agent").await?;
+let block = BlockId::of(&payload);
+let lease = BlockId(unique_random_32_bytes); // application-generated, never reused
+db.begin_upload_lease(lease, vec![block]).await?;
+db.put_block(payload).await?;
+db.commit_upload_lease(lease, key, vec![block], None, 0).await?;
+```
+
+HTTP equivalents are `POST /v1/leases/begin` with
+`{lease, agent, blocks, signature}` and `POST /v1/leases/commit` with
+`{lease, agent, binding: {key, blocks, parent}, expected_revision, signature}`.
+Both endpoints **always** verify Ed25519 signatures, even without
+`--require-signatures` and on forwarded requests. Canonical messages are
+defined by `lease_begin_message` and `lease_commit_message` in `kalpak-core`:
+separate domains, length-prefixed fingerprint strings, ordered hashes,
+complete parent keys and the expected revision. An agent must be registered.
+Fingerprint fields are limited to 1,024 bytes each and parent fingerprints
+must match. These signatures are not cluster-bound; cross-cluster replay and
+the older signing APIs' broader replay limitations remain unresolved.
+
+Reservation IDs are globally single-use within the cluster. An exact begin
+retry acknowledges the existing reservation without reopening it; a changed
+owner or block list conflicts. Commit atomically consumes the reservation
+and updates the binding/refcounts. Exact commit retries acknowledge only:
+they never reapply an older binding. Reusing a consumed ID for a different
+commit, mismatched ownership/hashes or a stale revision returns 409.
+Concurrent first commits at one expected revision cannot both succeed.
+
+Use `lease_revision` from `GET /v1/agents/{agent}/bindings` for updates,
+including its usual read-token protection. Each binding and revision are
+captured under one state lock; the listing is still a local, potentially
+stale read. All binding mutations (including legacy bind and chain-bind)
+advance revisions after the first valid reservation activates the protocol.
+That common Raft command initializes fences at zero on every node, regardless
+of older snapshot positions. Read the revision **after reserving**. Zero
+means an absent key or an imported key not mutated since activation.
+A stale read is rejected at the commit's Raft CAS.
+Legacy writes themselves still do not enforce CAS or namespace ownership;
+this is not a completed multi-tenant authorization protocol.
+
+The current commit endpoint requires blocks locally on both the ingress
+data node and committing data leader; it checks index presence, not fresh
+replica durability. Prefer a data leader with the uploaded bytes; a witness
+leader cannot serve this endpoint. Reservations replicate only metadata and
+do not prove that an upload completed or the requested replica count exists.
+Bytes continue through the existing HTTP/gRPC data plane and local guards.
+
+Limits are 4,096 reservations total, 256 ordered block entries per reservation
+and 65,536 reserved block entries across the cluster. Consumed records remain
+as replay tombstones and still count toward capacity. There is no expiry,
+abort, release, tombstone-pruning or lease-capacity recovery API yet.
+`/v1/stats.replicated_leases` reports local pending/committed counts. Leases
+survive log replay, snapshots and leader changes. No timer releases local
+guards; **all daemon GC remains blocked** pending a safe reclamation protocol.
+
+Committed requirements survive origin loss and leader changes. The leader
+can fetch a missing local source from retained peers, verify its content
+hash and persist it before repairing other copies. Uncommitted local
+intents from failed/older uploads are promoted when a leader is reachable;
+only these uncommitted intents still depend on the source ledger surviving.
+Each ledger and the replicated requirement map are capped at 16,384 blocks.
+The local ledger also persists bounded block/node/storage-generation
+observations (at most 16 locations per block). Each data directory has a
+durable `storage-generation` ID; a fresh directory gets a new ID. A new peer
+generation invalidates its old observations across blocks. Cached locations
+never count alone: fresh, retained-presence probes are required before
+skipping an upload. Missing or unretained copies are uploaded; a partly
+missing HTTP batch may still resend its complete batch payload.
+
+Peer probes use `GET /v1/admin/blocks/{id}/presence`, restricted to the mesh
+listener in mTLS deployments. Probes now read cold payloads and verify their
+content hashes, bypassing warm and pinned caches. One peer verification per
+node runs at a time on the blocking pool; probes wait up to 100 ms for the
+shared verification slot before returning 503. Repair scans remain bounded
+by the existing batch/admission limits; the optional sealed-segment worker
+above does not rate-limit repair probes. Verification costs disk reads even
+when it avoids network tensor transfers.
+Observations are local hints, not a Raft-replicated placement catalog or
+cryptographic storage proofs. A cold verification confirms bytes at that
+instant, not future survival. `/v1/stats` exposes acknowledged replication
+upload attempts so redundant tensor transfers can be checked. Backups
+include the storage-generation ID and observations.
+
+Detected payload corruption is quarantined from normal cache reads and stops
+counting as a healthy copy. Repair verifies incoming bytes, bypasses normal
+deduplication for damaged records, appends and syncs a replacement, then
+publishes its new location. The damaged record is not overwritten in place.
+The repair worker can retrieve a healthy copy from another peer. Runtime
+quarantine flags are not persisted; cold verification redetects damage after
+restart. Structural/header corruption and general I/O failures still need
+broader recovery handling; if no healthy source survives, repair cannot
+invent the missing data. A failed append blocks further writes until restart,
+preventing later writes from being acknowledged beyond an uncertain tail.
+This is not yet an always-maintained replica-count guarantee.
+
+Snapshot payloads now carry a `KLPKSM03` version prefix, including replicated
+leases and binding revisions. The new binary reads `KLPKSM02` and
+legacy snapshots, but old binaries cannot read new commands/snapshots:
+upgrade the entire experimental cluster together, with verified backups;
+mixed-version rolling upgrades and downgrades are unsupported.
+
+The `replica_crash` integration test exercises acknowledged HTTP single,
+HTTP batch and gRPC writes with two real node processes. It kills the
+receiver, verifies the peer without read fallback, kills both processes,
+checks both stores offline, then restarts each node alone and checks every
+payload again. It also checks that failed replication resumes after an
+origin crash and restores the returning peer without client resubmission.
+Isolated nodes must reject new two-replica writes. This is
+process-crash evidence, not a power-loss simulation or a maintained-replica
+guarantee.
 
 Observability reads can demand a token: `--read-token <t>` guards `/v1/stats`, `/v1/ws`, and the agent explorer with `Authorization: Bearer <t>` (the dashboard picks it up from `?token=`); `/metrics` stays open for Prometheus scrapers and the data path is governed by signatures, not the read token.
 

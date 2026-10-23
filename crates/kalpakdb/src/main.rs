@@ -1,12 +1,13 @@
 //! Kalpak node CLI.
 //!
-//!   kalpakdb serve <data-dir> [--addr 127.0.0.1:7411] [--warm-mb 256] [--max-block-mb 256] [--node-id 1] [--join] [--compact-secs 3600]
+//!   kalpakdb serve <data-dir> [--addr 127.0.0.1:7411] [--warm-mb 256] [--max-block-mb 256] [--node-id 1] [--join] [--compact-secs 0]
 //!   kalpakdb witness <data-dir> [--addr ...] [--node-id N]   (consensus-only voter)
 //!   kalpakdb bench <data-dir> [--blocks 2000] [--size-kb 64]
 //!   kalpakdb stress <base-url> [--agents 8] [--secs 10] [--chunk-kb 64]
 //!   kalpakdb put <data-dir>            reads payload from stdin, prints id
 //!   kalpakdb get <data-dir> <block-id> writes payload to stdout
 //!   kalpakdb stat <data-dir>           prints store statistics
+//!   kalpakdb scrub <data-dir> --offline [--mib-per-sec 8] [--restart]
 
 use kalpakdb::server;
 
@@ -34,7 +35,48 @@ fn main() -> ExitCode {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
+        [cmd, dir, rest @ ..] if cmd == "scrub" => {
+            let mut offline = false;
+            let mut restart = false;
+            let mut rate = 8u64;
+            let mut flags = rest.iter();
+            while let Some(flag) = flags.next() {
+                match flag.as_str() {
+                    "--offline" => offline = true,
+                    "--restart" => restart = true,
+                    "--mib-per-sec" => {
+                        rate = flags.next().ok_or("--mib-per-sec needs a value")?.parse()?
+                    }
+                    other => return Err(format!("unknown scrub flag: {other}").into()),
+                }
+            }
+            if !offline {
+                return Err(
+                    "scrub requires --offline: stop all processes using this data directory first"
+                        .into(),
+                );
+            }
+            let rate = rate.checked_mul(1024 * 1024).ok_or("scrub rate overflow")?;
+            let stdout = std::io::stdout();
+            let mut output = stdout.lock();
+            let summary = kalpak_storage::scrub::scrub(
+                std::path::Path::new(dir),
+                rate,
+                restart,
+                |finding| {
+                    serde_json::to_writer(&mut output, finding).map_err(std::io::Error::other)?;
+                    writeln!(output)
+                },
+            )?;
+            serde_json::to_writer(&mut output, &summary)?;
+            writeln!(output)?;
+            if summary.findings != 0 {
+                return Err("physical scrub found damage; preserve the files and investigate before writing".into());
+            }
+            Ok(())
+        }
         [cmd, dir, rest @ ..] if cmd == "serve" || cmd == "witness" => {
+            let mut scrub_rate = None;
             let mut opts = server::ServeOpts {
                 data_dir: dir.clone(),
                 addr: "127.0.0.1:7411".to_string(),
@@ -48,11 +90,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 tls_cert: None,
                 tls_key: None,
                 mesh: None,
-                compact_secs: 3600,
+                // Automatic destructive GC stays opt-in until uploads and
+                // bind commits are protected by a coordinated GC protocol.
+                compact_secs: 0,
             };
             let mut it = rest.iter();
             while let Some(flag) = it.next() {
                 match flag.as_str() {
+                    "--scrub-mib-per-sec" => {
+                        scrub_rate = Some(
+                            it.next()
+                                .ok_or("--scrub-mib-per-sec needs a value")?
+                                .parse()?,
+                        )
+                    }
                     "--addr" => opts.addr = it.next().ok_or("--addr needs a value")?.clone(),
                     "--warm-mb" => {
                         let mb: u64 = it.next().ok_or("--warm-mb needs a value")?.parse()?;
@@ -103,9 +154,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             let rt = tokio::runtime::Runtime::new()?;
             if cmd == "witness" {
+                if scrub_rate.is_some() {
+                    return Err("online scrub is only available on data nodes".into());
+                }
                 rt.block_on(server::serve_witness(opts))
             } else {
-                rt.block_on(server::serve(opts))
+                rt.block_on(server::serve_with_scrub(opts, scrub_rate))
             }
         }
         [cmd, url, rest @ ..] if cmd == "stress" => {
@@ -319,8 +373,9 @@ hosts: {}",
         }
         _ => {
             eprintln!(
-                "usage:\n  kalpakdb serve <data-dir> [--addr 127.0.0.1:7411] [--warm-mb 256] [--max-block-mb 256] [--node-id 1] [--join] [--compact-secs 3600]\n  kalpakdb witness <data-dir> [--addr ...] [--node-id N]   (consensus-only voter)\n  kalpakdb bench <data-dir> [--blocks 2000] [--size-kb 64]\n  kalpakdb stress <base-url> [--agents 8] [--secs 10] [--chunk-kb 64]\n  kalpakdb put <data-dir>            (payload on stdin)\n  kalpakdb get <data-dir> <block-id>\n  kalpakdb stat <data-dir>"
+                "usage:\n  kalpakdb serve <data-dir> [--addr 127.0.0.1:7411] [--warm-mb 256] [--max-block-mb 256] [--node-id 1] [--join] [--compact-secs 0]\n  kalpakdb witness <data-dir> [--addr ...] [--node-id N]   (consensus-only voter)\n  kalpakdb bench <data-dir> [--blocks 2000] [--size-kb 64]\n  kalpakdb stress <base-url> [--agents 8] [--secs 10] [--chunk-kb 64]\n  kalpakdb put <data-dir>            (payload on stdin)\n  kalpakdb get <data-dir> <block-id>\n  kalpakdb stat <data-dir>"
             );
+            eprintln!("  kalpakdb scrub <data-dir> --offline [--mib-per-sec 8] [--restart]");
             Err("invalid arguments".into())
         }
     }

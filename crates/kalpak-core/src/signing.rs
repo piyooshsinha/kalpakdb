@@ -10,10 +10,10 @@
 //! counts are little-endian u32. Domain-separation prefixes keep a signature
 //! for one operation from ever validating another.
 //!
-//! Replay: signatures carry no nonce. All three mutations are idempotent
-//! (re-registering or re-binding identical content is a no-op), so replaying
-//! a captured signature reproduces state that already exists. Capture
-//! resistance on the wire is TLS's job, not the signature's.
+//! Replay: signatures carry no nonce or expected revision. Replaying an
+//! older valid request after a newer mutation can roll state back. TLS does
+//! not resolve that protocol limitation; replay protection needs a versioned
+//! signing format and state-machine enforcement before multi-tenant use.
 
 use ed25519_dalek::{Signature, Signer, SigningKey};
 
@@ -101,10 +101,96 @@ pub fn signature_from_hex(s: &str) -> Result<Signature, crate::Error> {
     Ok(Signature::from_bytes(&bytes))
 }
 
+fn push_lease_key(buf: &mut Vec<u8>, key: &CacheKey) {
+    for value in [
+        &key.fingerprint.model_id,
+        &key.fingerprint.tokenizer_hash,
+        &key.fingerprint.kv_layout,
+    ] {
+        buf.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        buf.extend_from_slice(value.as_bytes());
+    }
+    buf.extend_from_slice(key.prefix_hash.as_bytes());
+}
+
+/// Lease messages use length-prefixed fields and separate domains. Lease IDs
+/// are caller-generated, globally single-use within one cluster's lifetime.
+pub fn lease_begin_message(agent: &AgentId, lease: &BlockId, blocks: &[BlockId]) -> Vec<u8> {
+    let mut buf = b"KLPK/lease/begin/v1\0".to_vec();
+    buf.extend_from_slice(&agent.0);
+    buf.extend_from_slice(lease.as_bytes());
+    buf.extend_from_slice(&(blocks.len() as u64).to_le_bytes());
+    for block in blocks {
+        buf.extend_from_slice(block.as_bytes());
+    }
+    buf
+}
+
+pub fn lease_commit_message(
+    agent: &AgentId,
+    lease: &BlockId,
+    key: &CacheKey,
+    blocks: &[BlockId],
+    parent: Option<&CacheKey>,
+    expected_revision: u64,
+) -> Vec<u8> {
+    let mut buf = b"KLPK/lease/commit/v1\0".to_vec();
+    buf.extend_from_slice(&agent.0);
+    buf.extend_from_slice(lease.as_bytes());
+    buf.extend_from_slice(&expected_revision.to_le_bytes());
+    push_lease_key(&mut buf, key);
+    buf.extend_from_slice(&(blocks.len() as u64).to_le_bytes());
+    for block in blocks {
+        buf.extend_from_slice(block.as_bytes());
+    }
+    buf.push(u8::from(parent.is_some()));
+    if let Some(parent) = parent {
+        push_lease_key(&mut buf, parent);
+    }
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ModelFingerprint;
+
+    #[test]
+    fn lease_domains_lengths_revisions_and_full_parents_are_signed() {
+        let (sk, agent) = agent_and_key();
+        let lease = BlockId::of(b"random-lease-id");
+        let blocks = [BlockId::of(b"data")];
+        let key = key(&[1]);
+        let mut parent = key.clone();
+        let original = lease_commit_message(&agent, &lease, &key, &blocks, Some(&parent), 7);
+        let signature = signature_from_hex(&sign_hex(&sk, &original)).unwrap();
+        parent.fingerprint.model_id.push('\0');
+        assert!(agent
+            .verify(
+                &lease_commit_message(&agent, &lease, &key, &blocks, Some(&parent), 7),
+                &signature
+            )
+            .is_err());
+        assert!(agent
+            .verify(
+                &lease_commit_message(&agent, &lease, &key, &blocks, Some(&key), 8),
+                &signature
+            )
+            .is_err());
+        assert!(agent
+            .verify(&lease_begin_message(&agent, &lease, &blocks), &signature)
+            .is_err());
+        let mut a = key.clone();
+        let mut b = key.clone();
+        a.fingerprint.model_id = "m\0x".into();
+        a.fingerprint.tokenizer_hash = "y".into();
+        b.fingerprint.model_id = "m".into();
+        b.fingerprint.tokenizer_hash = "x\0y".into();
+        assert_ne!(
+            lease_commit_message(&agent, &lease, &a, &blocks, None, 0),
+            lease_commit_message(&agent, &lease, &b, &blocks, None, 0)
+        );
+    }
 
     fn agent_and_key() -> (SigningKey, AgentId) {
         let sk = SigningKey::from_bytes(&[42; 32]);

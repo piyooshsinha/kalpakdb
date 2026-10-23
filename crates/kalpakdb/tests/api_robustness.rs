@@ -90,6 +90,16 @@ async fn batch_endpoint_rejects_malformed_framing_without_crashing() {
     // second block's length prefix is missing entirely
     assert_eq!(post_batch(&client, ADDR, partial).await.as_u16(), 400);
 
+    // A zero-block batch may not smuggle trailing data past its framing.
+    let mut trailing = 0u32.to_le_bytes().to_vec();
+    trailing.push(42);
+    assert_eq!(post_batch(&client, ADDR, trailing).await.as_u16(), 400);
+
+    // Bound per-block metadata even when every payload is empty.
+    let mut excessive = 4097u32.to_le_bytes().to_vec();
+    excessive.resize(4 + 4097 * 4, 0);
+    assert_eq!(post_batch(&client, ADDR, excessive).await.as_u16(), 400);
+
     // The node is still healthy after all that abuse, and a *well-formed*
     // batch still works — proving we rejected the bad input without
     // wedging the server.

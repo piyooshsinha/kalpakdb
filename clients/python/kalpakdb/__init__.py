@@ -311,5 +311,5 @@ class KalpakClient:
         return self._json("GET", f"/v1/agents/{agent}/bindings")["bindings"]
 
     def compact(self) -> dict:
-        """Trigger GC: sweep sealed segments not referenced by any binding."""
+        """Request GC. Raises KalpakError(409) while safe reclamation is blocked."""
         return self._json("POST", "/v1/admin/compact", {})

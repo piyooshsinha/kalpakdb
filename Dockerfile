@@ -26,4 +26,6 @@ EXPOSE 7411
 HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=3 \
     CMD curl -fsS http://127.0.0.1:7411/readyz || exit 1
 ENTRYPOINT ["kalpakdb"]
-CMD ["serve", "/var/lib/kalpakdb", "--addr", "0.0.0.0:7411"]
+# Secure development default. Publishing a port does not bypass the daemon's
+# listener policy; remote HTTP requires an explicitly configured mTLS mesh.
+CMD ["serve", "/var/lib/kalpakdb", "--addr", "127.0.0.1:7411"]

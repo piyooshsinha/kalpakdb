@@ -21,7 +21,13 @@ use serde_json::json;
 use tower_http::cors::CorsLayer;
 
 pub struct AppState {
-    pub store: TieredStore,
+    pub(crate) scrub_slots: Arc<tokio::sync::Semaphore>,
+    pub(crate) online_scrub: crate::online_scrub::Metrics,
+    replica_pushes: std::sync::atomic::AtomicU64,
+    pub(crate) repairs: crate::repair::RepairLog,
+    pub(crate) retention: crate::retention::Retention,
+    pub(crate) uploads: crate::admission::UploadBudget,
+    pub store: Arc<TieredStore>,
     pub data_dir: String,
     pub control: Arc<ControlPlane>,
     /// Client for node-to-node calls (leader forwarding, peer block fetch);
@@ -41,16 +47,6 @@ pub struct AppState {
     pub gc_bytes_reclaimed: std::sync::atomic::AtomicU64,
 }
 
-impl AppState {
-    fn record_gc(&self, st: &kalpak_storage::CompactStats) {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.gc_runs.fetch_add(1, Relaxed);
-        self.gc_blocks_dropped.fetch_add(st.blocks_dropped, Relaxed);
-        self.gc_bytes_reclaimed
-            .fetch_add(st.bytes_reclaimed, Relaxed);
-    }
-}
-
 type Shared = Arc<AppState>;
 
 pub struct ServeOpts {
@@ -63,8 +59,7 @@ pub struct ServeOpts {
     pub bootstrap: bool,
     /// Bind address for the gRPC streaming data plane (None disables it).
     pub grpc_addr: Option<String>,
-    /// Run GC automatically every N seconds (0 disables; the
-    /// `/v1/admin/compact` endpoint always works).
+    /// Must remain zero until coordinated GC is implemented.
     pub compact_secs: u64,
     /// Reject metadata mutations (register/bind) that are not signed by the
     /// owning agent's Ed25519 key.
@@ -140,7 +135,8 @@ async fn boot_control(opts: &ServeOpts) -> Result<Arc<ControlPlane>, Box<dyn std
     )
     .await?;
     if opts.bootstrap {
-        let members = std::collections::BTreeMap::from([(opts.node_id, opts.addr.clone())]);
+        let peer_addr = opts.mesh.as_ref().map_or(&opts.addr, |mesh| &mesh.addr);
+        let members = std::collections::BTreeMap::from([(opts.node_id, peer_addr.clone())]);
         // Re-initialization of an already-formed cluster fails benignly on
         // restart: membership is already in the durable log.
         if let Err(e) = control.init_cluster(members).await {
@@ -150,8 +146,57 @@ async fn boot_control(opts: &ServeOpts) -> Result<Arc<ControlPlane>, Box<dyn std
     Ok(Arc::new(control))
 }
 
+/// Validate transport boundaries before opening storage or starting tasks.
+/// Server-only TLS does not authenticate callers of the legacy Raft API.
+fn validate_listeners(opts: &ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
+    if opts.compact_secs != 0 {
+        return Err(crate::retention::gc_reason().into());
+    }
+    if opts.mesh.is_none() {
+        require_loopback(&opts.addr, "HTTP without mesh mTLS")?;
+    }
+    if let Some(addr) = &opts.grpc_addr {
+        require_loopback(addr, "plaintext gRPC")?;
+    }
+    Ok(())
+}
+
+fn require_loopback(addr: &str, transport: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // Require a literal address: hostname resolution can change between
+    // validation and bind, and must not widen this security boundary.
+    let addr: std::net::SocketAddr = addr.parse().map_err(|_| {
+        format!("{transport} requires a literal loopback bind address (127.0.0.1 or [::1])")
+    })?;
+    if !addr.ip().is_loopback() {
+        return Err(format!(
+            "{transport} may bind only to loopback; configure --mesh for remote HTTP access; remote gRPC requires an authenticated transport not yet implemented"
+        ).into());
+    }
+    Ok(())
+}
+
 pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
+    serve_with_scrub(opts, None).await
+}
+
+pub async fn serve_with_scrub(
+    opts: ServeOpts,
+    scrub_mib_per_sec: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if scrub_mib_per_sec.is_some_and(|rate| !(1..=1024).contains(&rate)) {
+        return Err("--scrub-mib-per-sec must be between 1 and 1024".into());
+    }
+    validate_listeners(&opts)?;
+    let uploads =
+        crate::admission::UploadBudget::new(opts.max_block_bytes.unwrap_or(256 * 1024 * 1024))?;
     let store = TieredStore::open(&opts.data_dir, opts.warm_bytes)?;
+    let retention = crate::retention::Retention::open(std::path::Path::new(&opts.data_dir))?;
+    let scanner = scrub_mib_per_sec
+        .map(|_| {
+            kalpak_storage::online_scrub::OnlineScrubber::open(std::path::Path::new(&opts.data_dir))
+        })
+        .transpose()?;
+    let repairs = crate::repair::RepairLog::open(std::path::Path::new(&opts.data_dir))?;
     let control = boot_control(&opts).await?;
     let (http, peer_scheme) = match &opts.mesh {
         Some(m) => {
@@ -165,7 +210,13 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
         None => (reqwest::Client::new(), "http"),
     };
     let state = Arc::new(AppState {
-        store,
+        scrub_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+        online_scrub: Default::default(),
+        replica_pushes: Default::default(),
+        repairs,
+        retention,
+        uploads,
+        store: Arc::new(store),
         data_dir: opts.data_dir.clone(),
         control,
         http,
@@ -178,34 +229,9 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
         gc_bytes_reclaimed: Default::default(),
     });
 
-    if opts.compact_secs > 0 {
-        let state = state.clone();
-        let every = std::time::Duration::from_secs(opts.compact_secs);
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(every);
-            tick.tick().await; // first tick fires immediately; skip it
-            loop {
-                tick.tick().await;
-                let live = state.control.bound_blocks();
-                let store_state = state.clone();
-                let swept = tokio::task::spawn_blocking(move || {
-                    store_state.store.compact(|id| live.contains(id))
-                })
-                .await;
-                match swept {
-                    Ok(Ok(st)) if st.blocks_dropped > 0 => {
-                        state.record_gc(&st);
-                        eprintln!(
-                            "kalpakdb: gc reclaimed {} bytes ({} blocks, {} segments)",
-                            st.bytes_reclaimed, st.blocks_dropped, st.segments_rewritten
-                        )
-                    }
-                    Ok(Ok(st)) => state.record_gc(&st),
-                    Ok(Err(e)) => eprintln!("kalpakdb: gc failed: {e}"),
-                    Err(e) => eprintln!("kalpakdb: gc task panicked: {e}"),
-                }
-            }
-        });
+    crate::repair::start(state.clone());
+    if let (Some(scanner), Some(rate)) = (scanner, scrub_mib_per_sec) {
+        crate::online_scrub::start(state.clone(), scanner, rate);
     }
 
     if let Some(grpc_addr) = &opts.grpc_addr {
@@ -249,15 +275,25 @@ pub async fn serve(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
         // With a mesh listener present, internal semantics never apply to
         // public traffic: strip the header so it cannot be spoofed to skip
         // signature checks or fan-out suppression.
-        app = app.layer(axum::middleware::from_fn(strip_internal_header));
+        app = app.layer(axum::middleware::from_fn(mesh_public_boundary));
     }
     serve_app(app, &opts).await
 }
 
-async fn strip_internal_header(
+async fn mesh_public_boundary(
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
+    // These operations require a cluster client certificate, not merely
+    // server-side TLS or an observability read token. Deny the namespace,
+    // including future routes, before body parsing or handler execution.
+    let path = req.uri().path();
+    if ["/raft", "/v1/cluster", "/v1/admin"]
+        .iter()
+        .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     req.headers_mut().remove(INTERNAL_HEADER);
     next.run(req).await
 }
@@ -298,8 +334,25 @@ async fn serve_app(app: Router, opts: &ServeOpts) -> Result<(), Box<dyn std::err
 /// but stores no data-plane blocks. This is the lightweight third vote that
 /// gives a two-box deployment strict quorum without a third storage machine.
 pub async fn serve_witness(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
+    validate_listeners(&opts)?;
     let control = boot_control(&opts).await?;
-    let app = witness_router(control.clone());
+    let mut app = witness_router(control.clone());
+    if let Some(mesh) = &opts.mesh {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let config = mesh.server_config()?;
+        let bind: std::net::SocketAddr = mesh.addr.parse()?;
+        let mesh_app = app.clone();
+        tokio::spawn(async move {
+            let config = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(config));
+            if let Err(error) = axum_server::bind_rustls(bind, config)
+                .serve(mesh_app.into_make_service())
+                .await
+            {
+                eprintln!("kalpakdb: witness mesh listener exited: {error}");
+            }
+        });
+        app = app.layer(axum::middleware::from_fn(mesh_public_boundary));
+    }
     eprintln!(
         "kalpakdb witness {} (control dir: {})",
         opts.node_id, opts.data_dir
@@ -319,6 +372,7 @@ fn raft_router(control: Arc<ControlPlane>) -> Router {
         .route("/v1/cluster/init", post(cluster_init))
         .route("/v1/cluster/add-learner", post(cluster_add_learner))
         .route("/v1/cluster/promote", post(cluster_promote))
+        .route("/v1/cluster/replica-requirements", post(require_replicas))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .with_state(control)
@@ -336,6 +390,10 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/blocks", post(put_block))
         .route("/v1/blocks/batch", post(put_blocks_batch))
         .layer(axum::extract::DefaultBodyLimit::max(state.max_block_bytes))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            admit_upload,
+        ))
         .with_state(state.clone());
 
     Router::new()
@@ -344,18 +402,38 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/keys", post(make_key))
         .route("/v1/manifest/bind", post(bind_prefix))
         .route("/v1/manifest/bind-chain", post(bind_chain))
+        .route("/v1/leases/begin", post(crate::leases::begin))
+        .route("/v1/leases/commit", post(crate::leases::commit))
         .route("/v1/manifest/lookup", post(lookup_prefix))
         .route("/v1/stats", get(stats))
         .route("/metrics", get(metrics))
         .route("/v1/ws", get(ws_stats))
         .route("/v1/admin/compact", post(admin_compact))
         .route("/v1/admin/backup", get(admin_backup))
+        .route("/v1/admin/blocks/{id}/presence", get(block_presence))
         .route("/v1/agents/list", get(list_agents))
         .route("/v1/agents/{id}/bindings", get(agent_bindings))
         .with_state(state)
         .merge(block_ingest)
         .merge(raft)
         .layer(CorsLayer::permissive())
+}
+
+async fn admit_upload(
+    State(state): State<Shared>,
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let Ok(lease) = state.uploads.try_acquire() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "upload budget exhausted").into_response();
+    };
+    request.extensions_mut().insert(lease.clone());
+    // Admission precedes body buffering. A slow body cannot hold capacity
+    // forever; dropping this future releases its request reservation.
+    match tokio::time::timeout(std::time::Duration::from_secs(60), next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => StatusCode::REQUEST_TIMEOUT.into_response(),
+    }
 }
 
 fn witness_router(control: Arc<ControlPlane>) -> Router {
@@ -403,7 +481,7 @@ async fn witness_stats(State(c): State<Arc<ControlPlane>>) -> Json<serde_json::V
     }))
 }
 
-struct ApiError(StatusCode, String);
+pub(crate) struct ApiError(pub(crate) StatusCode, pub(crate) String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -426,6 +504,7 @@ impl From<kalpak_control::ControlError> for ApiError {
     fn from(e: kalpak_control::ControlError) -> Self {
         let code = match &e {
             kalpak_control::ControlError::NotLeader { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            kalpak_control::ControlError::Rejected(_) => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         ApiError(code, e.to_string())
@@ -479,17 +558,16 @@ const INTERNAL_HEADER: &str = "x-kalpak-internal";
 
 /// Verify a mutation's signature when the node demands signed writes.
 ///
-/// Node-to-node requests (leader forwarding, replication) skip
-/// re-verification: the ingress node already verified before forwarding,
-/// matching the existing internal trust model.
+/// Forwarding preserves the signed payload. Verify it again even on peer
+/// requests: a caller-controlled loop-prevention header is not identity.
 fn verify_signature(
     s: &AppState,
-    headers: &axum::http::HeaderMap,
+    _headers: &axum::http::HeaderMap,
     agent: &AgentId,
     message: &[u8],
     signature: Option<&str>,
 ) -> Result<(), ApiError> {
-    if !s.require_signatures || headers.contains_key(INTERNAL_HEADER) {
+    if !s.require_signatures {
         return Ok(());
     }
     let Some(sig_hex) = signature else {
@@ -510,7 +588,7 @@ fn verify_signature(
 
 /// If a write failed because this node is a follower, transparently retry it
 /// against the leader and relay the leader's response.
-async fn forward_to_leader(
+pub(crate) async fn forward_to_leader(
     s: &AppState,
     err: kalpak_control::ControlError,
     path: &str,
@@ -546,31 +624,345 @@ async fn forward_to_leader(
     }
 }
 
+pub(crate) fn parse_replicas<E>(value: Option<Result<&str, E>>) -> Result<usize, String> {
+    match value {
+        None => Ok(1),
+        Some(Ok(value)) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=16).contains(n))
+            .ok_or_else(|| "x-kalpak-replicas must be an integer from 1 to 16".to_string()),
+        Some(Err(_)) => Err("invalid x-kalpak-replicas encoding".to_string()),
+    }
+}
+
+async fn block_presence(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let block: BlockId = id.parse()?;
+    let permit = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        state.scrub_slots.clone().acquire_owned(),
+    )
+    .await
+    .map_err(|_| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cold verification busy".to_string(),
+        )
+    })?
+    .map_err(|_| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cold verification unavailable".to_string(),
+        )
+    })?;
+    let store = state.store.clone();
+    let verified = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        store.verify_cold(&block).is_ok()
+    })
+    .await
+    .map_err(|error| ApiError(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(
+        json!({ "id": id, "node_id": state.control.metrics().id,
+        "storage_generation": state.repairs.generation,
+        "present": verified, "cold_verified": verified, "retained": state.repairs.retained(&block) }),
+    ))
+}
+
+async fn bounded_peer_json(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Option<serde_json::Value> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if chunk.len() > limit.saturating_sub(bytes.len()) {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+async fn probe_peer(state: &AppState, node: u64, addr: &str, ids: &[BlockId]) -> Option<String> {
+    let mut incarnation = None;
+    for id in ids {
+        let response = state
+            .http
+            .get(format!(
+                "{}://{addr}/v1/admin/blocks/{id}/presence",
+                state.peer_scheme
+            ))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let value = bounded_peer_json(response, 2048).await?;
+        let generation = value["storage_generation"].as_str()?;
+        if value["node_id"].as_u64() != Some(node)
+            || value["id"].as_str() != Some(&id.to_string())
+            || !crate::repair::valid_generation(generation)
+        {
+            return None;
+        }
+        // Even an absent block can reveal that the entire node incarnation
+        // changed. Invalidate observations before deciding what to upload.
+        state.repairs.observe(&[], node, Some(generation)).ok()?;
+        if value["present"].as_bool() != Some(true)
+            || value["cold_verified"].as_bool() != Some(true)
+            || value["retained"].as_bool() != Some(true)
+        {
+            return None;
+        }
+        if incarnation.as_ref().is_some_and(|old| old != generation) {
+            return None;
+        }
+        incarnation = Some(generation.to_string());
+    }
+    incarnation
+}
+
+/// Count only matching content acknowledgements from distinct membership
+/// identities. A witness has no ingest handler and therefore cannot count.
+pub(crate) async fn acknowledge_replicas(
+    state: &AppState,
+    path: &str,
+    body: bytes::Bytes,
+    expected: serde_json::Value,
+    required: usize,
+    lease: crate::admission::UploadLease,
+) -> Result<(), String> {
+    if required == 1 {
+        return Ok(());
+    }
+    let ids: Vec<BlockId> = if let Some(id) = expected.get("id").and_then(|v| v.as_str()) {
+        vec![id.parse().map_err(|_| "invalid replica block id")?]
+    } else {
+        serde_json::from_value(expected["ids"].clone()).map_err(|_| "invalid replica block ids")?
+    };
+    commit_requirements(state, ids.clone(), required).await?;
+    let store = state.store.clone();
+    let local_ids = ids.clone();
+    tokio::task::spawn_blocking(move || {
+        let _lease = lease;
+        for id in local_ids {
+            store.verify_cold(&id)?;
+        }
+        Ok::<_, kalpak_core::Error>(())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())?;
+    state
+        .repairs
+        .observe(
+            &ids,
+            state.control.metrics().id,
+            Some(&state.repairs.generation),
+        )
+        .map_err(|error| error.to_string())?;
+    let mut peers = state.control.peer_nodes();
+    let known = ids
+        .first()
+        .map(|id| state.repairs.known_nodes(id))
+        .unwrap_or_default();
+    peers.sort_by_key(|(node, _)| (!known.contains(node), *node));
+    if peers.len() + 1 < required {
+        return Err(format!(
+            "need {required} replicas, membership has only {} nodes; local write may already exist",
+            peers.len() + 1
+        ));
+    }
+    let operation = async {
+        let mut acknowledged = 1usize;
+        let mut endpoints = std::collections::HashSet::new();
+        for (node_id, addr) in peers {
+            if !endpoints.insert(addr.clone()) {
+                continue;
+            }
+            if let Some(generation) = probe_peer(state, node_id, &addr, &ids).await {
+                state
+                    .repairs
+                    .observe(&ids, node_id, Some(&generation))
+                    .map_err(|error| error.to_string())?;
+                acknowledged += 1;
+                if acknowledged >= required {
+                    return Ok(());
+                }
+                continue;
+            }
+            state
+                .repairs
+                .observe(&ids, node_id, None)
+                .map_err(|error| error.to_string())?;
+            state
+                .replica_pushes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let response = state
+                .http
+                .post(format!("{}://{addr}{path}", state.peer_scheme))
+                .header(INTERNAL_HEADER, "1")
+                .header("x-kalpak-retain-replica", "1")
+                .body(body.clone())
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await;
+            if let Ok(response) = response {
+                if response.status().is_success() {
+                    if let Some(value) = bounded_peer_json(response, 512 * 1024).await {
+                        if value["node_id"].as_u64() == Some(node_id)
+                            && value["retained"].as_bool() == Some(true)
+                            && value["cold_verified"].as_bool() == Some(true)
+                            && value["storage_generation"]
+                                .as_str()
+                                .is_some_and(crate::repair::valid_generation)
+                            && expected
+                                .as_object()
+                                .unwrap()
+                                .iter()
+                                .all(|(k, v)| value.get(k) == Some(v))
+                        {
+                            state
+                                .repairs
+                                .observe(&ids, node_id, value["storage_generation"].as_str())
+                                .map_err(|error| error.to_string())?;
+                            acknowledged += 1;
+                            if acknowledged >= required {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Err(format!("need {required} replicas, received {acknowledged} durable acknowledgements; partial writes may exist"))
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), operation)
+        .await
+        .map_err(|_| {
+            "replica acknowledgement deadline exceeded; partial writes may exist".to_string()
+        })?
+}
+
+pub(crate) async fn commit_requirements(
+    state: &AppState,
+    blocks: Vec<BlockId>,
+    replicas: usize,
+) -> Result<(), String> {
+    let operation = async {
+        match state
+            .control
+            .require_replicas(blocks.clone(), replicas)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(kalpak_control::ControlError::NotLeader {
+                leader_addr: Some(addr),
+            }) => {
+                let response = state
+                    .http
+                    .post(format!(
+                        "{}://{addr}/v1/cluster/replica-requirements",
+                        state.peer_scheme
+                    ))
+                    .json(&json!({"blocks": blocks, "replicas": replicas}))
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if response.status().is_success() {
+                    Ok(())
+                } else {
+                    Err("leader rejected replica requirements".to_string())
+                }
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), operation)
+        .await
+        .map_err(|_| "replica requirement consensus deadline exceeded".to_string())?
+}
+
+#[derive(Deserialize)]
+struct ReplicaRequirementsReq {
+    blocks: Vec<BlockId>,
+    replicas: usize,
+}
+
+async fn require_replicas(
+    State(control): State<Arc<ControlPlane>>,
+    Json(request): Json<ReplicaRequirementsReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    control
+        .require_replicas(request.blocks, request.replicas)
+        .await?;
+    Ok(Json(json!({"committed": true})))
+}
+
 async fn put_block(
     State(s): State<Shared>,
+    axum::Extension(lease): axum::Extension<crate::admission::UploadLease>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let id = s.store.put(&body)?;
+    let replicas = parse_replicas(headers.get("x-kalpak-replicas").map(|v| v.to_str()))
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
+    s.retention
+        .protect(&[BlockId::of(&body)])
+        .map_err(kalpak_core::Error::from)?;
+    if replicas > 1 || headers.contains_key("x-kalpak-retain-replica") {
+        s.repairs
+            .record(&[BlockId::of(&body)], replicas)
+            .map_err(kalpak_core::Error::from)?;
+    }
+    let id = if replicas > 1 || headers.contains_key("x-kalpak-retain-replica") {
+        s.store.repair(&BlockId::of(&body), &body)?
+    } else {
+        s.store.put(&body)?
+    };
+    if replicas > 1 {
+        acknowledge_replicas(
+            &s,
+            "/v1/blocks",
+            body.clone(),
+            json!({"id": id.to_string()}),
+            replicas,
+            lease.clone(),
+        )
+        .await
+        .map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    }
     // Proactive replication: push the block to every data peer in the
     // background so reads anywhere are local. Witnesses simply reject the
     // route. Internal pushes never fan out further.
-    if !headers.contains_key(INTERNAL_HEADER) {
+    if replicas == 1 && !headers.contains_key(INTERNAL_HEADER) {
         let state = s.clone();
         let payload = body.clone();
         tokio::spawn(async move {
+            let _lease = lease;
             for peer in state.control.peer_addrs() {
                 let _ = state
                     .http
                     .post(format!("{}://{peer}/v1/blocks", state.peer_scheme))
                     .header(INTERNAL_HEADER, "1")
                     .body(payload.clone())
+                    .timeout(std::time::Duration::from_secs(30))
                     .send()
                     .await;
             }
         });
     }
-    Ok(Json(json!({ "id": id.to_string(), "bytes": body.len() })))
+    Ok(Json(
+        json!({ "id": id.to_string(), "bytes": body.len(), "node_id": s.control.metrics().id,
+            "storage_generation": s.repairs.generation,
+            "cold_verified": replicas > 1 || headers.contains_key("x-kalpak-retain-replica"),
+            "retained": replicas > 1 || headers.contains_key("x-kalpak-retain-replica") }),
+    ))
 }
 
 /// Batch block upload with one group-committed fsync.
@@ -579,14 +971,20 @@ async fn put_block(
 /// `u32 len` + `len` payload bytes. Replies with the ids in input order.
 async fn put_blocks_batch(
     State(s): State<Shared>,
+    axum::Extension(lease): axum::Extension<crate::admission::UploadLease>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let replicas = parse_replicas(headers.get("x-kalpak-replicas").map(|v| v.to_str()))
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
     let bad = |m: &str| ApiError(StatusCode::BAD_REQUEST, m.to_string());
     if body.len() < 4 {
         return Err(bad("truncated batch header"));
     }
     let count = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+    if count > 4096 {
+        return Err(bad("batch exceeds 4096 blocks"));
+    }
     // `count` is attacker-controlled: never pre-allocate from it directly,
     // or a 4-byte body claiming u32::MAX blocks would try to reserve tens of
     // GB and abort the process. Every block contributes at least a 4-byte
@@ -606,25 +1004,67 @@ async fn put_blocks_batch(
         payloads.push(&body[at..at + len]);
         at += len;
     }
+    if at != body.len() {
+        return Err(bad("trailing bytes after batch"));
+    }
+    let guarded: Vec<_> = payloads
+        .iter()
+        .map(|payload| BlockId::of(payload))
+        .collect();
+    s.retention
+        .protect(&guarded)
+        .map_err(kalpak_core::Error::from)?;
+    if replicas > 1 || headers.contains_key("x-kalpak-retain-replica") {
+        let ids: Vec<_> = payloads
+            .iter()
+            .map(|payload| BlockId::of(payload))
+            .collect();
+        s.repairs
+            .record(&ids, replicas)
+            .map_err(kalpak_core::Error::from)?;
+    }
     let ids = s.store.put_many(payloads.iter().copied())?;
+    if replicas > 1 || headers.contains_key("x-kalpak-retain-replica") {
+        for (id, payload) in ids.iter().zip(&payloads) {
+            s.store.repair(id, payload)?;
+        }
+    }
+    let ids_json = json!(ids.iter().map(|id| id.to_string()).collect::<Vec<_>>());
+    if replicas > 1 {
+        acknowledge_replicas(
+            &s,
+            "/v1/blocks/batch",
+            body.clone(),
+            json!({"ids": ids_json}),
+            replicas,
+            lease.clone(),
+        )
+        .await
+        .map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    }
 
-    if !headers.contains_key(INTERNAL_HEADER) {
+    if replicas == 1 && !headers.contains_key(INTERNAL_HEADER) {
         let state = s.clone();
         let raw = body.clone();
         tokio::spawn(async move {
+            let _lease = lease;
             for peer in state.control.peer_addrs() {
                 let _ = state
                     .http
                     .post(format!("{}://{peer}/v1/blocks/batch", state.peer_scheme))
                     .header(INTERNAL_HEADER, "1")
                     .body(raw.clone())
+                    .timeout(std::time::Duration::from_secs(30))
                     .send()
                     .await;
             }
         });
     }
     Ok(Json(json!({
-        "ids": ids.iter().map(|i| i.to_string()).collect::<Vec<_>>()
+        "ids": ids_json, "node_id": s.control.metrics().id,
+        "storage_generation": s.repairs.generation,
+        "cold_verified": replicas > 1 || headers.contains_key("x-kalpak-retain-replica"),
+        "retained": replicas > 1 || headers.contains_key("x-kalpak-retain-replica")
     })))
 }
 
@@ -659,6 +1099,9 @@ async fn get_block(
                 if BlockId::of(&bytes) != id {
                     continue;
                 }
+                s.retention
+                    .protect(&[id])
+                    .map_err(kalpak_core::Error::from)?;
                 s.store.put(&bytes)?;
                 return Ok(bytes.to_vec());
             }
@@ -946,22 +1389,12 @@ async fn raft_snapshot(
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))
 }
 
-/// Garbage-collect sealed segments: every block referenced by a
-/// Raft-replicated binding is live; everything else in sealed segments is
-/// swept. The active segment is never touched, which is the grace window
-/// for the put-then-bind two-phase write.
-async fn admin_compact(State(s): State<Shared>) -> Result<Json<serde_json::Value>, ApiError> {
-    let live = s.control.bound_blocks();
-    let state = s.clone();
-    let stats = tokio::task::spawn_blocking(move || state.store.compact(|id| live.contains(id)))
-        .await
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
-    s.record_gc(&stats);
-    Ok(Json(json!({
-        "segments_rewritten": stats.segments_rewritten,
-        "blocks_dropped": stats.blocks_dropped,
-        "bytes_reclaimed": stats.bytes_reclaimed,
-    })))
+/// Local bindings are not a coordinated distributed reclamation watermark.
+async fn admin_compact(State(_s): State<Shared>) -> Result<Json<serde_json::Value>, ApiError> {
+    Err(ApiError(
+        StatusCode::CONFLICT,
+        crate::retention::gc_reason().to_string(),
+    ))
 }
 
 /// The "mind explorer" listing: every registered agent, oldest first.
@@ -997,9 +1430,9 @@ async fn agent_bindings(
     let parents = s.control.parent_index();
     let bindings: Vec<_> = s
         .control
-        .bindings_of(&agent)
+        .bindings_with_revisions(&agent)
         .into_iter()
-        .map(|(key, blocks)| {
+        .map(|(key, blocks, revision)| {
             let extends = parents.get(&key).map(|p| {
                 serde_json::from_str::<serde_json::Value>(p)
                     .ok()
@@ -1011,6 +1444,7 @@ async fn agent_bindings(
                     .unwrap_or(serde_json::Value::String(key)),
                 "blocks": blocks.iter().map(|b| b.to_string()).collect::<Vec<_>>(),
                 "extends": extends,
+                "lease_revision": revision,
             })
         })
         .collect();
@@ -1030,12 +1464,20 @@ async fn agent_bindings(
 /// exactly "the node as of some moment during the backup".
 async fn admin_backup(State(s): State<Shared>) -> Result<Response, ApiError> {
     let data_dir = s.data_dir.clone();
+    let backup_state = s.clone();
     let tar_path =
         tokio::task::spawn_blocking(move || -> Result<std::path::PathBuf, std::io::Error> {
             let tmp = tempfile::NamedTempFile::new()?;
             let (file, path) = tmp.keep().map_err(|e| e.error)?;
             let mut builder = tar::Builder::new(std::io::BufWriter::new(file));
             let root = std::path::Path::new(&data_dir);
+            builder.append_path_with_name(root.join("storage-generation"), "storage-generation")?;
+            // Published intent is replaced atomically; never include its
+            // unfinished .pending file. Capture it before segment traversal.
+            let requirements = root.join("replica-requirements.json");
+            if requirements.exists() {
+                builder.append_path_with_name(requirements, "replica-requirements.json")?;
+            }
             // 1. control plane first (see ordering argument above)
             let control = root.join("control");
             if control.is_dir() {
@@ -1049,6 +1491,9 @@ async fn admin_backup(State(s): State<Shared>) -> Result<Response, ApiError> {
                     builder.append_path_with_name(entry.path(), &name)?;
                 }
             }
+            // Capture guards after segments so every copied upload is covered.
+            // The journal lock prevents a partially appended retention frame.
+            backup_state.retention.archive(&mut builder, root)?;
             builder.into_inner()?;
             Ok(path)
         })
@@ -1070,6 +1515,7 @@ async fn admin_backup(State(s): State<Shared>) -> Result<Response, ApiError> {
 }
 
 fn stats_payload(s: &AppState) -> serde_json::Value {
+    let (lease_total, lease_pending) = s.control.upload_lease_counts();
     let cold = s.store.cold().stats();
     let tier = s.store.tier_stats();
     let raft = s.control.metrics();
@@ -1103,6 +1549,14 @@ fn stats_payload(s: &AppState) -> serde_json::Value {
             "blocks_dropped": s.gc_blocks_dropped.load(std::sync::atomic::Ordering::Relaxed),
             "bytes_reclaimed": s.gc_bytes_reclaimed.load(std::sync::atomic::Ordering::Relaxed),
         },
+        "repair": {
+            "acknowledged_replication_upload_attempts": s.replica_pushes.load(std::sync::atomic::Ordering::Relaxed),
+        },
+        "online_scrub": s.online_scrub.snapshot(),
+        "upload_retention": s.retention.snapshot(),
+        "replicated_leases": {"total": lease_total, "pending": lease_pending,
+            "committed": lease_total - lease_pending, "capacity": kalpak_control::MAX_LEASES,
+            "automatic_expiry": false, "gc_enabled": false},
     })
 }
 
@@ -1269,6 +1723,29 @@ async fn stream_stats(mut socket: WebSocket, s: Shared) {
         let payload = stats_payload(&s).to_string();
         if socket.send(Message::Text(payload.into())).await.is_err() {
             break;
+        }
+    }
+}
+
+#[cfg(test)]
+mod listener_tests {
+    use super::require_loopback;
+
+    #[test]
+    fn unauthenticated_transports_require_literal_loopback() {
+        for addr in ["127.0.0.1:7411", "127.0.0.2:7411", "[::1]:7411"] {
+            assert!(require_loopback(addr, "test").is_ok(), "{addr}");
+        }
+        for addr in [
+            "0.0.0.0:7411",
+            "[::]:7411",
+            "192.168.1.2:7411",
+            "[::ffff:127.0.0.1]:7411",
+            "localhost:7411",
+            "example.com:7411",
+            "not an address",
+        ] {
+            assert!(require_loopback(addr, "test").is_err(), "{addr}");
         }
     }
 }

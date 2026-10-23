@@ -11,6 +11,8 @@
 //! the node's API server wires `/raft/*` to the [`ControlPlane::handle_*`]
 //! methods. The Raft log and vote are durable when a data directory is given.
 
+mod durability;
+mod leases;
 mod log_store;
 mod network;
 mod state_machine;
@@ -28,6 +30,7 @@ use openraft::raft::{
 };
 use openraft::{BasicNode, Config, Raft};
 
+pub use leases::{LeaseState, UploadLease, MAX_LEASES, MAX_LEASE_BLOCKS};
 pub use state_machine::{AgentRecord, BindingRecord, MetadataState};
 pub use types::{ChainBinding, NodeId, Request, Response, TypeConfig};
 
@@ -42,6 +45,8 @@ pub enum ControlError {
     Init(String),
     #[error("raft write: {0}")]
     Write(String),
+    #[error("metadata request rejected: {0}")]
+    Rejected(String),
     #[error("raft membership: {0}")]
     Membership(String),
     /// This node is a follower; the caller should retry against the leader.
@@ -84,12 +89,30 @@ impl ControlPlane {
                 .map_err(|e| ControlError::Init(e.to_string()))?,
         );
 
-        let log_store = match data_dir {
+        let mut log_store = match data_dir {
             Some(dir) => LogStore::open(dir.join("control"))
                 .map_err(|e| ControlError::Init(e.to_string()))?,
             None => LogStore::in_memory(),
         };
-        let sm = StateMachineStore::default();
+        let sm = match data_dir {
+            Some(dir) => StateMachineStore::open(dir.join("control"))
+                .map_err(|e| ControlError::Init(format!("snapshot recovery: {e}")))?,
+            None => StateMachineStore::default(),
+        };
+        // An older deployment may already have purged logs while its only
+        // snapshot was volatile. Do not start an apparently healthy empty
+        // node when the discarded state cannot be reconstructed.
+        let log_state = openraft::storage::RaftLogStorage::get_log_state(&mut log_store)
+            .await
+            .map_err(|e| ControlError::Init(format!("log recovery: {e}")))?;
+        if let Some(purged) = log_state.last_purged_log_id {
+            let applied = sm.state.read().unwrap().last_applied;
+            if !applied.is_some_and(|id| id.index >= purged.index) {
+                return Err(ControlError::Init(
+                    "purged Raft logs require a durable snapshot; recover from a healthy peer or verified backup".to_string(),
+                ));
+            }
+        }
 
         let network = match mesh {
             Some(m) => HttpNetworkFactory::with_mesh_tls(m)
@@ -157,6 +180,130 @@ impl ControlPlane {
         .map(|_| ())
     }
 
+    pub async fn begin_upload_lease(
+        &self,
+        lease: BlockId,
+        agent: AgentId,
+        blocks: Vec<BlockId>,
+    ) -> Result<(), ControlError> {
+        match self
+            .write(Request::BeginUploadLease {
+                lease,
+                agent,
+                blocks,
+            })
+            .await?
+        {
+            Response::LeaseReserved => Ok(()),
+            Response::Rejected(message) => Err(ControlError::Rejected(message)),
+            _ => Err(ControlError::Write("unexpected lease response".into())),
+        }
+    }
+
+    pub async fn commit_upload_lease(
+        &self,
+        lease: BlockId,
+        agent: AgentId,
+        binding: ChainBinding,
+        expected_revision: u64,
+    ) -> Result<(), ControlError> {
+        match self
+            .write(Request::CommitUploadLease {
+                lease,
+                agent,
+                binding,
+                expected_revision,
+            })
+            .await?
+        {
+            Response::Bound => Ok(()),
+            Response::Rejected(message) => Err(ControlError::Rejected(message)),
+            _ => Err(ControlError::Write(
+                "unexpected lease commit response".into(),
+            )),
+        }
+    }
+
+    /// Local diagnostic view; callers needing authority must issue a Raft write.
+    pub fn upload_lease(&self, id: &BlockId) -> Option<UploadLease> {
+        self.sm
+            .state
+            .read()
+            .unwrap()
+            .leases
+            .records
+            .get(id)
+            .cloned()
+    }
+
+    pub fn upload_lease_counts(&self) -> (usize, usize) {
+        let state = self.sm.state.read().unwrap();
+        (
+            state.leases.records.len(),
+            state
+                .leases
+                .records
+                .values()
+                .filter(|lease| lease.committed.is_none())
+                .count(),
+        )
+    }
+
+    pub fn binding_revision(&self, key: &CacheKey) -> u64 {
+        self.sm
+            .state
+            .read()
+            .unwrap()
+            .leases
+            .revisions
+            .get(&binding_key(key))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub async fn require_replicas(
+        &self,
+        blocks: Vec<BlockId>,
+        replicas: usize,
+    ) -> Result<(), ControlError> {
+        if !(2..=16).contains(&replicas) || blocks.len() > 4096 {
+            return Err(ControlError::Write(
+                "invalid replica requirements".to_string(),
+            ));
+        }
+        if self.metrics().current_leader == Some(self.metrics().id)
+            && blocks.iter().all(|id| {
+                self.sm
+                    .state
+                    .read()
+                    .unwrap()
+                    .replica_requirements
+                    .get(id)
+                    .is_some_and(|n| *n >= replicas)
+            })
+        {
+            self.raft
+                .ensure_linearizable()
+                .await
+                .map_err(|e| ControlError::Write(e.to_string()))?;
+            return Ok(());
+        }
+        match self
+            .write(Request::RequireReplicas { blocks, replicas })
+            .await?
+        {
+            Response::ReplicasRequired => Ok(()),
+            Response::Rejected(message) => Err(ControlError::Write(message)),
+            _ => Err(ControlError::Write(
+                "unexpected replica response".to_string(),
+            )),
+        }
+    }
+
+    pub fn replica_requirements(&self) -> BTreeMap<BlockId, usize> {
+        self.sm.state.read().unwrap().replica_requirements.clone()
+    }
+
     pub async fn bind_prefix(
         &self,
         agent: AgentId,
@@ -214,13 +361,21 @@ impl ControlPlane {
 
     /// Addresses of all current cluster members except this node.
     pub fn peer_addrs(&self) -> Vec<String> {
+        self.peer_nodes()
+            .into_iter()
+            .map(|(_, addr)| addr)
+            .collect()
+    }
+
+    /// Stable node identities paired with the current peer endpoints.
+    pub fn peer_nodes(&self) -> Vec<(u64, String)> {
         let metrics = self.metrics();
         let self_id = metrics.id;
         metrics
             .membership_config
             .nodes()
             .filter(|(id, _)| **id != self_id)
-            .map(|(_, node)| node.addr.clone())
+            .map(|(id, node)| (*id, node.addr.clone()))
             .collect()
     }
 
@@ -280,6 +435,24 @@ impl ControlPlane {
             .iter()
             .filter(|(_, rec)| rec.agent == *agent)
             .map(|(k, rec)| (k.clone(), rec.blocks.clone()))
+            .collect()
+    }
+
+    /// Capture each binding and its revision under one state lock. A stale
+    /// local view is safe to use as a CAS hint, but not as GC authority.
+    pub fn bindings_with_revisions(&self, agent: &AgentId) -> Vec<(String, Vec<BlockId>, u64)> {
+        let state = self.sm.state.read().unwrap();
+        state
+            .bindings
+            .iter()
+            .filter(|(_, binding)| binding.agent == *agent)
+            .map(|(key, binding)| {
+                (
+                    key.clone(),
+                    binding.blocks.clone(),
+                    state.leases.revisions.get(key).copied().unwrap_or(0),
+                )
+            })
             .collect()
     }
 
@@ -482,5 +655,83 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert_eq!(cp.agent(&a).unwrap().display_name, "survivor");
+    }
+
+    #[tokio::test]
+    async fn durable_snapshot_survives_log_purge_and_restart() {
+        use openraft::storage::{RaftLogStorage, RaftStateMachine};
+        let dir = tempfile::tempdir().unwrap();
+        let a = agent(9);
+        let k = key(&[80, 81]);
+        let blocks = vec![BlockId::of(b"durable-snapshot")];
+        let cp = ControlPlane::start_node(1, Some(dir.path())).await.unwrap();
+        cp.init_cluster(BTreeMap::from([(1, "local".to_string())]))
+            .await
+            .unwrap();
+        cp.register_agent(a, "snapshotted").await.unwrap();
+        cp.bind_prefix(a, k.clone(), blocks.clone(), None)
+            .await
+            .unwrap();
+        let index = cp.metrics().last_applied.unwrap().index;
+        cp.snapshot().await.unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut sm = cp.sm.clone();
+        loop {
+            if sm
+                .get_current_snapshot()
+                .await
+                .unwrap()
+                .is_some_and(|s| s.meta.last_log_id.is_some_and(|id| id.index >= index))
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "snapshot did not complete"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        cp.raft.trigger().purge_log(index).await.unwrap();
+        loop {
+            let mut log = LogStore::open(dir.path().join("control")).unwrap();
+            if log
+                .get_log_state()
+                .await
+                .unwrap()
+                .last_purged_log_id
+                .is_some_and(|l| l.index >= index)
+            {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "logs did not purge");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        cp.raft.shutdown().await.unwrap();
+        drop(cp);
+        drop(sm);
+        let restarted = ControlPlane::start_node(1, Some(dir.path())).await.unwrap();
+        // Immediately available from the durable snapshot, without waiting
+        // for election or a peer to reconstruct discarded log entries.
+        assert_eq!(restarted.agent(&a).unwrap().display_name, "snapshotted");
+        assert_eq!(restarted.lookup(&k).unwrap().blocks, blocks);
+        restarted.raft.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_snapshot_after_purge_fails_startup() {
+        use openraft::storage::RaftLogStorage;
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = LogStore::open(dir.path().join("control")).unwrap();
+        log.purge(openraft::LogId::new(
+            openraft::CommittedLeaderId::new(1, 1),
+            7,
+        ))
+        .await
+        .unwrap();
+        drop(log);
+        let result = ControlPlane::start_node(1, Some(dir.path())).await;
+        assert!(
+            matches!(result, Err(ControlError::Init(message)) if message.contains("durable snapshot"))
+        );
     }
 }

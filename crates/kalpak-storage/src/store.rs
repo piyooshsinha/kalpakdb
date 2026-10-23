@@ -33,6 +33,34 @@ pub struct BlockStore<B: IoBackend = StdBackend> {
     /// Append position in the active (last) segment. Serializes writers.
     append: Mutex<u64>,
     roll_bytes: u64,
+    write_failed: std::sync::atomic::AtomicBool,
+    foreground_reads: std::sync::atomic::AtomicUsize,
+}
+
+struct ReadActivity<'a>(&'a std::sync::atomic::AtomicUsize);
+impl Drop for ReadActivity<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+pub(crate) struct SealedScrubView<F> {
+    pub file: Arc<F>,
+    pub generation: String,
+    pub length: u64,
+}
+
+struct AppendAttempt<'a> {
+    failed: &'a std::sync::atomic::AtomicBool,
+    committed: bool,
+}
+impl Drop for AppendAttempt<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.failed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
 }
 
 /// Outcome of [`BlockStore::verify_all`].
@@ -106,6 +134,7 @@ impl<B: IoBackend> BlockStore<B> {
         }
         if files.is_empty() {
             files.push(Arc::new(backend.open(&segment_path(&dir, 0))?));
+            std::fs::File::open(&dir)?.sync_all()?;
             tail = 0;
         }
 
@@ -113,6 +142,8 @@ impl<B: IoBackend> BlockStore<B> {
             backend,
             dir,
             index: RwLock::new(index),
+            write_failed: std::sync::atomic::AtomicBool::new(false),
+            foreground_reads: std::sync::atomic::AtomicUsize::new(0),
             files: RwLock::new(files),
             append: Mutex::new(tail),
             roll_bytes: DEFAULT_SEGMENT_ROLL_BYTES,
@@ -135,6 +166,22 @@ impl<B: IoBackend> BlockStore<B> {
     where
         I: IntoIterator<Item = &'a [u8]>,
     {
+        self.put_many_inner(payloads, false)
+    }
+
+    /// Replace an unreadable/corrupt indexed record by appending a verified
+    /// new generation. Never overwrite the damaged record in place.
+    pub fn repair(&self, id: &BlockId, payload: &[u8]) -> Result<BlockId, Error> {
+        if !id.verify(payload) {
+            return Err(Error::Corrupt { id: *id });
+        }
+        Ok(self.put_many_inner(std::iter::once(payload), true)?[0])
+    }
+
+    fn put_many_inner<'a, I>(&self, payloads: I, repair: bool) -> Result<Vec<BlockId>, Error>
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
         // Hash outside any lock.
         let prepared: Vec<(BlockId, &[u8])> =
             payloads.into_iter().map(|p| (BlockId::of(p), p)).collect();
@@ -142,6 +189,16 @@ impl<B: IoBackend> BlockStore<B> {
 
         // Writers serialize on the tail; readers are untouched by this lock.
         let mut tail = self.append.lock().unwrap();
+        if self.write_failed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(std::io::Error::other(
+                "append failed previously; restart storage before further writes",
+            )
+            .into());
+        }
+        let mut attempt = AppendAttempt {
+            failed: &self.write_failed,
+            committed: false,
+        };
         let mut active = {
             let files = self.files.read().unwrap();
             (files.len() as u32 - 1, Arc::clone(files.last().unwrap()))
@@ -150,13 +207,17 @@ impl<B: IoBackend> BlockStore<B> {
         // Records staged for the current active file, flushed as one
         // batched submission (a single ring round on the uring backend).
         let mut pending: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut rolled = false;
 
         for (id, payload) in &prepared {
             // The append lock is held, so the index check is race-free with
             // other writers; `staged` covers duplicates within this batch.
-            if self.index.read().unwrap().contains_key(id)
-                || staged.iter().any(|(sid, _)| sid == id)
-            {
+            let present = if repair {
+                self.get(id).is_ok()
+            } else {
+                self.index.read().unwrap().contains_key(id)
+            };
+            if present || staged.iter().any(|(sid, _)| sid == id) {
                 continue;
             }
             let record = segment::encode_record(id, payload);
@@ -175,6 +236,7 @@ impl<B: IoBackend> BlockStore<B> {
                     (seg_id, Arc::clone(files.last().unwrap()))
                 };
                 active = new_file;
+                rolled = true;
                 *tail = 0;
             }
 
@@ -195,6 +257,9 @@ impl<B: IoBackend> BlockStore<B> {
         // Readers keep reading sealed records throughout: no shared lock
         // is held here.
         flush_pending(active.1.as_ref(), &mut pending, true)?;
+        if rolled {
+            std::fs::File::open(&self.dir)?.sync_all()?;
+        }
 
         // Publish only after the data is durable.
         if !staged.is_empty() {
@@ -203,22 +268,24 @@ impl<B: IoBackend> BlockStore<B> {
                 index.insert(id, loc);
             }
         }
+        attempt.committed = true;
         Ok(ids)
     }
 
     /// Fetch a block, verifying its hash before returning.
     pub fn get(&self, id: &BlockId) -> Result<Vec<u8>, Error> {
-        let loc = *self
-            .index
-            .read()
-            .unwrap()
-            .get(id)
-            .ok_or(Error::BlockNotFound(*id))?;
-
-        // Clone the segment handle under a brief lock, then read with no
-        // lock held: indexed records are immutable, and an in-flight fsync
-        // on the active segment cannot block this path.
-        let file = Arc::clone(&self.files.read().unwrap()[loc.segment as usize]);
+        self.foreground_reads
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let _activity = ReadActivity(&self.foreground_reads);
+        // Capture the location and matching file generation under the same
+        // index guard. Compaction takes these locks in this order too, so a
+        // reader cannot combine an old offset with the replacement file.
+        let (loc, file) = {
+            let index = self.index.read().unwrap();
+            let loc = *index.get(id).ok_or(Error::BlockNotFound(*id))?;
+            let file = Arc::clone(&self.files.read().unwrap()[loc.segment as usize]);
+            (loc, file)
+        };
         let mut payload = vec![0u8; loc.payload_len as usize];
         file.read_at(&mut payload, loc.offset + HEADER_LEN as u64)?;
 
@@ -232,12 +299,14 @@ impl<B: IoBackend> BlockStore<B> {
     ///
     /// Rewrites every sealed segment that contains records for which
     /// `live(id)` is false, dropping the dead records. The active segment is
-    /// never touched — recent writes stay safe through the two-phase write
-    /// window (put first, bind through consensus after), since anything not
-    /// yet bound is still in or near the active segment.
+    /// never touched. This alone is NOT a safe put-then-bind grace window:
+    /// unbound uploads can roll into sealed segments before their binds.
+    /// Callers must supply a coordinated safe live set or use this only on
+    /// an exclusively controlled store. The daemon disables this operation
+    /// until a distributed reclamation protocol exists.
     ///
-    /// Readers are never blocked: each rewrite happens into a tmp file that
-    /// atomically replaces the segment, and in-flight readers keep reading
+    /// Payload reads use pinned handles: each rewrite happens into a tmp file
+    /// that atomically replaces the segment, and in-flight readers keep reading
     /// their own `Arc`'d handle of the old file, which stays valid until
     /// dropped. The index and file table swap together under brief locks.
     pub fn compact(&self, live: impl Fn(&BlockId) -> bool) -> Result<CompactStats, Error> {
@@ -270,6 +339,12 @@ impl<B: IoBackend> BlockStore<B> {
             // through the current handle (no locks held during I/O).
             let old = Arc::clone(&self.files.read().unwrap()[seg as usize]);
             let tmp_path = self.dir.join(format!("seg-{seg:08}.klpk.compact"));
+            // A previous interrupted rewrite may have left a longer file.
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&tmp_path)?;
             let tmp = self.backend.open(&tmp_path)?;
             let mut new_locs: Vec<(BlockId, Location)> = Vec::with_capacity(keep.len());
             let mut offset = 0u64;
@@ -294,16 +369,15 @@ impl<B: IoBackend> BlockStore<B> {
             tmp.sync()?;
             drop_handle(tmp);
             let old_len = old.len()?;
-            std::fs::rename(&tmp_path, segment_path(&self.dir, seg))?;
-
             // Swap the handle and the index entries together.
-            let new_file = Arc::new(self.backend.open(&segment_path(&self.dir, seg))?);
-            {
-                let mut files = self.files.write().unwrap();
-                files[seg as usize] = new_file;
-            }
+            let new_file = Arc::new(self.backend.open(&tmp_path)?);
             {
                 let mut index = self.index.write().unwrap();
+                let mut files = self.files.write().unwrap();
+                // Path identity and reader handles publish at the same
+                // boundary, including snapshots taken by the scrubber.
+                std::fs::rename(&tmp_path, segment_path(&self.dir, seg))?;
+                files[seg as usize] = new_file;
                 for (id, _) in &drop {
                     index.remove(id);
                 }
@@ -311,6 +385,7 @@ impl<B: IoBackend> BlockStore<B> {
                     index.insert(id, loc);
                 }
             }
+            std::fs::File::open(&self.dir)?.sync_all()?;
 
             stats.segments_rewritten += 1;
             stats.blocks_dropped += drop.len() as u64;
@@ -321,6 +396,42 @@ impl<B: IoBackend> BlockStore<B> {
 
     pub fn contains(&self, id: &BlockId) -> bool {
         self.index.read().unwrap().contains_key(id)
+    }
+
+    pub(crate) fn foreground_io_active(&self) -> bool {
+        self.foreground_reads
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+            || self.append.try_lock().is_err()
+    }
+
+    pub(crate) fn sealed_scrub_view(
+        &self,
+        segment: u32,
+    ) -> std::io::Result<Option<SealedScrubView<B::SegmentFile>>> {
+        let files = self.files.read().unwrap();
+        if segment as usize >= files.len().saturating_sub(1) {
+            return Ok(None);
+        }
+        let metadata = std::fs::metadata(segment_path(&self.dir, segment))?;
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt;
+            format!(
+                "{}:{}:{}:{}",
+                metadata.dev(),
+                metadata.ino(),
+                metadata.ctime(),
+                metadata.ctime_nsec()
+            )
+        };
+        #[cfg(not(unix))]
+        let identity = format!("{:?}", metadata.created()?);
+        Ok(Some(SealedScrubView {
+            file: Arc::clone(&files[segment as usize]),
+            generation: format!("{identity}:{}:{:?}", metadata.len(), metadata.modified()?),
+            length: metadata.len(),
+        }))
     }
 
     /// Full integrity check (fsck): re-read every indexed record and verify
@@ -477,6 +588,57 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_repair_fails_closed_and_can_be_retried_after_restart() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Backend(Arc<AtomicBool>);
+        struct File(std::fs::File, Arc<AtomicBool>);
+        impl IoBackend for Backend {
+            type SegmentFile = File;
+            fn open(&self, path: &Path) -> std::io::Result<File> {
+                Ok(File(StdBackend.open(path)?, self.0.clone()))
+            }
+        }
+        impl SegmentFile for File {
+            fn len(&self) -> std::io::Result<u64> {
+                SegmentFile::len(&self.0)
+            }
+            fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+                self.0.read_at(buf, offset)
+            }
+            fn sync(&self) -> std::io::Result<()> {
+                SegmentFile::sync(&self.0)
+            }
+            fn write_at(&self, buf: &[u8], offset: u64) -> std::io::Result<()> {
+                if self.1.swap(false, Ordering::SeqCst) {
+                    self.0.write_at(&buf[..HEADER_LEN + 3], offset)?;
+                    return Err(std::io::Error::other("injected partial repair write"));
+                }
+                self.0.write_at(buf, offset)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let fail = Arc::new(AtomicBool::new(false));
+        let store = BlockStore::open_with(Backend(fail.clone()), dir.path()).unwrap();
+        let payload = b"repair-with-a-torn-replacement";
+        let id = store.put(payload).unwrap();
+        let path = dir.path().join("seg-00000000.klpk");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[HEADER_LEN] ^= 0xff;
+        std::fs::write(&path, bytes).unwrap();
+        fail.store(true, Ordering::SeqCst);
+        assert!(store.repair(&id, payload).is_err());
+        assert!(matches!(store.get(&id), Err(Error::Corrupt { .. })));
+        assert!(store.put(b"must-not-ack-after-append-error").is_err());
+        drop(store);
+        let store = BlockStore::open(dir.path()).unwrap();
+        store.repair(&id, payload).unwrap();
+        drop(store);
+        let store = BlockStore::open(dir.path()).unwrap();
+        assert_eq!(store.get(&id).unwrap(), payload);
+        assert!(store.verify_all().is_clean());
+    }
+
+    #[test]
     fn many_blocks_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let store = BlockStore::open(dir.path()).unwrap();
@@ -601,6 +763,54 @@ mod tests {
         let stats = store.compact(|_| false).unwrap();
         assert_eq!(stats.segments_rewritten, 0);
         assert_eq!(store.get(&id).unwrap(), b"unbound but recent");
+    }
+
+    #[test]
+    fn readers_use_the_matching_file_generation_during_compaction() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(BlockStore::open_with_roll(dir.path(), 16 * 1024).unwrap());
+        let ids: Vec<_> = (0..96u32)
+            .map(|i| store.put(&i.to_le_bytes().repeat(750)).unwrap())
+            .collect();
+        let keep: Vec<_> = ids
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 0)
+            .map(|(i, id)| (*id, (i as u32).to_le_bytes().repeat(750)))
+            .collect();
+        let stop = Arc::new(AtomicBool::new(false));
+        let barrier = Arc::new(std::sync::Barrier::new(5));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let store = store.clone();
+                let keep = keep.clone();
+                let stop = stop.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let mut rounds = 0;
+                    while rounds == 0 || !stop.load(Ordering::Acquire) {
+                        for (id, expected) in &keep {
+                            assert_eq!(store.get(id).unwrap(), *expected);
+                        }
+                        rounds += 1;
+                    }
+                })
+            })
+            .collect();
+        barrier.wait();
+        let result = store.compact(|id| keep.iter().any(|(live, _)| live == id));
+        stop.store(true, Ordering::Release);
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        assert!(result.unwrap().blocks_dropped > 0);
+        drop(store);
+        let reopened = BlockStore::open(dir.path()).unwrap();
+        for (id, expected) in keep {
+            assert_eq!(reopened.get(&id).unwrap(), expected);
+        }
     }
 
     #[test]
