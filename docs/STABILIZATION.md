@@ -62,9 +62,10 @@ cached-good/cold-bad payloads, partial replacement writes, cold restart and
 repair from a healthy peer. Append errors fail closed until restart.
 
 The snapshot envelope is versioned (`raft-snapshot.json`, version 1) and
-contains a `KLPKSM03`-prefixed bincode payload plus Raft metadata. Version 2
-(`KLPKSM02`) and legacy unprefixed snapshots remain readable, with empty
-lease state. The first valid reservation activates binding fences at a common
+contains a `KLPKSM04`-prefixed bincode payload plus Raft metadata. Version 3
+(`KLPKSM03`) preserves reservations/revisions with an empty cancellation map.
+Version 2 (`KLPKSM02`) and legacy unprefixed snapshots remain readable, with
+empty lease state. The first valid reservation activates binding fences at a common
 Raft barrier, avoiding per-node revision drift from different old snapshot
 positions. Mixed-version rolling upgrades and
 downgrades are unsupported; upgrade the full experimental cluster together.
@@ -96,7 +97,10 @@ read pacing excludes metadata/checkpoint I/O and is not a device-level SLO.
    compaction gate now prevent the unsafe local sweep. Opt-in signed Raft
    reservations now atomically commit a binding with a revision fence and
    single-use replay tombstone. Legacy writes advance the revision but are
-   not themselves CAS-protected. Still implement safe expiry/abort and local
+   not themselves CAS-protected. Signed Raft cancellation now closes pending
+   reservations, rejects late commits/reopening, preserves replay tombstones
+   and leaves all local guards intact. Commit/cancel races, log replay,
+   snapshots and owner/signature checks are tested. Still implement safe expiry and local
    guard release, legacy-inventory migration and a Raft-coordinated watermark,
    then test binds, leader transitions, lagging followers and GC cancellation.
    Keep `--compact-secs 0`; manual compaction returns 409. No reclamation or

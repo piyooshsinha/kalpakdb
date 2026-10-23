@@ -126,6 +126,15 @@ pub fn lease_begin_message(agent: &AgentId, lease: &BlockId, blocks: &[BlockId])
     buf
 }
 
+/// Authorize closing exactly one pending reservation. This signature cannot
+/// authorize a commit, an expiry deadline, or release of stored bytes.
+pub fn lease_cancel_message(agent: &AgentId, lease: &BlockId) -> Vec<u8> {
+    let mut buf = b"KLPK/lease/cancel/v1\0".to_vec();
+    buf.extend_from_slice(&agent.0);
+    buf.extend_from_slice(lease.as_bytes());
+    buf
+}
+
 pub fn lease_commit_message(
     agent: &AgentId,
     lease: &BlockId,
@@ -190,6 +199,28 @@ mod tests {
             lease_commit_message(&agent, &lease, &a, &blocks, None, 0),
             lease_commit_message(&agent, &lease, &b, &blocks, None, 0)
         );
+    }
+
+    #[test]
+    fn cancellation_signature_covers_owner_id_and_a_distinct_domain() {
+        let (key, agent) = agent_and_key();
+        let lease = BlockId::of(b"cancel-lease");
+        let message = lease_cancel_message(&agent, &lease);
+        let signature = signature_from_hex(&sign_hex(&key, &message)).unwrap();
+        agent.verify(&message, &signature).unwrap();
+        assert!(agent
+            .verify(
+                &lease_cancel_message(&agent, &BlockId::of(b"other")),
+                &signature
+            )
+            .is_err());
+        assert!(agent
+            .verify(&lease_begin_message(&agent, &lease, &[]), &signature)
+            .is_err());
+        let other = AgentId::from_verifying_key(&SigningKey::from_bytes(&[44; 32]).verifying_key());
+        assert!(other
+            .verify(&lease_cancel_message(&other, &lease), &signature)
+            .is_err());
     }
 
     fn agent_and_key() -> (SigningKey, AgentId) {

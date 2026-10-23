@@ -59,6 +59,27 @@ struct LegacyMetadataState {
 }
 const SNAPSHOT_V2: &[u8] = b"KLPKSM02";
 const SNAPSHOT_V3: &[u8] = b"KLPKSM03";
+const SNAPSHOT_V4: &[u8] = b"KLPKSM04";
+
+// Exact version-three layout: bincode cannot default an appended field.
+#[derive(Serialize, Deserialize)]
+struct V3LeaseState {
+    initialized: bool,
+    records: std::collections::BTreeMap<BlockId, crate::UploadLease>,
+    revisions: HashMap<String, u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct V3MetadataState {
+    leases: V3LeaseState,
+    replica_requirements: std::collections::BTreeMap<BlockId, usize>,
+    agents: HashMap<AgentId, AgentRecord>,
+    bindings: HashMap<String, BindingRecord>,
+    children: HashMap<String, Vec<String>>,
+    block_refs: HashMap<BlockId, u32>,
+    last_applied: Option<LogId>,
+    membership: StoredMembership<NodeId, openraft::BasicNode>,
+}
 
 #[derive(Serialize, Deserialize)]
 struct V2MetadataState {
@@ -128,11 +149,33 @@ impl StateMachineStore {
         data: &[u8],
     ) -> std::io::Result<MetadataState> {
         let (state, consumed): (MetadataState, usize) =
-            if let Some(payload) = data.strip_prefix(SNAPSHOT_V3) {
+            if let Some(payload) = data.strip_prefix(SNAPSHOT_V4) {
                 let (state, consumed) =
                     bincode::serde::decode_from_slice(payload, bincode::config::standard())
                         .map_err(std::io::Error::other)?;
-                (state, consumed + SNAPSHOT_V3.len())
+                (state, consumed + SNAPSHOT_V4.len())
+            } else if let Some(payload) = data.strip_prefix(SNAPSHOT_V3) {
+                let (old, consumed): (V3MetadataState, usize) =
+                    bincode::serde::decode_from_slice(payload, bincode::config::standard())
+                        .map_err(std::io::Error::other)?;
+                (
+                    MetadataState {
+                        leases: crate::LeaseState {
+                            initialized: old.leases.initialized,
+                            records: old.leases.records,
+                            revisions: old.leases.revisions,
+                            cancelled: Default::default(),
+                        },
+                        replica_requirements: old.replica_requirements,
+                        agents: old.agents,
+                        bindings: old.bindings,
+                        children: old.children,
+                        block_refs: old.block_refs,
+                        last_applied: old.last_applied,
+                        membership: old.membership,
+                    },
+                    consumed + SNAPSHOT_V3.len(),
+                )
             } else if let Some(payload) = data.strip_prefix(SNAPSHOT_V2) {
                 let (old, consumed): (V2MetadataState, usize) =
                     bincode::serde::decode_from_slice(payload, bincode::config::standard())
@@ -185,6 +228,12 @@ impl StateMachineStore {
             ));
         }
         state.leases.validate()?;
+        if state.leases.cancelled.iter().any(|(id, at)| {
+            *at < state.leases.records[id].created_at
+                || *at > state.last_applied.map(|id| id.index).unwrap_or(0)
+        }) {
+            return Err(std::io::Error::other("invalid lease cancellation position"));
+        }
         if state
             .leases
             .revisions
@@ -225,6 +274,9 @@ impl StateMachineStore {
 
     fn apply_one(state: &mut MetadataState, req: &Request) -> Response {
         match req {
+            Request::CancelUploadLease { lease, agent } => {
+                crate::leases::cancel(state, *lease, *agent)
+            }
             Request::BeginUploadLease {
                 lease,
                 agent,
@@ -369,7 +421,7 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
             // binding map grows large.
             let encoded = bincode::serde::encode_to_vec(&*state, bincode::config::standard())
                 .map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let mut data = SNAPSHOT_V3.to_vec();
+            let mut data = SNAPSHOT_V4.to_vec();
             data.extend_from_slice(&encoded);
             (data, state.last_applied, state.membership.clone())
         };
@@ -497,6 +549,197 @@ mod tests {
             CacheKey::root(kalpak_core::ModelFingerprint::new("m", "t", "l"), &[1]),
             BlockId::of(b"data"),
         )
+    }
+
+    #[tokio::test]
+    async fn cancellation_is_terminal_idempotent_owner_checked_and_durable() {
+        let (mut state, agent, key, block) = lease_setup();
+        let lease = BlockId::of(b"cancel-me");
+        let reserve = Request::BeginUploadLease {
+            lease,
+            agent,
+            blocks: vec![block],
+        };
+        StateMachineStore::apply_one(&mut state, &reserve);
+        let stranger = AgentId::from_verifying_key(
+            &ed25519_dalek::SigningKey::from_bytes(&[38; 32]).verifying_key(),
+        );
+        for request in [
+            Request::CancelUploadLease {
+                lease,
+                agent: stranger,
+            },
+            Request::CancelUploadLease {
+                lease: BlockId::of(b"unknown"),
+                agent,
+            },
+        ] {
+            assert!(matches!(
+                StateMachineStore::apply_one(&mut state, &request),
+                Response::Rejected(_)
+            ));
+        }
+        assert!(state.leases.cancelled.is_empty());
+        let cancel = Request::CancelUploadLease { lease, agent };
+        assert!(matches!(
+            StateMachineStore::apply_one(&mut state, &cancel),
+            Response::LeaseCancelled
+        ));
+        let at = state.leases.cancelled[&lease];
+        assert!(matches!(
+            StateMachineStore::apply_one(&mut state, &cancel),
+            Response::LeaseCancelled
+        ));
+        assert_eq!(state.leases.cancelled[&lease], at);
+        assert!(matches!(
+            StateMachineStore::apply_one(&mut state, &reserve),
+            Response::Rejected(_)
+        ));
+        let commit = Request::CommitUploadLease {
+            lease,
+            agent,
+            binding: ChainBinding {
+                key,
+                blocks: vec![block],
+                parent: None,
+            },
+            expected_revision: 0,
+        };
+        assert!(matches!(
+            StateMachineStore::apply_one(&mut state, &commit),
+            Response::Rejected(_)
+        ));
+        assert!(state.bindings.is_empty());
+        assert!(state.block_refs.is_empty());
+        assert!(state.leases.revisions.is_empty());
+        assert_eq!(state.leases.records[&lease].blocks, vec![block]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = StateMachineStore::open(dir.path().to_owned()).unwrap();
+        *store.state.write().unwrap() = state;
+        let snapshot = store.build_snapshot().await.unwrap();
+        assert!(snapshot.snapshot.get_ref().starts_with(SNAPSHOT_V4));
+        drop(store);
+        let store = StateMachineStore::open(dir.path().to_owned()).unwrap();
+        assert!(store
+            .state
+            .read()
+            .unwrap()
+            .leases
+            .cancelled
+            .contains_key(&lease));
+        assert!(matches!(
+            StateMachineStore::apply_one(&mut store.state.write().unwrap(), &commit),
+            Response::Rejected(_)
+        ));
+        // Reject a damaged snapshot that claims a future cancellation index.
+        store
+            .state
+            .write()
+            .unwrap()
+            .leases
+            .cancelled
+            .insert(lease, 1);
+        let mut bad = SNAPSHOT_V4.to_vec();
+        bad.extend(
+            bincode::serde::encode_to_vec(
+                &*store.state.read().unwrap(),
+                bincode::config::standard(),
+            )
+            .unwrap(),
+        );
+        assert!(StateMachineStore::decode_snapshot(&snapshot.meta, &bad).is_err());
+    }
+
+    #[test]
+    fn commit_winning_before_cancel_keeps_its_binding_and_retry_contract() {
+        let (mut state, agent, key, block) = lease_setup();
+        let lease = BlockId::of(b"commit-wins");
+        StateMachineStore::apply_one(
+            &mut state,
+            &Request::BeginUploadLease {
+                lease,
+                agent,
+                blocks: vec![block],
+            },
+        );
+        let commit = Request::CommitUploadLease {
+            lease,
+            agent,
+            binding: ChainBinding {
+                key: key.clone(),
+                blocks: vec![block],
+                parent: None,
+            },
+            expected_revision: 0,
+        };
+        assert!(matches!(
+            StateMachineStore::apply_one(&mut state, &commit),
+            Response::Bound
+        ));
+        assert!(matches!(
+            StateMachineStore::apply_one(&mut state, &Request::CancelUploadLease { lease, agent }),
+            Response::Rejected(_)
+        ));
+        assert!(matches!(
+            StateMachineStore::apply_one(&mut state, &commit),
+            Response::Bound
+        ));
+        assert_eq!(state.bindings[&binding_key(&key)].blocks, vec![block]);
+        assert_eq!(state.block_refs[&block], 1);
+        assert_eq!(state.leases.revisions[&binding_key(&key)], 1);
+        assert!(state.leases.cancelled.is_empty());
+    }
+
+    #[test]
+    fn v3_snapshot_preserves_committed_leases_and_fences_without_cancellations() {
+        let (mut state, agent, key, block) = lease_setup();
+        let lease = BlockId::of(b"v3-reservation");
+        StateMachineStore::apply_one(
+            &mut state,
+            &Request::BeginUploadLease {
+                lease,
+                agent,
+                blocks: vec![block],
+            },
+        );
+        StateMachineStore::apply_one(
+            &mut state,
+            &Request::CommitUploadLease {
+                lease,
+                agent,
+                binding: ChainBinding {
+                    key: key.clone(),
+                    blocks: vec![block],
+                    parent: None,
+                },
+                expected_revision: 0,
+            },
+        );
+        let old = V3MetadataState {
+            leases: V3LeaseState {
+                initialized: state.leases.initialized,
+                records: state.leases.records,
+                revisions: state.leases.revisions,
+            },
+            replica_requirements: state.replica_requirements,
+            agents: state.agents,
+            bindings: state.bindings,
+            children: state.children,
+            block_refs: state.block_refs,
+            last_applied: state.last_applied,
+            membership: state.membership,
+        };
+        let mut data = SNAPSHOT_V3.to_vec();
+        data.extend(bincode::serde::encode_to_vec(&old, bincode::config::standard()).unwrap());
+        let meta = SnapshotMeta {
+            last_log_id: None,
+            last_membership: Default::default(),
+            snapshot_id: "v3".into(),
+        };
+        let state = StateMachineStore::decode_snapshot(&meta, &data).unwrap();
+        assert!(state.leases.records[&lease].committed.is_some());
+        assert_eq!(state.leases.revisions[&binding_key(&key)], 1);
+        assert!(state.leases.cancelled.is_empty());
     }
 
     #[test]
@@ -645,7 +888,7 @@ mod tests {
         let mut store = StateMachineStore::open(dir.path().to_owned()).unwrap();
         *store.state.write().unwrap() = state;
         let snapshot = store.build_snapshot().await.unwrap();
-        assert!(snapshot.snapshot.get_ref().starts_with(SNAPSHOT_V3));
+        assert!(snapshot.snapshot.get_ref().starts_with(SNAPSHOT_V4));
         drop(store);
         let store = StateMachineStore::open(dir.path().to_owned()).unwrap();
         let state = store.state.read().unwrap();

@@ -144,6 +144,8 @@ async fn signed_reservation_survives_origin_loss_and_retries_cannot_rebind_old_d
     db.begin_upload_lease(reservation, vec![block])
         .await
         .unwrap(); // follower -> leader
+    let cancelled = BlockId::of(b"cancel-after-failover");
+    db.begin_upload_lease(cancelled, vec![block]).await.unwrap();
     let key = CacheKey::root(
         ModelFingerprint::new("lease/model", "tokenizer", "layout"),
         &[1],
@@ -169,6 +171,13 @@ async fn signed_reservation_survives_origin_loss_and_retries_cannot_rebind_old_d
     nodes[old_leader].stop();
     let current = leader(&client, &nodes, Some(old_id)).await;
     let db = KalpakClient::with_signer(nodes[current].base(), signer);
+    db.cancel_upload_lease(cancelled).await.unwrap();
+    db.cancel_upload_lease(cancelled).await.unwrap();
+    assert!(db.begin_upload_lease(cancelled, vec![block]).await.is_err());
+    assert!(db
+        .commit_upload_lease(cancelled, key.clone(), vec![block], None, 0)
+        .await
+        .is_err());
     db.commit_upload_lease(reservation, key.clone(), vec![block], None, 0)
         .await
         .unwrap();
@@ -216,6 +225,8 @@ async fn signed_reservation_survives_origin_loss_and_retries_cannot_rebind_old_d
         .await
         .unwrap();
     assert_eq!(stats["replicated_leases"]["committed"], 2);
+    assert_eq!(stats["replicated_leases"]["cancelled"], 1);
+    assert_eq!(stats["replicated_leases"]["pending"], 0);
     assert_eq!(stats["upload_retention"]["gc_enabled"], false);
     assert_eq!(
         client
@@ -236,6 +247,19 @@ async fn signed_reservation_survives_origin_loss_and_retries_cannot_rebind_old_d
         .await
         .unwrap();
     assert_eq!(forged.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let wrong_domain = kalpak_core::signing::sign_hex(
+        &ed25519_dalek::SigningKey::from_bytes(&[96; 32]),
+        &kalpak_core::signing::lease_begin_message(&agent, &cancelled, &[block]),
+    );
+    let forged = client
+        .post(format!("{}/v1/leases/cancel", nodes[current].base()))
+        .header("x-kalpak-internal", "1")
+        .json(&json!({"agent": agent, "lease": cancelled,
+            "signature": wrong_domain}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), reqwest::StatusCode::UNAUTHORIZED);
     // Kill and reopen the committing node's actual directory, without a
     // snapshot-only simulation. Its peer and recovered log restore quorum.
     let address = nodes[current].addr.clone();
@@ -250,8 +274,82 @@ async fn signed_reservation_survives_origin_loss_and_retries_cannot_rebind_old_d
     db.commit_upload_lease(reservation, key.clone(), vec![block], None, 0)
         .await
         .unwrap();
+    db.cancel_upload_lease(cancelled).await.unwrap();
+    assert!(db.begin_upload_lease(cancelled, vec![block]).await.is_err());
     assert_eq!(
         db.lookup(&[key]).await.unwrap().unwrap().blocks,
         vec![block_two]
     );
+}
+
+#[tokio::test]
+async fn concurrent_cancel_and_commit_have_one_winner_without_releasing_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let nodes = vec![node(dir.path(), 1).await];
+    post(
+        &client,
+        &nodes[0].base(),
+        "/v1/cluster/init",
+        json!({"members": {"1": nodes[0].addr}}),
+    )
+    .await;
+    leader(&client, &nodes, None).await;
+    let db = KalpakClient::with_signer(
+        nodes[0].base(),
+        ed25519_dalek::SigningKey::from_bytes(&[97; 32]),
+    );
+    let agent = db.agent_id().unwrap();
+    db.register_agent(agent, "race").await.unwrap();
+    let block = db.put_block(b"guarded race bytes".to_vec()).await.unwrap();
+    for n in 0..8u32 {
+        let lease = BlockId::of(&n.to_le_bytes());
+        let key = CacheKey::root(ModelFingerprint::new("race", "tok", "layout"), &[n]);
+        db.begin_upload_lease(lease, vec![block]).await.unwrap();
+        let (committed, cancelled) = tokio::join!(
+            db.commit_upload_lease(lease, key.clone(), vec![block], None, 0),
+            db.cancel_upload_lease(lease)
+        );
+        match (&committed, &cancelled) {
+            (Ok(()), Err(kalpak_client::ClientError::Server { status: 409, .. })) => {
+                assert_eq!(
+                    db.lookup(std::slice::from_ref(&key))
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .blocks,
+                    vec![block]
+                );
+                assert!(db.cancel_upload_lease(lease).await.is_err());
+            }
+            (Err(kalpak_client::ClientError::Server { status: 409, .. }), Ok(())) => {
+                assert!(db
+                    .lookup(std::slice::from_ref(&key))
+                    .await
+                    .unwrap()
+                    .is_none());
+                db.cancel_upload_lease(lease).await.unwrap();
+                assert!(db
+                    .commit_upload_lease(lease, key.clone(), vec![block], None, 0)
+                    .await
+                    .is_err());
+            }
+            _ => panic!(
+                "expected one terminal winner, got commit={committed:?}, cancel={cancelled:?}"
+            ),
+        }
+    }
+    assert_eq!(db.get_block(&block).await.unwrap(), b"guarded race bytes");
+    let stats: Value = client
+        .get(format!("{}/v1/stats", nodes[0].base()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stats["upload_retention"]["guarded_blocks"], 1);
+    assert_eq!(stats["replicated_leases"]["total"], 8);
+    assert_eq!(stats["replicated_leases"]["pending"], 0);
+    assert_eq!(stats["upload_retention"]["gc_enabled"], false);
 }

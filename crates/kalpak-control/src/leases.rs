@@ -49,11 +49,19 @@ pub struct LeaseState {
     /// After activation, every binding mutation (including legacy APIs)
     /// advances this fence. Imported bindings start at the common zero fence.
     pub revisions: HashMap<String, u64>,
+    /// First cancellation's Raft log position. IDs and hashes remain retained
+    /// as replay tombstones; cancellation is never physical GC authority.
+    pub cancelled: BTreeMap<BlockId, u64>,
 }
 
 impl LeaseState {
     pub(crate) fn validate(&self) -> std::io::Result<()> {
         if self.records.len() > MAX_LEASES
+            || self.cancelled.iter().any(|(id, _)| {
+                self.records
+                    .get(id)
+                    .is_none_or(|lease| lease.committed.is_some())
+            })
             || (!self.initialized && (!self.records.is_empty() || !self.revisions.is_empty()))
             || self
                 .records
@@ -98,7 +106,11 @@ pub(crate) fn reserve(
     }
     if let Some(old) = state.leases.records.get(&id) {
         return if old.agent == agent && old.blocks == blocks {
-            Response::LeaseReserved
+            if state.leases.cancelled.contains_key(&id) {
+                Response::Rejected("upload lease cancelled".into())
+            } else {
+                Response::LeaseReserved
+            }
         } else {
             Response::Rejected("lease ID already belongs to a different reservation".into())
         };
@@ -143,6 +155,9 @@ pub(crate) fn validate_commit(
     if &lease.agent != agent || lease.blocks != binding.blocks {
         return Err("lease owner or blocks mismatch".into());
     }
+    if state.leases.cancelled.contains_key(id) {
+        return Err("upload lease cancelled".into());
+    }
     if let Some(old) = &lease.committed {
         return if old.expected_revision == expected_revision
             && old.binding.key == binding.key
@@ -167,4 +182,22 @@ pub(crate) fn validate_commit(
         return Err("binding revision conflict".into());
     }
     Ok(true)
+}
+
+pub(crate) fn cancel(state: &mut MetadataState, id: BlockId, agent: AgentId) -> Response {
+    let Some(lease) = state.leases.records.get(&id) else {
+        return Response::Rejected("unknown upload lease".into());
+    };
+    if lease.agent != agent {
+        return Response::Rejected("lease owner mismatch".into());
+    }
+    if lease.committed.is_some() {
+        return Response::Rejected("committed upload lease cannot be cancelled".into());
+    }
+    state
+        .leases
+        .cancelled
+        .entry(id)
+        .or_insert_with(|| state.last_applied.map(|id| id.index).unwrap_or(0));
+    Response::LeaseCancelled
 }

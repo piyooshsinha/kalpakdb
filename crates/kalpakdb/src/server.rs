@@ -404,6 +404,7 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/manifest/bind-chain", post(bind_chain))
         .route("/v1/leases/begin", post(crate::leases::begin))
         .route("/v1/leases/commit", post(crate::leases::commit))
+        .route("/v1/leases/cancel", post(crate::leases::cancel))
         .route("/v1/manifest/lookup", post(lookup_prefix))
         .route("/v1/stats", get(stats))
         .route("/metrics", get(metrics))
@@ -1515,7 +1516,8 @@ async fn admin_backup(State(s): State<Shared>) -> Result<Response, ApiError> {
 }
 
 fn stats_payload(s: &AppState) -> serde_json::Value {
-    let (lease_total, lease_pending) = s.control.upload_lease_counts();
+    let (lease_pending, lease_committed, lease_cancelled) =
+        s.control.upload_lease_lifecycle_counts();
     let cold = s.store.cold().stats();
     let tier = s.store.tier_stats();
     let raft = s.control.metrics();
@@ -1554,8 +1556,8 @@ fn stats_payload(s: &AppState) -> serde_json::Value {
         },
         "online_scrub": s.online_scrub.snapshot(),
         "upload_retention": s.retention.snapshot(),
-        "replicated_leases": {"total": lease_total, "pending": lease_pending,
-            "committed": lease_total - lease_pending, "capacity": kalpak_control::MAX_LEASES,
+        "replicated_leases": {"total": lease_pending + lease_committed + lease_cancelled, "pending": lease_pending,
+            "committed": lease_committed, "cancelled": lease_cancelled, "capacity": kalpak_control::MAX_LEASES,
             "automatic_expiry": false, "gc_enabled": false},
     })
 }

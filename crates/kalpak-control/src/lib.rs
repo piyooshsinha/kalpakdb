@@ -224,6 +224,52 @@ impl ControlPlane {
         }
     }
 
+    /// Close a pending reservation in Raft without releasing any stored bytes.
+    pub async fn cancel_upload_lease(
+        &self,
+        lease: BlockId,
+        agent: AgentId,
+    ) -> Result<(), ControlError> {
+        match self
+            .write(Request::CancelUploadLease { lease, agent })
+            .await?
+        {
+            Response::LeaseCancelled => Ok(()),
+            Response::Rejected(message) => Err(ControlError::Rejected(message)),
+            _ => Err(ControlError::Write(
+                "unexpected lease cancellation response".into(),
+            )),
+        }
+    }
+
+    /// Local diagnostics only, not authorization to release retention guards.
+    pub fn upload_lease_is_cancelled(&self, id: &BlockId) -> bool {
+        self.sm
+            .state
+            .read()
+            .unwrap()
+            .leases
+            .cancelled
+            .contains_key(id)
+    }
+
+    /// Pending, committed, cancelled counts captured together.
+    pub fn upload_lease_lifecycle_counts(&self) -> (usize, usize, usize) {
+        let state = self.sm.state.read().unwrap();
+        let cancelled = state.leases.cancelled.len();
+        let committed = state
+            .leases
+            .records
+            .values()
+            .filter(|lease| lease.committed.is_some())
+            .count();
+        (
+            state.leases.records.len() - committed - cancelled,
+            committed,
+            cancelled,
+        )
+    }
+
     /// Local diagnostic view; callers needing authority must issue a Raft write.
     pub fn upload_lease(&self, id: &BlockId) -> Option<UploadLease> {
         self.sm
@@ -237,16 +283,8 @@ impl ControlPlane {
     }
 
     pub fn upload_lease_counts(&self) -> (usize, usize) {
-        let state = self.sm.state.read().unwrap();
-        (
-            state.leases.records.len(),
-            state
-                .leases
-                .records
-                .values()
-                .filter(|lease| lease.committed.is_none())
-                .count(),
-        )
+        let (pending, committed, cancelled) = self.upload_lease_lifecycle_counts();
+        (pending + committed + cancelled, pending)
     }
 
     pub fn binding_revision(&self, key: &CacheKey) -> u64 {
