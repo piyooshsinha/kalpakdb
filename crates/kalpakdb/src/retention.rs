@@ -21,9 +21,30 @@ struct State {
     sequence: u64,
     bytes: u64,
     failed: bool,
+    active: HashMap<BlockId, usize>,
 }
 
 pub(crate) struct Retention(Mutex<State>);
+
+/// Owned by the actual local write operation, not a cancellable caller.
+#[must_use]
+pub(crate) struct WriteGuard<'a> {
+    retention: &'a Retention,
+    ids: HashSet<BlockId>,
+}
+
+impl Drop for WriteGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.retention.0.lock().unwrap();
+        for id in &self.ids {
+            let count = state.active.get_mut(id).expect("registered write guard");
+            *count -= 1;
+            if *count == 0 {
+                state.active.remove(id);
+            }
+        }
+    }
+}
 
 impl Retention {
     pub(crate) fn open(dir: &Path) -> io::Result<Self> {
@@ -89,12 +110,13 @@ impl Retention {
             sequence,
             bytes,
             failed: false,
+            active: HashMap::new(),
         })))
     }
 
     /// Commit the guard before attempting any payload append. Failures leave
     /// conservative guards; there is deliberately no cancellation rollback.
-    pub(crate) fn protect(&self, ids: &[BlockId]) -> io::Result<()> {
+    pub(crate) fn protect(&self, ids: &[BlockId]) -> io::Result<WriteGuard<'_>> {
         if ids.len() > MAX_BATCH {
             return Err(io::Error::other("upload retention batch too large"));
         }
@@ -108,7 +130,10 @@ impl Retention {
         // reuse must invalidate any previously observed local fence.
         let requested: HashSet<_> = ids.iter().copied().collect();
         if requested.is_empty() {
-            return Ok(());
+            return Ok(WriteGuard {
+                retention: self,
+                ids: requested,
+            });
         }
         let fresh = requested
             .iter()
@@ -144,14 +169,21 @@ impl Retention {
         }
         state.sequence = next;
         state.bytes += size as u64;
-        state.ids.extend(requested.into_iter().map(|id| (id, next)));
-        Ok(())
+        state.ids.extend(requested.iter().map(|id| (*id, next)));
+        for id in &requested {
+            *state.active.entry(*id).or_default() += 1;
+        }
+        Ok(WriteGuard {
+            retention: self,
+            ids: requested,
+        })
     }
 
     pub(crate) fn evidence(&self, id: &BlockId) -> serde_json::Value {
         let state = self.0.lock().unwrap();
         serde_json::json!({"guarded": state.ids.contains_key(id),
             "local_generation": state.ids.get(id),
+            "active_local_writes": state.active.get(id).copied().unwrap_or(0),
             "journal_sequence": state.sequence, "write_failed": state.failed})
     }
 
@@ -178,8 +210,67 @@ pub(crate) fn gc_reason() -> &'static str {
 }
 
 #[cfg(test)]
+// Existing journal-format tests intentionally drop write guards immediately.
+#[allow(unused_must_use)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn cancelling_async_waiter_keeps_submitted_disk_write_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = std::sync::Arc::new(Retention::open(dir.path()).unwrap());
+        let id = BlockId::of(b"submitted write");
+        let worker_journal = journal.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let waiter = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let guard = worker_journal.protect(&[id]).unwrap();
+                started_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+                drop(guard);
+                let _ = done_tx.send(());
+            })
+            .await
+            .unwrap();
+        });
+        started_rx.await.unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert_eq!(journal.evidence(&id)["active_local_writes"], 1);
+        release_tx.send(()).unwrap();
+        done_rx.await.unwrap();
+        assert_eq!(journal.evidence(&id)["active_local_writes"], 0);
+        assert_eq!(journal.evidence(&id)["guarded"], true);
+    }
+
+    #[test]
+    fn overlapping_write_guards_count_operations_and_release_on_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Retention::open(dir.path()).unwrap();
+        let id = BlockId::of(b"overlapping");
+        let first = journal.protect(&[id, id]).unwrap();
+        assert_eq!(journal.evidence(&id)["active_local_writes"], 1);
+        let second = journal.protect(&[id]).unwrap();
+        assert_eq!(journal.evidence(&id)["active_local_writes"], 2);
+        drop(first);
+        assert_eq!(journal.evidence(&id)["active_local_writes"], 1);
+        drop(second);
+        let fail = || -> io::Result<()> {
+            let _guard = journal.protect(&[id])?;
+            assert_eq!(journal.evidence(&id)["active_local_writes"], 1);
+            Err(io::Error::other("payload failed"))
+        };
+        assert!(fail().is_err());
+        assert_eq!(journal.evidence(&id)["active_local_writes"], 0);
+        drop(journal);
+        let journal = Retention::open(dir.path()).unwrap();
+        assert_eq!(journal.evidence(&id)["active_local_writes"], 0);
+        assert_eq!(journal.evidence(&id)["guarded"], true);
+    }
+
     #[test]
     fn reuse_fences_survive_restart_and_migrate_legacy_records() {
         let dir = tempfile::tempdir().unwrap();

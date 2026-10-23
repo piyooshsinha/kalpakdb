@@ -82,7 +82,7 @@ impl BlockService for BlockGrpc {
                 // submitted blocking disk operation is still running.
                 let _permit = disk_permit;
                 let guarded: Vec<_> = blocks.iter().map(|block| BlockId::of(block)).collect();
-                disk_state
+                let _write_guard = disk_state
                     .retention
                     .protect(&guarded)
                     .map_err(kalpak_core::Error::from)?;

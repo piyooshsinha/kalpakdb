@@ -291,7 +291,7 @@ pub(crate) fn start(state: Arc<crate::server::AppState>) {
                                 let disk_lease = lease.clone();
                                 let saved = tokio::task::spawn_blocking(move || {
                                     let _lease = disk_lease;
-                                    disk_state
+                                    let _write_guard = disk_state
                                         .retention
                                         .protect(&[id])
                                         .map_err(kalpak_core::Error::from)?;

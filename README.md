@@ -420,6 +420,16 @@ false` and `reclaimable: false`: in-flight writes, legacy provenance, the GC
 watermark, linearizable authorization and restore rollback remain unresolved.
 The endpoint performs no Raft writes, guard release, or payload deletion.
 
+`local_guard.active_local_writes` counts guarded local payload operations for
+that hash. Overlapping operations count separately, duplicate hashes within a
+batch count once, and RAII guards release counts on completion or errors.
+gRPC and repair guards live inside the blocking disk worker, so cancelling its
+async waiter cannot prematurely hide an already submitted write. Counts are
+ephemeral and restart at zero; durable guards and generations remain. They do
+not cover network staging before hashing, remote fan-out after local completion,
+offline writers, or provide an atomic exclusion barrier against new operations.
+A nonzero count blocks dry-run validation; zero never authorizes reclamation.
+
 Each new guard batch adds a metadata fsync before the payload fsync; no
 throughput improvement is claimed. Backups capture a stable journal after
 segment traversal; the journal-copy lock can delay uploads. Timed

@@ -114,6 +114,7 @@ async fn unbound_uploads_survive_compaction_requests_and_real_restart() {
         assert_eq!(plan["reclaimable"], false);
         assert_eq!(plan["gc_enabled"], false);
         assert_eq!(plan["local_guard"]["guarded"], guarded);
+        assert_eq!(plan["local_guard"]["active_local_writes"], 0);
         assert_eq!(plan["local_payload_present"], present);
         assert_eq!(plan["metadata"]["binding_references"], 0);
         assert_eq!(plan["metadata"]["leases"]["pending"], 0);
