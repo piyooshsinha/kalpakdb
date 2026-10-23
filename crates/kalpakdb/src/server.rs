@@ -409,6 +409,7 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/leases/renew", post(crate::leases::renew))
         .route("/v1/manifest/lookup", post(lookup_prefix))
         .route("/v1/stats", get(stats))
+        .route("/v1/reclamation/{id}", get(reclamation_plan))
         .route("/metrics", get(metrics))
         .route("/v1/ws", get(ws_stats))
         .route("/v1/admin/compact", post(admin_compact))
@@ -1563,6 +1564,32 @@ fn stats_payload(s: &AppState) -> serde_json::Value {
             "capacity": kalpak_control::MAX_LEASES, "expiry_mode": "opt_in_logical_ticks",
             "automatic_expiry": true, "gc_enabled": false},
     })
+}
+
+/// Deliberately performs no payload reads, Raft writes, or guard releases.
+async fn reclamation_plan(
+    State(s): State<Shared>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_read_token(&s, &headers, None)?;
+    let id: BlockId = id
+        .parse()
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid block ID".into()))?;
+    Ok(Json(json!({
+        "block": id,
+        "mode": "diagnostic_only",
+        "authoritative": false,
+        "reclaimable": false,
+        "gc_enabled": false,
+        "blocked_reason": crate::retention::gc_reason(),
+        "metadata": s.control.reclamation_evidence(&id),
+        "local_guard": s.retention.evidence(&id),
+        "local_payload_present": s.store.contains(&id),
+        "unknowns": ["in_flight_writes", "legacy_provenance", "cluster_gc_watermark",
+            "block_reuse_generation", "replica_health"],
+        "consistency": "local observations taken separately; may be stale or change during capture"
+    })))
 }
 
 async fn stats(

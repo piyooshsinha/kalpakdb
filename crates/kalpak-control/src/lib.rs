@@ -598,6 +598,37 @@ impl ControlPlane {
             .unwrap_or(0)
     }
 
+    /// One local metadata observation, never a linearizable GC certificate.
+    pub fn reclamation_evidence(&self, id: &BlockId) -> serde_json::Value {
+        let state = self.sm.state.read().unwrap();
+        let mut pending = 0usize;
+        let mut committed = 0usize;
+        let mut cancelled = 0usize;
+        let mut expired = 0usize;
+        for (lease_id, lease) in &state.leases.records {
+            if !lease.blocks.contains(id) {
+                continue;
+            }
+            if lease.committed.is_some() {
+                committed += 1;
+            } else if state.leases.cancelled.contains_key(lease_id) {
+                cancelled += 1;
+            } else if state.leases.is_expired(lease_id) {
+                expired += 1;
+            } else {
+                pending += 1;
+            }
+        }
+        serde_json::json!({
+            "last_applied": state.last_applied,
+            "logical_tick": state.leases.clock,
+            "binding_references": state.block_refs.get(id).copied().unwrap_or(0),
+            "required_replicas": state.replica_requirements.get(id).copied().unwrap_or(0),
+            "leases": {"pending": pending, "committed": committed,
+                "cancelled": cancelled, "expired": expired}
+        })
+    }
+
     /// Blocks referenced by at least `min_refs` bindings — the structural
     /// importance set for pinned warm placement (IMPRESS-style).
     pub fn shared_blocks(&self, min_refs: u32) -> Vec<BlockId> {
