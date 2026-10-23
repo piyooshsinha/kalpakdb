@@ -83,11 +83,15 @@ class WorkflowTest(unittest.TestCase):
         bindings = db.agent_bindings(agent)
         self.assertEqual(len(bindings), 2)
 
-        # Stats and GC respond.
+        # Stats expose retention; GC must fail closed until coordinated release.
         stats = db.stats()
         self.assertEqual(stats["control_plane"]["agents"], 1)
-        gc = db.compact()
-        self.assertEqual(gc["segments_rewritten"], 0)  # all in active segment
+        self.assertFalse(stats["upload_retention"]["gc_enabled"])
+        with self.assertRaises(KalpakError) as gc:
+            db.compact()
+        self.assertEqual(gc.exception.status, 409)
+        self.assertIn("coordinated GC watermark", str(gc.exception))
+        self.assertEqual(db.get_block(ids[1]), b"py-kv-chunk-1")
 
         # Typed errors.
         with self.assertRaises(KalpakError) as ctx:

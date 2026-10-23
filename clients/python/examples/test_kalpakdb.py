@@ -11,7 +11,7 @@ Exercises the full agent workflow against a running node:
      content-address verification
   5. speculative lookahead: a parent-only lookup pre-warms child blocks
   6. memory explorer: list agents, audit this agent's bindings + lineage
-  7. garbage collection trigger
+  7. verify unsafe garbage collection is blocked
 
 Usage:
     # start a node first (see RUNNING below), then:
@@ -133,9 +133,14 @@ def main() -> None:
     )
 
     # -- 7. GC -----------------------------------------------------------
-    swept = db.compact()
-    check("garbage collection runs", "blocks_dropped" in swept,
-          f"{swept['blocks_dropped']} dead block(s) swept")
+    try:
+        db.compact()
+    except KalpakError as error:
+        check("unsafe garbage collection is blocked", error.status == 409,
+              str(error))
+    else:
+        check("unsafe garbage collection is blocked", False,
+              "expected a 409 until coordinated reclamation is implemented")
 
     d = db.stats()["data_plane"]
     print(f"\n{INFO} final node state: {d['blocks']} blocks, "

@@ -332,6 +332,7 @@ export class KalpakClient {
     return r.bindings;
   }
 
+  /** Requests GC; rejects with HTTP 409 while coordinated reclamation is blocked. */
   compact(): Promise<Record<string, unknown>> {
     return this.json("POST", "/v1/admin/compact");
   }
