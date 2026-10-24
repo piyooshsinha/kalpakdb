@@ -30,7 +30,10 @@ use openraft::raft::{
 };
 use openraft::{BasicNode, Config, Raft};
 
-pub use leases::{LeaseState, UploadLease, MAX_LEASES, MAX_LEASE_BLOCKS};
+pub use leases::{
+    LeaseDeadline, LeaseState, LeaseStatusCounts, UploadLease, MAX_LEASES, MAX_LEASE_BLOCKS,
+    MAX_TTL_TICKS,
+};
 pub use state_machine::{AgentRecord, BindingRecord, MetadataState};
 pub use types::{ChainBinding, NodeId, Request, Response, TypeConfig};
 
@@ -242,6 +245,96 @@ impl ControlPlane {
         }
     }
 
+    pub async fn renew_upload_lease(
+        &self,
+        lease: BlockId,
+        agent: AgentId,
+        expected_generation: u64,
+        ttl_ticks: u64,
+    ) -> Result<LeaseDeadline, ControlError> {
+        match self
+            .write(Request::RenewUploadLease {
+                lease,
+                agent,
+                expected_generation,
+                ttl_ticks,
+            })
+            .await?
+        {
+            Response::LeaseRenewed {
+                generation,
+                deadline_tick,
+            } => Ok(LeaseDeadline {
+                generation,
+                deadline_tick,
+                ttl_ticks,
+            }),
+            Response::Rejected(message) => Err(ControlError::Rejected(message)),
+            _ => Err(ControlError::Write(
+                "unexpected lease renewal response".into(),
+            )),
+        }
+    }
+
+    /// Trusted coordinator operation; intentionally not exposed over HTTP.
+    pub async fn advance_lease_clock(&self, expected_tick: u64) -> Result<(), ControlError> {
+        match self
+            .write(Request::AdvanceLeaseClock { expected_tick })
+            .await?
+        {
+            Response::LeaseClockAdvanced => Ok(()),
+            Response::Rejected(message) => Err(ControlError::Rejected(message)),
+            _ => Err(ControlError::Write(
+                "unexpected lease clock response".into(),
+            )),
+        }
+    }
+
+    pub async fn expire_upload_lease(
+        &self,
+        lease: BlockId,
+        generation: u64,
+        deadline_tick: u64,
+    ) -> Result<(), ControlError> {
+        match self
+            .write(Request::ExpireUploadLease {
+                lease,
+                generation,
+                deadline_tick,
+            })
+            .await?
+        {
+            Response::LeaseExpired => Ok(()),
+            Response::Rejected(message) => Err(ControlError::Rejected(message)),
+            _ => Err(ControlError::Write(
+                "unexpected lease expiry response".into(),
+            )),
+        }
+    }
+
+    /// Local hints only; generation and deadline are checked again in Raft.
+    pub fn lease_expiry_work(&self) -> (u64, bool, Vec<(BlockId, LeaseDeadline)>) {
+        let state = self.sm.state.read().unwrap();
+        let active = state.leases.deadlines.keys().any(|id| {
+            state.leases.records[id].committed.is_none()
+                && !state.leases.cancelled.contains_key(id)
+                && !state.leases.is_expired(id)
+        });
+        let due = state
+            .leases
+            .deadlines
+            .iter()
+            .filter(|(id, _)| state.leases.is_expired(id) && !state.leases.expired.contains_key(id))
+            .take(16)
+            .map(|(id, deadline)| (*id, deadline.clone()))
+            .collect();
+        (state.leases.clock, active, due)
+    }
+
+    pub fn upload_lease_status(&self) -> LeaseStatusCounts {
+        self.sm.state.read().unwrap().leases.status_counts()
+    }
+
     /// Local diagnostics only, not authorization to release retention guards.
     pub fn upload_lease_is_cancelled(&self, id: &BlockId) -> bool {
         self.sm
@@ -253,21 +346,11 @@ impl ControlPlane {
             .contains_key(id)
     }
 
-    /// Pending, committed, cancelled counts captured together.
+    /// Legacy three-way summary. Expired records are omitted; use
+    /// upload_lease_status for the complete partition of lifecycle states.
     pub fn upload_lease_lifecycle_counts(&self) -> (usize, usize, usize) {
-        let state = self.sm.state.read().unwrap();
-        let cancelled = state.leases.cancelled.len();
-        let committed = state
-            .leases
-            .records
-            .values()
-            .filter(|lease| lease.committed.is_some())
-            .count();
-        (
-            state.leases.records.len() - committed - cancelled,
-            committed,
-            cancelled,
-        )
+        let counts = self.upload_lease_status();
+        (counts.pending, counts.committed, counts.cancelled)
     }
 
     /// Local diagnostic view; callers needing authority must issue a Raft write.
@@ -283,8 +366,8 @@ impl ControlPlane {
     }
 
     pub fn upload_lease_counts(&self) -> (usize, usize) {
-        let (pending, committed, cancelled) = self.upload_lease_lifecycle_counts();
-        (pending + committed + cancelled, pending)
+        let counts = self.upload_lease_status();
+        (counts.total, counts.pending)
     }
 
     pub fn binding_revision(&self, key: &CacheKey) -> u64 {

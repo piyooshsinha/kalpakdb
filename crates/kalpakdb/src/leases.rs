@@ -32,6 +32,71 @@ pub(crate) struct Cancel {
     signature: String,
 }
 
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Renew {
+    lease: BlockId,
+    agent: AgentId,
+    expected_generation: u64,
+    ttl_ticks: u64,
+    signature: String,
+}
+
+pub(crate) async fn renew(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<Renew>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    verify(
+        &req.agent,
+        &kalpak_core::signing::lease_renew_message(
+            &req.agent,
+            &req.lease,
+            req.expected_generation,
+            req.ttl_ticks,
+        ),
+        &req.signature,
+    )?;
+    match state
+        .control
+        .renew_upload_lease(req.lease, req.agent, req.expected_generation, req.ttl_ticks)
+        .await
+    {
+        Ok(deadline) => Ok(Json(
+            json!({"generation": deadline.generation, "deadline_tick": deadline.deadline_tick}),
+        )),
+        Err(error) => {
+            crate::server::forward_to_leader(&state, error, "/v1/leases/renew", json!(req)).await
+        }
+    }
+}
+
+/// Logical time is proposed only by a data leader, one tick per scheduled
+/// interval with no catch-up loop. Followers never expire from local clocks.
+pub(crate) fn start_expiry(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let metrics = state.control.metrics();
+            if metrics.current_leader != Some(metrics.id) {
+                continue;
+            }
+            let (clock, active, _) = state.control.lease_expiry_work();
+            if active && state.control.advance_lease_clock(clock).await.is_err() {
+                continue;
+            }
+            let (_, _, due) = state.control.lease_expiry_work();
+            for (id, deadline) in due {
+                let _ = state
+                    .control
+                    .expire_upload_lease(id, deadline.generation, deadline.deadline_tick)
+                    .await;
+            }
+        }
+    });
+}
+
 pub(crate) async fn cancel(
     State(state): State<Arc<AppState>>,
     Json(req): Json<Cancel>,
@@ -83,9 +148,7 @@ pub(crate) async fn begin(
         .begin_upload_lease(req.lease, req.agent, req.blocks.clone())
         .await
     {
-        Ok(()) => Ok(Json(
-            json!({"reserved": true, "lease": req.lease, "expires": false}),
-        )),
+        Ok(()) => Ok(Json(json!({"reserved": true, "lease": req.lease}))),
         Err(error) => {
             crate::server::forward_to_leader(&state, error, "/v1/leases/begin", json!(req)).await
         }

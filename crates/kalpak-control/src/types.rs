@@ -56,6 +56,20 @@ pub enum Request {
         lease: BlockId,
         agent: AgentId,
     },
+    RenewUploadLease {
+        lease: BlockId,
+        agent: AgentId,
+        expected_generation: u64,
+        ttl_ticks: u64,
+    },
+    AdvanceLeaseClock {
+        expected_tick: u64,
+    },
+    ExpireUploadLease {
+        lease: BlockId,
+        generation: u64,
+        deadline_tick: u64,
+    },
 }
 
 /// One link of an atomic chain bind.
@@ -75,6 +89,9 @@ pub enum Response {
     Bound,
     LeaseReserved,
     LeaseCancelled,
+    LeaseRenewed { generation: u64, deadline_tick: u64 },
+    LeaseClockAdvanced,
+    LeaseExpired,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

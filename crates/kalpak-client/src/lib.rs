@@ -48,6 +48,12 @@ pub struct KalpakClient {
     signer: Option<ed25519_dalek::SigningKey>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct LeaseRenewal {
+    pub generation: u64,
+    pub deadline_tick: u64,
+}
+
 /// The longest cached prefix found for a key chain.
 #[derive(Debug, Clone)]
 pub struct PrefixHit {
@@ -111,7 +117,8 @@ impl KalpakClient {
 
     /// Reserve hashes in Raft before uploading bytes. Requires a signer and
     /// a registered agent. IDs must be fresh random 32-byte values, never
-    /// reused. Reservations do not expire or enable reclamation.
+    /// reused. Reservations start without a deadline; renewal can opt into
+    /// logical-tick expiry. Neither operation enables reclamation.
     pub async fn begin_upload_lease(
         &self,
         lease: BlockId,
@@ -184,6 +191,36 @@ impl KalpakClient {
             .send()
             .await?;
         Self::check(response).await.map(|_| ())
+    }
+
+    /// Opt into logical-tick expiry, or extend a pending lease. Start with
+    /// generation zero; use the returned generation for a later renewal.
+    /// Exact retries never extend the deadline twice. Ticks are not wall time.
+    pub async fn renew_upload_lease(
+        &self,
+        lease: BlockId,
+        expected_generation: u64,
+        ttl_ticks: u64,
+    ) -> Result<LeaseRenewal, ClientError> {
+        let agent = self
+            .agent_id()
+            .ok_or_else(|| ClientError::Decode("upload leases require a signing key".into()))?;
+        let signature = self.sign(&kalpak_core::signing::lease_renew_message(
+            &agent,
+            &lease,
+            expected_generation,
+            ttl_ticks,
+        ));
+        let response = self
+            .http
+            .post(format!("{}/v1/leases/renew", self.base))
+            .json(
+                &json!({"lease": lease, "agent": agent, "expected_generation": expected_generation,
+                "ttl_ticks": ttl_ticks, "signature": signature}),
+            )
+            .send()
+            .await?;
+        Ok(Self::check(response).await?.json().await?)
     }
 
     async fn check(resp: reqwest::Response) -> Result<reqwest::Response, ClientError> {

@@ -62,7 +62,8 @@ cached-good/cold-bad payloads, partial replacement writes, cold restart and
 repair from a healthy peer. Append errors fail closed until restart.
 
 The snapshot envelope is versioned (`raft-snapshot.json`, version 1) and
-contains a `KLPKSM04`-prefixed bincode payload plus Raft metadata. Version 3
+contains a `KLPKSM05`-prefixed bincode payload plus Raft metadata. Version 4
+preserves cancellation state with no deadlines and logical clock zero. Version 3
 (`KLPKSM03`) preserves reservations/revisions with an empty cancellation map.
 Version 2 (`KLPKSM02`) and legacy unprefixed snapshots remain readable, with
 empty lease state. The first valid reservation activates binding fences at a common
@@ -100,8 +101,12 @@ read pacing excludes metadata/checkpoint I/O and is not a device-level SLO.
    not themselves CAS-protected. Signed Raft cancellation now closes pending
    reservations, rejects late commits/reopening, preserves replay tombstones
    and leaves all local guards intact. Commit/cancel races, log replay,
-   snapshots and owner/signature checks are tested. Still implement safe expiry and local
-   guard release, legacy-inventory migration and a Raft-coordinated watermark,
+   snapshots and owner/signature checks are tested. Opt-in logical-tick deadlines
+   and signed renewal generations now fence stale expiry and late writes;
+   data leaders advance time only through Raft. Ticks are not wall-time leases
+   and pause during quorum loss, downtime or witness leadership. Expired
+   reservations retain all hashes/guards/capacity. Still implement local guard
+   release, legacy-inventory migration and a Raft-coordinated watermark,
    then test binds, leader transitions, lagging followers and GC cancellation.
    Keep `--compact-secs 0`; manual compaction returns 409. No reclamation or
    capacity-recovery workflow exists yet. Upload guards add metadata fsync

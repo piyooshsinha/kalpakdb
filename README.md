@@ -436,9 +436,9 @@ Bytes continue through the existing HTTP/gRPC data plane and local guards.
 
 Limits are 4,096 reservations total, 256 ordered block entries per reservation
 and 65,536 reserved block entries across the cluster. Consumed and cancelled
-records remain as replay tombstones and still count toward both limits.
-There is no expiry, guard release, tombstone-pruning or lease-capacity recovery API yet.
-`/v1/stats.replicated_leases` reports local pending/committed/cancelled counts. Leases
+records, including expired reservations, remain as replay tombstones and still count toward both limits.
+There is no guard release, tombstone-pruning or lease-capacity recovery API yet.
+`/v1/stats.replicated_leases` reports local pending/committed/cancelled/expired counts. Leases
 survive log replay, snapshots and leader changes. No timer releases local
 guards; **all daemon GC remains blocked** pending a safe reclamation protocol.
 
@@ -451,8 +451,8 @@ the owner and exact lease ID under the separate `KLPK/lease/cancel/v1\0`
 domain; it is always verified, including on forwarded/internal requests.
 No payload needs to be present, so a failed or abandoned upload can be closed.
 
-Cancellation is a Raft state transition, not a local timer. The first applied
-commit or cancel wins. Cancelling a pending reservation returns 200 with
+Cancellation is a Raft state transition, not a local timer. Before a timed
+deadline has elapsed, the first applied commit or cancel wins. Cancelling a pending reservation returns 200 with
 `cancelled: true` and `guards_released: false`; exact owner retries return the
 same acknowledgement without changing the original cancellation position.
 Unknown IDs, other owners and committed reservations return 409. A cancelled
@@ -463,10 +463,54 @@ removed by cancellation. Wrong or cross-operation signatures return 401.
 Closing a reservation does **not** cancel an in-flight byte transfer, reject
 ordinary later uploads of the same hashes, release local retention, reduce
 replica requirements, reclaim lease capacity or authorize deleting data.
-Tombstones survive snapshots, restart and leader changes. There is still no
-automatic expiry: safe deadlines, guard release and a coordinated GC watermark
-remain separate release-blocking work. Do not delete tombstones or local
+Tombstones survive snapshots, restart and leader changes. Optional expiry is
+described below; guard release and a coordinated GC watermark remain separate
+release-blocking work. Do not delete tombstones or local
 retention files to simulate cancellation or reclaim capacity.
+
+#### Opt-in logical deadlines and renewal
+
+Reservations begin without a deadline. A signed Rust client can call
+`renew_upload_lease(lease, expected_generation, ttl_ticks)`, starting with
+generation zero. The reply contains `generation` and `deadline_tick`; use the
+returned generation for the next renewal. HTTP uses `POST /v1/leases/renew`
+with `{lease, agent, expected_generation, ttl_ticks, signature}`. The
+`KLPK/lease/renew/v1\0` message signs both integers as little-endian u64 after
+the owner and lease ID. All requests require the owner's signature.
+
+TTL is 1–86,400 **logical ticks**, not Unix time or guaranteed seconds. A data
+leader proposes at most one clock advance per scheduled one-second interval
+while future timed reservations exist, with missed intervals skipped. Every
+advance commits through Raft with an expected-tick fence: stale duplicate
+proposals do not advance time twice. Followers never expire using local wall
+clocks. Ticks can pause during downtime, quorum loss, slow I/O or witness
+leadership; leader changes can change tick phase. TTL is not a wall-time SLA,
+and expiry does not catch up to elapsed downtime. No assumption about clock
+skew is used in state-machine decisions. Embedded control-plane users must
+drive the trusted coordinator methods themselves.
+
+Renewals must extend the deadline and match the current generation. An exact
+retry acknowledges the original generation/deadline without extending it
+again; stale/conflicting generations return 409. At the replicated deadline,
+new commits, renewals, cancellations and begin retries reject—even before the
+worker records an expiry marker. Old committed/cancelled reservations retain
+their terminal status when their former deadline passes. Expiry proposals
+also carry the exact generation and deadline, so an earlier proposal cannot
+close a successfully renewed lease. A renewal ordered after the deadline
+cannot resurrect it. Clock and expiry commands have no public HTTP routes.
+
+The leader finalizes up to 16 due markers per interval. Stats count a due
+reservation as expired immediately from replicated time; `expiry_markers`
+counts finalized markers and may lag. `current_tick` exposes the logical
+clock. State and tombstones survive snapshots and restart. There is no expiry
+of legacy untimed reservations unless their owner explicitly opts in.
+`begin` replies acknowledge only the reservation and no longer promise a
+fixed `expires: false` value after renewal support was introduced.
+
+Expiry does **not** release local guards, bytes, replica requirements or lease
+capacity. Ordinary byte uploads remain possible; only the closed lease ID is
+fenced. All daemon GC remains blocked until guard release, legacy-inventory
+migration and the distributed reclamation watermark are implemented.
 
 Committed requirements survive origin loss and leader changes. The leader
 can fetch a missing local source from retained peers, verify its content
@@ -508,8 +552,9 @@ invent the missing data. A failed append blocks further writes until restart,
 preventing later writes from being acknowledged beyond an uncertain tail.
 This is not yet an always-maintained replica-count guarantee.
 
-Snapshot payloads now carry a `KLPKSM04` version prefix, including replicated
-lease cancellation tombstones and binding revisions. The new binary reads `KLPKSM03`, `KLPKSM02` and
+Snapshot payloads now carry a `KLPKSM05` version prefix, including replicated
+logical time, deadlines, expiry/cancellation tombstones and binding revisions.
+The new binary reads `KLPKSM04`, `KLPKSM03`, `KLPKSM02` and
 legacy snapshots, but old binaries cannot read new commands/snapshots:
 upgrade the entire experimental cluster together, with verified backups;
 mixed-version rolling upgrades and downgrades are unsupported.

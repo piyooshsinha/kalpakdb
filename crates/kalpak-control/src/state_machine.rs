@@ -60,6 +60,7 @@ struct LegacyMetadataState {
 const SNAPSHOT_V2: &[u8] = b"KLPKSM02";
 const SNAPSHOT_V3: &[u8] = b"KLPKSM03";
 const SNAPSHOT_V4: &[u8] = b"KLPKSM04";
+const SNAPSHOT_V5: &[u8] = b"KLPKSM05";
 
 // Exact version-three layout: bincode cannot default an appended field.
 #[derive(Serialize, Deserialize)]
@@ -70,8 +71,8 @@ struct V3LeaseState {
 }
 
 #[derive(Serialize, Deserialize)]
-struct V3MetadataState {
-    leases: V3LeaseState,
+struct VersionedMetadata<L> {
+    leases: L,
     replica_requirements: std::collections::BTreeMap<BlockId, usize>,
     agents: HashMap<AgentId, AgentRecord>,
     bindings: HashMap<String, BindingRecord>,
@@ -79,6 +80,32 @@ struct V3MetadataState {
     block_refs: HashMap<BlockId, u32>,
     last_applied: Option<LogId>,
     membership: StoredMembership<NodeId, openraft::BasicNode>,
+}
+
+type V3MetadataState = VersionedMetadata<V3LeaseState>;
+type V4MetadataState = VersionedMetadata<V4LeaseState>;
+
+#[derive(Serialize, Deserialize)]
+struct V4LeaseState {
+    initialized: bool,
+    records: std::collections::BTreeMap<BlockId, crate::UploadLease>,
+    revisions: HashMap<String, u64>,
+    cancelled: std::collections::BTreeMap<BlockId, u64>,
+}
+
+impl<L> VersionedMetadata<L> {
+    fn with_leases(self, convert: impl FnOnce(L) -> crate::LeaseState) -> MetadataState {
+        MetadataState {
+            leases: convert(self.leases),
+            replica_requirements: self.replica_requirements,
+            agents: self.agents,
+            bindings: self.bindings,
+            children: self.children,
+            block_refs: self.block_refs,
+            last_applied: self.last_applied,
+            membership: self.membership,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -149,11 +176,25 @@ impl StateMachineStore {
         data: &[u8],
     ) -> std::io::Result<MetadataState> {
         let (state, consumed): (MetadataState, usize) =
-            if let Some(payload) = data.strip_prefix(SNAPSHOT_V4) {
+            if let Some(payload) = data.strip_prefix(SNAPSHOT_V5) {
                 let (state, consumed) =
                     bincode::serde::decode_from_slice(payload, bincode::config::standard())
                         .map_err(std::io::Error::other)?;
-                (state, consumed + SNAPSHOT_V4.len())
+                (state, consumed + SNAPSHOT_V5.len())
+            } else if let Some(payload) = data.strip_prefix(SNAPSHOT_V4) {
+                let (old, consumed): (V4MetadataState, usize) =
+                    bincode::serde::decode_from_slice(payload, bincode::config::standard())
+                        .map_err(std::io::Error::other)?;
+                (
+                    old.with_leases(|leases| crate::LeaseState {
+                        initialized: leases.initialized,
+                        records: leases.records,
+                        revisions: leases.revisions,
+                        cancelled: leases.cancelled,
+                        ..Default::default()
+                    }),
+                    consumed + SNAPSHOT_V4.len(),
+                )
             } else if let Some(payload) = data.strip_prefix(SNAPSHOT_V3) {
                 let (old, consumed): (V3MetadataState, usize) =
                     bincode::serde::decode_from_slice(payload, bincode::config::standard())
@@ -165,6 +206,7 @@ impl StateMachineStore {
                             records: old.leases.records,
                             revisions: old.leases.revisions,
                             cancelled: Default::default(),
+                            ..Default::default()
                         },
                         replica_requirements: old.replica_requirements,
                         agents: old.agents,
@@ -234,6 +276,12 @@ impl StateMachineStore {
         }) {
             return Err(std::io::Error::other("invalid lease cancellation position"));
         }
+        if state.leases.expired.iter().any(|(id, at)| {
+            *at < state.leases.records[id].created_at
+                || *at > state.last_applied.map(|id| id.index).unwrap_or(0)
+        }) {
+            return Err(std::io::Error::other("invalid lease expiry position"));
+        }
         if state
             .leases
             .revisions
@@ -274,6 +322,20 @@ impl StateMachineStore {
 
     fn apply_one(state: &mut MetadataState, req: &Request) -> Response {
         match req {
+            Request::RenewUploadLease {
+                lease,
+                agent,
+                expected_generation,
+                ttl_ticks,
+            } => crate::leases::renew(state, *lease, *agent, *expected_generation, *ttl_ticks),
+            Request::AdvanceLeaseClock { expected_tick } => {
+                crate::leases::advance(state, *expected_tick)
+            }
+            Request::ExpireUploadLease {
+                lease,
+                generation,
+                deadline_tick,
+            } => crate::leases::expire(state, *lease, *generation, *deadline_tick),
             Request::CancelUploadLease { lease, agent } => {
                 crate::leases::cancel(state, *lease, *agent)
             }
@@ -421,7 +483,7 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
             // binding map grows large.
             let encoded = bincode::serde::encode_to_vec(&*state, bincode::config::standard())
                 .map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let mut data = SNAPSHOT_V4.to_vec();
+            let mut data = SNAPSHOT_V5.to_vec();
             data.extend_from_slice(&encoded);
             (data, state.last_applied, state.membership.clone())
         };
@@ -552,6 +614,284 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn renewal_generations_fence_stale_expiry_and_survive_snapshot() {
+        let (mut state, agent, key, block) = lease_setup();
+        let lease = BlockId::of(b"timed");
+        StateMachineStore::apply_one(
+            &mut state,
+            &Request::BeginUploadLease {
+                lease,
+                agent,
+                blocks: vec![block],
+            },
+        );
+        let first = Request::RenewUploadLease {
+            lease,
+            agent,
+            expected_generation: 0,
+            ttl_ticks: 3,
+        };
+        assert!(matches!(
+            StateMachineStore::apply_one(&mut state, &first),
+            Response::LeaseRenewed {
+                generation: 1,
+                deadline_tick: 3
+            }
+        ));
+        StateMachineStore::apply_one(&mut state, &Request::AdvanceLeaseClock { expected_tick: 0 });
+        StateMachineStore::apply_one(&mut state, &Request::AdvanceLeaseClock { expected_tick: 0 });
+        assert_eq!(
+            state.leases.clock, 1,
+            "a duplicate tick must not advance twice"
+        );
+        assert!(matches!(
+            StateMachineStore::apply_one(&mut state, &first),
+            Response::LeaseRenewed {
+                generation: 1,
+                deadline_tick: 3
+            }
+        ));
+        let renewal = Request::RenewUploadLease {
+            lease,
+            agent,
+            expected_generation: 1,
+            ttl_ticks: 5,
+        };
+        assert!(matches!(
+            StateMachineStore::apply_one(&mut state, &renewal),
+            Response::LeaseRenewed {
+                generation: 2,
+                deadline_tick: 6
+            }
+        ));
+        assert!(matches!(
+            StateMachineStore::apply_one(&mut state, &first),
+            Response::Rejected(_)
+        ));
+        assert!(matches!(
+            StateMachineStore::apply_one(
+                &mut state,
+                &Request::AdvanceLeaseClock { expected_tick: 10 }
+            ),
+            Response::Rejected(_)
+        ));
+        let stale = Request::ExpireUploadLease {
+            lease,
+            generation: 1,
+            deadline_tick: 3,
+        };
+        for tick in 1..6 {
+            StateMachineStore::apply_one(
+                &mut state,
+                &Request::AdvanceLeaseClock {
+                    expected_tick: tick,
+                },
+            );
+        }
+        assert!(matches!(
+            StateMachineStore::apply_one(&mut state, &stale),
+            Response::Rejected(_)
+        ));
+        assert!(state.leases.expired.is_empty());
+        // Deadline crossing itself is authoritative, before marker scheduling.
+        assert!(state.leases.is_expired(&lease));
+        assert!(matches!(
+            StateMachineStore::apply_one(
+                &mut state,
+                &Request::CommitUploadLease {
+                    lease,
+                    agent,
+                    binding: ChainBinding {
+                        key,
+                        blocks: vec![block],
+                        parent: None
+                    },
+                    expected_revision: 0
+                }
+            ),
+            Response::Rejected(_)
+        ));
+        assert!(matches!(
+            StateMachineStore::apply_one(&mut state, &renewal),
+            Response::Rejected(_)
+        ));
+        assert!(matches!(
+            StateMachineStore::apply_one(&mut state, &Request::CancelUploadLease { lease, agent }),
+            Response::Rejected(_)
+        ));
+        let expiry = Request::ExpireUploadLease {
+            lease,
+            generation: 2,
+            deadline_tick: 6,
+        };
+        assert!(matches!(
+            StateMachineStore::apply_one(&mut state, &expiry),
+            Response::LeaseExpired
+        ));
+        let at = state.leases.expired[&lease];
+        assert!(matches!(
+            StateMachineStore::apply_one(&mut state, &expiry),
+            Response::LeaseExpired
+        ));
+        assert_eq!(state.leases.expired[&lease], at);
+        assert!(state.bindings.is_empty());
+        assert_eq!(state.leases.status_counts().expired, 1);
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = StateMachineStore::open(dir.path().to_owned()).unwrap();
+        *store.state.write().unwrap() = state;
+        store.build_snapshot().await.unwrap();
+        drop(store);
+        let store = StateMachineStore::open(dir.path().to_owned()).unwrap();
+        let state = store.state.read().unwrap();
+        assert_eq!(state.leases.clock, 6);
+        assert_eq!(state.leases.deadlines[&lease].generation, 2);
+        assert!(state.leases.is_expired(&lease));
+        assert_eq!(state.leases.records[&lease].blocks, vec![block]);
+    }
+
+    #[test]
+    fn expiry_never_overrides_commit_and_invalid_deadlines_fail_closed() {
+        let (mut state, agent, key, block) = lease_setup();
+        let lease = BlockId::of(b"commit-before-expiry");
+        StateMachineStore::apply_one(
+            &mut state,
+            &Request::BeginUploadLease {
+                lease,
+                agent,
+                blocks: vec![block],
+            },
+        );
+        for ttl in [0, crate::MAX_TTL_TICKS + 1] {
+            assert!(matches!(
+                StateMachineStore::apply_one(
+                    &mut state,
+                    &Request::RenewUploadLease {
+                        lease,
+                        agent,
+                        expected_generation: 0,
+                        ttl_ticks: ttl
+                    }
+                ),
+                Response::Rejected(_)
+            ));
+        }
+        assert!(state.leases.deadlines.is_empty());
+        StateMachineStore::apply_one(
+            &mut state,
+            &Request::RenewUploadLease {
+                lease,
+                agent,
+                expected_generation: 0,
+                ttl_ticks: 2,
+            },
+        );
+        assert!(matches!(
+            StateMachineStore::apply_one(
+                &mut state,
+                &Request::ExpireUploadLease {
+                    lease,
+                    generation: 1,
+                    deadline_tick: 2
+                }
+            ),
+            Response::Rejected(_)
+        ));
+        let commit = Request::CommitUploadLease {
+            lease,
+            agent,
+            binding: ChainBinding {
+                key,
+                blocks: vec![block],
+                parent: None,
+            },
+            expected_revision: 0,
+        };
+        assert!(matches!(
+            StateMachineStore::apply_one(&mut state, &commit),
+            Response::Bound
+        ));
+        for tick in 0..4 {
+            StateMachineStore::apply_one(
+                &mut state,
+                &Request::AdvanceLeaseClock {
+                    expected_tick: tick,
+                },
+            );
+        }
+        assert!(matches!(
+            StateMachineStore::apply_one(&mut state, &commit),
+            Response::Bound
+        ));
+        assert!(matches!(
+            StateMachineStore::apply_one(
+                &mut state,
+                &Request::ExpireUploadLease {
+                    lease,
+                    generation: 1,
+                    deadline_tick: 2
+                }
+            ),
+            Response::Rejected(_)
+        ));
+        assert_eq!(state.leases.status_counts().committed, 1);
+        assert_eq!(state.leases.status_counts().expired, 0);
+        assert_eq!(state.block_refs[&block], 1);
+        state.leases.clock = u64::MAX;
+        assert!(matches!(
+            StateMachineStore::apply_one(
+                &mut state,
+                &Request::AdvanceLeaseClock {
+                    expected_tick: u64::MAX
+                }
+            ),
+            Response::Rejected(_)
+        ));
+        assert_eq!(state.leases.clock, u64::MAX);
+    }
+
+    #[test]
+    fn v4_snapshot_migration_preserves_cancellation_without_adding_deadlines() {
+        let (mut state, agent, _, block) = lease_setup();
+        let lease = BlockId::of(b"v4-cancelled");
+        StateMachineStore::apply_one(
+            &mut state,
+            &Request::BeginUploadLease {
+                lease,
+                agent,
+                blocks: vec![block],
+            },
+        );
+        StateMachineStore::apply_one(&mut state, &Request::CancelUploadLease { lease, agent });
+        let old = V4MetadataState {
+            leases: V4LeaseState {
+                initialized: state.leases.initialized,
+                records: state.leases.records,
+                revisions: state.leases.revisions,
+                cancelled: state.leases.cancelled,
+            },
+            replica_requirements: state.replica_requirements,
+            agents: state.agents,
+            bindings: state.bindings,
+            children: state.children,
+            block_refs: state.block_refs,
+            last_applied: state.last_applied,
+            membership: state.membership,
+        };
+        let mut data = SNAPSHOT_V4.to_vec();
+        data.extend(bincode::serde::encode_to_vec(&old, bincode::config::standard()).unwrap());
+        let meta = SnapshotMeta {
+            last_log_id: None,
+            last_membership: Default::default(),
+            snapshot_id: "v4".into(),
+        };
+        let state = StateMachineStore::decode_snapshot(&meta, &data).unwrap();
+        assert!(state.leases.cancelled.contains_key(&lease));
+        assert!(state.leases.deadlines.is_empty());
+        assert!(state.leases.expired.is_empty());
+        assert_eq!(state.leases.clock, 0);
+    }
+
+    #[tokio::test]
     async fn cancellation_is_terminal_idempotent_owner_checked_and_durable() {
         let (mut state, agent, key, block) = lease_setup();
         let lease = BlockId::of(b"cancel-me");
@@ -617,7 +957,7 @@ mod tests {
         let mut store = StateMachineStore::open(dir.path().to_owned()).unwrap();
         *store.state.write().unwrap() = state;
         let snapshot = store.build_snapshot().await.unwrap();
-        assert!(snapshot.snapshot.get_ref().starts_with(SNAPSHOT_V4));
+        assert!(snapshot.snapshot.get_ref().starts_with(SNAPSHOT_V5));
         drop(store);
         let store = StateMachineStore::open(dir.path().to_owned()).unwrap();
         assert!(store
@@ -639,7 +979,7 @@ mod tests {
             .leases
             .cancelled
             .insert(lease, 1);
-        let mut bad = SNAPSHOT_V4.to_vec();
+        let mut bad = SNAPSHOT_V5.to_vec();
         bad.extend(
             bincode::serde::encode_to_vec(
                 &*store.state.read().unwrap(),
@@ -888,7 +1228,7 @@ mod tests {
         let mut store = StateMachineStore::open(dir.path().to_owned()).unwrap();
         *store.state.write().unwrap() = state;
         let snapshot = store.build_snapshot().await.unwrap();
-        assert!(snapshot.snapshot.get_ref().starts_with(SNAPSHOT_V4));
+        assert!(snapshot.snapshot.get_ref().starts_with(SNAPSHOT_V5));
         drop(store);
         let store = StateMachineStore::open(dir.path().to_owned()).unwrap();
         let state = store.state.read().unwrap();
