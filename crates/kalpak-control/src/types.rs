@@ -52,6 +52,10 @@ pub enum Request {
         binding: ChainBinding,
         expected_revision: u64,
     },
+    CancelUploadLease {
+        lease: BlockId,
+        agent: AgentId,
+    },
 }
 
 /// One link of an atomic chain bind.
@@ -70,6 +74,7 @@ pub enum Response {
     Registered,
     Bound,
     LeaseReserved,
+    LeaseCancelled,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

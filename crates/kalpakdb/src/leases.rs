@@ -25,6 +25,36 @@ pub(crate) struct Commit {
     signature: String,
 }
 
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Cancel {
+    lease: BlockId,
+    agent: AgentId,
+    signature: String,
+}
+
+pub(crate) async fn cancel(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<Cancel>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    verify(
+        &req.agent,
+        &kalpak_core::signing::lease_cancel_message(&req.agent, &req.lease),
+        &req.signature,
+    )?;
+    match state
+        .control
+        .cancel_upload_lease(req.lease, req.agent)
+        .await
+    {
+        Ok(()) => Ok(Json(
+            json!({"cancelled": true, "lease": req.lease, "guards_released": false}),
+        )),
+        Err(error) => {
+            crate::server::forward_to_leader(&state, error, "/v1/leases/cancel", json!(req)).await
+        }
+    }
+}
+
 fn verify(agent: &AgentId, message: &[u8], signature: &str) -> Result<(), ApiError> {
     let signature = kalpak_core::signing::signature_from_hex(signature)
         .map_err(|_| ApiError(StatusCode::UNAUTHORIZED, "malformed lease signature".into()))?;

@@ -169,6 +169,23 @@ impl KalpakClient {
         Self::check(response).await.map(|_| ())
     }
 
+    /// Close a pending reservation through Raft. Exact owner retries succeed;
+    /// committed reservations reject cancellation. No local guards or bytes
+    /// are released, and IDs remain permanently non-reusable.
+    pub async fn cancel_upload_lease(&self, lease: BlockId) -> Result<(), ClientError> {
+        let agent = self
+            .agent_id()
+            .ok_or_else(|| ClientError::Decode("upload leases require a signing key".into()))?;
+        let signature = self.sign(&kalpak_core::signing::lease_cancel_message(&agent, &lease));
+        let response = self
+            .http
+            .post(format!("{}/v1/leases/cancel", self.base))
+            .json(&json!({"lease": lease, "agent": agent, "signature": signature}))
+            .send()
+            .await?;
+        Self::check(response).await.map(|_| ())
+    }
+
     async fn check(resp: reqwest::Response) -> Result<reqwest::Response, ClientError> {
         let status = resp.status();
         if status.is_success() {

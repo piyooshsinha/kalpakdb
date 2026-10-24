@@ -408,8 +408,8 @@ must match. These signatures are not cluster-bound; cross-cluster replay and
 the older signing APIs' broader replay limitations remain unresolved.
 
 Reservation IDs are globally single-use within the cluster. An exact begin
-retry acknowledges the existing reservation without reopening it; a changed
-owner or block list conflicts. Commit atomically consumes the reservation
+retry acknowledges the existing reservation without reopening it, unless it
+has been cancelled (409); a changed owner or block list conflicts. Commit atomically consumes the reservation
 and updates the binding/refcounts. Exact commit retries acknowledge only:
 they never reapply an older binding. Reusing a consumed ID for a different
 commit, mismatched ownership/hashes or a stale revision returns 409.
@@ -435,12 +435,38 @@ do not prove that an upload completed or the requested replica count exists.
 Bytes continue through the existing HTTP/gRPC data plane and local guards.
 
 Limits are 4,096 reservations total, 256 ordered block entries per reservation
-and 65,536 reserved block entries across the cluster. Consumed records remain
-as replay tombstones and still count toward capacity. There is no expiry,
-abort, release, tombstone-pruning or lease-capacity recovery API yet.
-`/v1/stats.replicated_leases` reports local pending/committed counts. Leases
+and 65,536 reserved block entries across the cluster. Consumed and cancelled
+records remain as replay tombstones and still count toward both limits.
+There is no expiry, guard release, tombstone-pruning or lease-capacity recovery API yet.
+`/v1/stats.replicated_leases` reports local pending/committed/cancelled counts. Leases
 survive log replay, snapshots and leader changes. No timer releases local
 guards; **all daemon GC remains blocked** pending a safe reclamation protocol.
+
+#### Cancelling a reservation
+
+After `begin_upload_lease` has succeeded, the owning signed Rust client can
+call `cancel_upload_lease(lease)`. The HTTP equivalent is
+`POST /v1/leases/cancel` with `{lease, agent, signature}`. The signature covers
+the owner and exact lease ID under the separate `KLPK/lease/cancel/v1\0`
+domain; it is always verified, including on forwarded/internal requests.
+No payload needs to be present, so a failed or abandoned upload can be closed.
+
+Cancellation is a Raft state transition, not a local timer. The first applied
+commit or cancel wins. Cancelling a pending reservation returns 200 with
+`cancelled: true` and `guards_released: false`; exact owner retries return the
+same acknowledgement without changing the original cancellation position.
+Unknown IDs, other owners and committed reservations return 409. A cancelled
+ID can neither be reopened by a begin retry nor committed by a delayed signed
+request. Existing committed bindings and their revision/refcounts are never
+removed by cancellation. Wrong or cross-operation signatures return 401.
+
+Closing a reservation does **not** cancel an in-flight byte transfer, reject
+ordinary later uploads of the same hashes, release local retention, reduce
+replica requirements, reclaim lease capacity or authorize deleting data.
+Tombstones survive snapshots, restart and leader changes. There is still no
+automatic expiry: safe deadlines, guard release and a coordinated GC watermark
+remain separate release-blocking work. Do not delete tombstones or local
+retention files to simulate cancellation or reclaim capacity.
 
 Committed requirements survive origin loss and leader changes. The leader
 can fetch a missing local source from retained peers, verify its content
@@ -482,8 +508,8 @@ invent the missing data. A failed append blocks further writes until restart,
 preventing later writes from being acknowledged beyond an uncertain tail.
 This is not yet an always-maintained replica-count guarantee.
 
-Snapshot payloads now carry a `KLPKSM03` version prefix, including replicated
-leases and binding revisions. The new binary reads `KLPKSM02` and
+Snapshot payloads now carry a `KLPKSM04` version prefix, including replicated
+lease cancellation tombstones and binding revisions. The new binary reads `KLPKSM03`, `KLPKSM02` and
 legacy snapshots, but old binaries cannot read new commands/snapshots:
 upgrade the entire experimental cluster together, with verified backups;
 mixed-version rolling upgrades and downgrades are unsupported.
