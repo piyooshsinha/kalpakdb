@@ -140,6 +140,11 @@ read pacing excludes metadata/checkpoint I/O and is not a device-level SLO.
 
 ## Verification rules
 
+The combined reclamation work and remaining distributed-release gaps are
+reviewed in [RECLAMATION_PROTOCOL.md](RECLAMATION_PROTOCOL.md). Local writer
+counts, generation fences and exclusion tokens are prerequisites only; they
+do not close the metadata race or authorize physical deletion.
+
 - Run commands directly and gate on exit status; never infer a green suite
   by counting `test result: ok` lines in a failed process.
 - Include restart after actual log purging, repeated torn-tail recovery,
