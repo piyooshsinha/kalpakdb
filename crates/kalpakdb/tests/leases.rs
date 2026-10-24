@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 struct Node {
     child: Option<Child>,
     addr: String,
+    stderr: tempfile::NamedTempFile,
 }
 impl Node {
     fn stop(&mut self) {
@@ -17,6 +18,10 @@ impl Node {
     }
     fn base(&self) -> String {
         format!("http://{}", self.addr)
+    }
+    fn diagnostics(&self) -> String {
+        std::fs::read_to_string(self.stderr.path())
+            .unwrap_or_else(|error| format!("could not read node stderr: {error}"))
     }
 }
 impl Drop for Node {
@@ -37,28 +42,47 @@ async fn node_at(dir: &std::path::Path, id: u64, address: Option<String>) -> Nod
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap().to_string()
     });
+    let stderr = tempfile::NamedTempFile::new().unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_kalpakdb"))
         .arg("serve")
         .arg(dir)
         .args(["--addr", &addr, "--node-id", &id.to_string(), "--join"])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr.reopen().unwrap())
         .spawn()
         .unwrap();
     let mut node = Node {
         child: Some(child),
         addr,
+        stderr,
     };
     let deadline = Instant::now() + Duration::from_secs(10);
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
     loop {
-        if reqwest::get(format!("{}/healthz", node.base()))
+        if let Some(status) = node.child.as_mut().unwrap().try_wait().unwrap() {
+            panic!(
+                "node {id} exited on {} with {status}:\n{}",
+                node.addr,
+                node.diagnostics()
+            );
+        }
+        if http
+            .get(format!("{}/healthz", node.base()))
+            .send()
             .await
-            .is_ok()
+            .is_ok_and(|response| response.status().is_success())
         {
             return node;
         }
-        assert!(node.child.as_mut().unwrap().try_wait().unwrap().is_none());
-        assert!(Instant::now() < deadline, "node did not start");
+        assert!(
+            Instant::now() < deadline,
+            "node {id} did not start on {}:\n{}",
+            node.addr,
+            node.diagnostics()
+        );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
