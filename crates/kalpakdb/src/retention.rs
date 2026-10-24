@@ -1,6 +1,6 @@
 //! Durable, non-expiring upload guards. Release requires a future coordinated
 //! GC protocol; wall-clock expiry and local binding snapshots are not safe.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -17,7 +17,7 @@ const GC_REASON: &str = "compaction blocked: upload retention requires a coordin
 
 struct State {
     file: File,
-    ids: HashSet<BlockId>,
+    ids: HashMap<BlockId, u64>,
     sequence: u64,
     bytes: u64,
     failed: bool,
@@ -38,7 +38,7 @@ impl Retention {
                 "upload retention journal exceeds capacity",
             ));
         }
-        let mut ids = HashSet::new();
+        let mut ids = HashMap::new();
         let mut sequence = 0u64;
         let mut bytes = 0u64;
         loop {
@@ -48,7 +48,7 @@ impl Retention {
                 Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(error) => return Err(error),
             }
-            if &header[..8] != b"KLPKUL01"
+            if (&header[..8] != b"KLPKUL01" && &header[..8] != b"KLPKUL02")
                 || header[12..16] != [0; 4]
                 || BlockId::of(&header[..24]).as_bytes() != &header[24..56]
             {
@@ -56,7 +56,7 @@ impl Retention {
             }
             let count = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
             let next = u64::from_le_bytes(header[16..24].try_into().unwrap());
-            if !(1..=MAX_BATCH).contains(&count) || next != sequence + 1 {
+            if !(1..=MAX_BATCH).contains(&count) || sequence.checked_add(1) != Some(next) {
                 return Err(io::Error::other("invalid upload retention record"));
             }
             let mut body = vec![0u8; count * 32 + 32];
@@ -70,7 +70,7 @@ impl Retention {
             }
             for chunk in body[..count * 32].as_chunks::<32>().0 {
                 let id = BlockId(*chunk);
-                ids.insert(id);
+                ids.insert(id, next);
             }
             if ids.len() > MAX_IDS {
                 return Err(io::Error::other("upload retention capacity exceeded"));
@@ -104,27 +104,33 @@ impl Retention {
                 "upload retention journal needs restart after I/O failure",
             ));
         }
-        let fresh: HashSet<_> = ids
-            .iter()
-            .filter(|id| !state.ids.contains(id))
-            .copied()
-            .collect();
-        if fresh.is_empty() {
+        // Collapse duplicates within a batch, but never across attempts:
+        // reuse must invalidate any previously observed local fence.
+        let requested: HashSet<_> = ids.iter().copied().collect();
+        if requested.is_empty() {
             return Ok(());
         }
-        let size = HEADER + fresh.len() * 32 + 32;
-        if state.ids.len() + fresh.len() > MAX_IDS || state.bytes + size as u64 > MAX_BYTES {
+        let fresh = requested
+            .iter()
+            .filter(|id| !state.ids.contains_key(id))
+            .count();
+        let next = state
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("upload retention sequence exhausted"))?;
+        let size = HEADER + requested.len() * 32 + 32;
+        if state.ids.len() + fresh > MAX_IDS || state.bytes + size as u64 > MAX_BYTES {
             return Err(io::Error::other(
                 "upload retention capacity exhausted; safe reclamation is not implemented",
             ));
         }
         let mut record = Vec::with_capacity(size);
-        record.extend_from_slice(b"KLPKUL01");
-        record.extend_from_slice(&(fresh.len() as u32).to_le_bytes());
+        record.extend_from_slice(b"KLPKUL02");
+        record.extend_from_slice(&(requested.len() as u32).to_le_bytes());
         record.extend_from_slice(&[0; 4]);
-        record.extend_from_slice(&(state.sequence + 1).to_le_bytes());
+        record.extend_from_slice(&next.to_le_bytes());
         record.extend_from_slice(BlockId::of(&record).as_bytes());
-        for id in &fresh {
+        for id in &requested {
             record.extend_from_slice(id.as_bytes());
         }
         record.extend_from_slice(BlockId::of(&record[HEADER..]).as_bytes());
@@ -136,15 +142,16 @@ impl Retention {
             state.failed = true;
             return Err(error);
         }
-        state.sequence += 1;
+        state.sequence = next;
         state.bytes += size as u64;
-        state.ids.extend(fresh);
+        state.ids.extend(requested.into_iter().map(|id| (id, next)));
         Ok(())
     }
 
     pub(crate) fn evidence(&self, id: &BlockId) -> serde_json::Value {
         let state = self.0.lock().unwrap();
-        serde_json::json!({"guarded": state.ids.contains(id),
+        serde_json::json!({"guarded": state.ids.contains_key(id),
+            "local_generation": state.ids.get(id),
             "journal_sequence": state.sequence, "write_failed": state.failed})
     }
 
@@ -174,6 +181,37 @@ pub(crate) fn gc_reason() -> &'static str {
 mod tests {
     use super::*;
     #[test]
+    fn reuse_fences_survive_restart_and_migrate_legacy_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = BlockId::of(b"reused");
+        let b = BlockId::of(b"untouched");
+        let journal = Retention::open(dir.path()).unwrap();
+        journal.protect(&[a, b]).unwrap();
+        drop(journal);
+        // V1 used the same framing but did not append duplicate attempts.
+        let path = dir.path().join(NAME);
+        let mut record = std::fs::read(&path).unwrap();
+        record[..8].copy_from_slice(b"KLPKUL01");
+        let checksum = BlockId::of(&record[..24]);
+        record[24..56].copy_from_slice(checksum.as_bytes());
+        std::fs::write(&path, record).unwrap();
+        let journal = Retention::open(dir.path()).unwrap();
+        assert_eq!(journal.evidence(&a)["local_generation"], 1);
+        journal.protect(&[a, a]).unwrap();
+        assert_eq!(journal.evidence(&a)["local_generation"], 2);
+        assert_eq!(journal.evidence(&b)["local_generation"], 1);
+        assert_eq!(journal.snapshot()["guarded_blocks"], 2);
+        drop(journal);
+        let journal = Retention::open(dir.path()).unwrap();
+        assert_eq!(journal.evidence(&a)["local_generation"], 2);
+        assert_eq!(journal.evidence(&b)["local_generation"], 1);
+        assert!(journal.evidence(&BlockId::of(b"missing"))["local_generation"].is_null());
+        journal.0.lock().unwrap().sequence = u64::MAX;
+        assert!(journal.protect(&[a]).is_err());
+        assert_eq!(journal.evidence(&a)["local_generation"], 2);
+    }
+
+    #[test]
     fn guards_survive_restart_deduplicate_and_recover_torn_tail_before_new_append() {
         let dir = tempfile::tempdir().unwrap();
         let a = BlockId::of(b"a");
@@ -182,7 +220,7 @@ mod tests {
         journal.protect(&[a, a]).unwrap();
         let length = journal.snapshot()["journal_bytes"].as_u64().unwrap();
         journal.protect(&[a]).unwrap();
-        assert_eq!(journal.snapshot()["journal_bytes"], length);
+        assert!(journal.snapshot()["journal_bytes"].as_u64().unwrap() > length);
         drop(journal);
         OpenOptions::new()
             .append(true)
@@ -252,8 +290,12 @@ mod tests {
             thread.join().unwrap();
         }
         assert_eq!(journal.snapshot()["guarded_blocks"], 16);
+        assert_eq!(journal.0.lock().unwrap().sequence, 64);
         journal.0.lock().unwrap().bytes = MAX_BYTES;
         assert!(journal.protect(&[BlockId::of(b"beyond capacity")]).is_err());
+        assert!(journal
+            .protect(&[BlockId::of(&0u32.to_le_bytes())])
+            .is_err());
         assert_eq!(journal.snapshot()["guarded_blocks"], 16);
     }
 }

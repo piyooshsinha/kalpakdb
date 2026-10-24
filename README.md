@@ -350,7 +350,8 @@ though concurrent backup consistency remains unproven.
 Before HTTP single/batch, gRPC batch, repair and replicate-on-read payload
 writes, the daemon syncs non-expiring block guards to `upload-retention.log`.
 Only content hashes enter this journal; tensors still bypass Raft. A guard
-is durable before the payload append or response. Retried hashes deduplicate;
+is durable before the payload append or response. Repeated hashes share payload storage,
+but every nonempty upload attempt now appends a durable local generation fence;
 cancelled/failed requests may leave conservative guards for absent data.
 Bindings do not release guards. These are local retention intents, not yet
 a distributed lease/commit protocol or a guarantee of maintained replication.
@@ -361,7 +362,8 @@ corrupt records fail startup. This is process-crash recovery, not proof
 against post-fsync media loss. A write/sync error poisons further guarded
 writes until restart. Capacity is bounded to 1,048,576 distinct hashes and
 128 MiB of journal data; new guards fail closed at capacity. Existing guards
-never expire automatically. `/v1/stats.upload_retention` exposes counts,
+never expire automatically. Retry-heavy workloads therefore consume journal capacity
+even without new hashes and fail closed at the byte limit. `/v1/stats.upload_retention` exposes counts,
 capacity, write-failure status and the GC-blocked reason.
 
 `POST /v1/admin/compact` returns 409; nonzero `--compact-secs` is rejected
@@ -382,6 +384,16 @@ are separate and may race. The report always returns `authoritative: false`,
 or replica health. In-flight writes, legacy provenance, block reuse generations
 and the cluster GC watermark remain unknown. Zero references or expired leases
 are never permission to remove data or guards.
+
+The diagnostic includes `local_guard.local_generation` (the last durable upload
+journal sequence for that hash, or null) and `storage_generation` (node storage
+incarnation). A repeated upload advances its local fence before payload I/O;
+duplicates within one batch advance once. Failed uploads may still advance it.
+These values are diagnostic prerequisites, not release certificates: bindings
+do not yet advance a Raft block-reuse fence, and restore/rollback can rewind
+local history. New journal records use `KLPKUL02`; legacy `KLPKUL01` records
+remain readable, but older binaries reject V2 records. Back up before upgrading;
+do not downgrade a directory once V2 writes have begun.
 
 Each new guard batch adds a metadata fsync before the payload fsync; no
 throughput improvement is claimed. Backups capture a stable journal after
