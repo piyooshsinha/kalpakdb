@@ -917,7 +917,8 @@ async fn put_block(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let replicas = parse_replicas(headers.get("x-kalpak-replicas").map(|v| v.to_str()))
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
-    s.retention
+    let _write_guard = s
+        .retention
         .protect(&[BlockId::of(&body)])
         .map_err(kalpak_core::Error::from)?;
     if replicas > 1 || headers.contains_key("x-kalpak-retain-replica") {
@@ -1016,7 +1017,8 @@ async fn put_blocks_batch(
         .iter()
         .map(|payload| BlockId::of(payload))
         .collect();
-    s.retention
+    let _write_guard = s
+        .retention
         .protect(&guarded)
         .map_err(kalpak_core::Error::from)?;
     if replicas > 1 || headers.contains_key("x-kalpak-retain-replica") {
@@ -1129,7 +1131,8 @@ async fn get_block(
                 if BlockId::of(&bytes) != id {
                     continue;
                 }
-                s.retention
+                let _write_guard = s
+                    .retention
                     .protect(&[id])
                     .map_err(kalpak_core::Error::from)?;
                 s.store.put(&bytes)?;

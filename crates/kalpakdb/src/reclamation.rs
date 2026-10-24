@@ -41,6 +41,9 @@ pub(crate) fn validate(expected: &ExpectedFences, observation: Value) -> Value {
     if observation["local_guard"]["write_failed"] != false {
         blockers.push("journal_health_unknown_or_failed");
     }
+    if observation["local_guard"]["active_local_writes"].as_u64() != Some(0) {
+        blockers.push("active_local_writes_present_or_unknown");
+    }
     for (value, reason) in [
         (
             &observation["metadata"]["binding_references"],
@@ -87,7 +90,7 @@ mod tests {
     }
     fn sample() -> Value {
         json!({"storage_generation": "incarnation",
-            "local_guard": {"guarded": true, "local_generation": 7, "write_failed": false},
+            "local_guard": {"guarded": true, "local_generation": 7, "write_failed": false, "active_local_writes": 0},
             "metadata": {"block_reference_fence": 11, "binding_references": 0,
                 "required_replicas": 0, "leases": {"pending": 0, "expired": 1}}})
     }
@@ -138,5 +141,17 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+    }
+    #[test]
+    fn active_writes_are_blockers_even_with_matching_fences() {
+        let mut sample = sample();
+        sample["local_guard"]["active_local_writes"] = json!(1);
+        let report = validate(&expected(), sample);
+        assert_eq!(report["observed_fences_match"], true);
+        assert!(report["blockers"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("active_local_writes_present_or_unknown")));
+        assert_eq!(report["release_authorized"], false);
     }
 }
