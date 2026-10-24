@@ -27,6 +27,8 @@ pub struct AgentRecord {
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct MetadataState {
+    /// Missing means unknown history, never a safe zero fence.
+    pub block_fences: std::collections::BTreeMap<BlockId, u64>,
     pub leases: crate::LeaseState,
     pub replica_requirements: std::collections::BTreeMap<BlockId, usize>,
     pub agents: HashMap<AgentId, AgentRecord>,
@@ -61,6 +63,8 @@ const SNAPSHOT_V2: &[u8] = b"KLPKSM02";
 const SNAPSHOT_V3: &[u8] = b"KLPKSM03";
 const SNAPSHOT_V4: &[u8] = b"KLPKSM04";
 const SNAPSHOT_V5: &[u8] = b"KLPKSM05";
+const SNAPSHOT_V6: &[u8] = b"KLPKSM06";
+const MAX_BLOCK_FENCES: usize = 65_536;
 
 // Exact version-three layout: bincode cannot default an appended field.
 #[derive(Serialize, Deserialize)]
@@ -96,6 +100,7 @@ struct V4LeaseState {
 impl<L> VersionedMetadata<L> {
     fn with_leases(self, convert: impl FnOnce(L) -> crate::LeaseState) -> MetadataState {
         MetadataState {
+            block_fences: Default::default(),
             leases: convert(self.leases),
             replica_requirements: self.replica_requirements,
             agents: self.agents,
@@ -176,11 +181,19 @@ impl StateMachineStore {
         data: &[u8],
     ) -> std::io::Result<MetadataState> {
         let (state, consumed): (MetadataState, usize) =
-            if let Some(payload) = data.strip_prefix(SNAPSHOT_V5) {
+            if let Some(payload) = data.strip_prefix(SNAPSHOT_V6) {
                 let (state, consumed) =
                     bincode::serde::decode_from_slice(payload, bincode::config::standard())
                         .map_err(std::io::Error::other)?;
-                (state, consumed + SNAPSHOT_V5.len())
+                (state, consumed + SNAPSHOT_V6.len())
+            } else if let Some(payload) = data.strip_prefix(SNAPSHOT_V5) {
+                let (old, consumed): (VersionedMetadata<crate::LeaseState>, usize) =
+                    bincode::serde::decode_from_slice(payload, bincode::config::standard())
+                        .map_err(std::io::Error::other)?;
+                (
+                    old.with_leases(|leases| leases),
+                    consumed + SNAPSHOT_V5.len(),
+                )
             } else if let Some(payload) = data.strip_prefix(SNAPSHOT_V4) {
                 let (old, consumed): (V4MetadataState, usize) =
                     bincode::serde::decode_from_slice(payload, bincode::config::standard())
@@ -201,6 +214,7 @@ impl StateMachineStore {
                         .map_err(std::io::Error::other)?;
                 (
                     MetadataState {
+                        block_fences: Default::default(),
                         leases: crate::LeaseState {
                             initialized: old.leases.initialized,
                             records: old.leases.records,
@@ -224,6 +238,7 @@ impl StateMachineStore {
                         .map_err(std::io::Error::other)?;
                 (
                     MetadataState {
+                        block_fences: Default::default(),
                         leases: Default::default(),
                         replica_requirements: old.replica_requirements,
                         agents: old.agents,
@@ -241,6 +256,7 @@ impl StateMachineStore {
                         .map_err(std::io::Error::other)?;
                 (
                     MetadataState {
+                        block_fences: Default::default(),
                         leases: Default::default(),
                         agents: legacy.agents,
                         bindings: legacy.bindings,
@@ -270,6 +286,14 @@ impl StateMachineStore {
             ));
         }
         state.leases.validate()?;
+        if state.block_fences.len() > MAX_BLOCK_FENCES
+            || state
+                .block_fences
+                .values()
+                .any(|at| *at > state.last_applied.map(|id| id.index).unwrap_or(0))
+        {
+            return Err(std::io::Error::other("invalid block fence positions"));
+        }
         if state.leases.cancelled.iter().any(|(id, at)| {
             *at < state.leases.records[id].created_at
                 || *at > state.last_applied.map(|id| id.index).unwrap_or(0)
@@ -321,6 +345,51 @@ impl StateMachineStore {
     }
 
     fn apply_one(state: &mut MetadataState, req: &Request) -> Response {
+        let mut touched = std::collections::BTreeSet::new();
+        let mut binding = |key: &CacheKey, blocks: &[BlockId]| {
+            touched.extend(blocks.iter().copied());
+            if let Some(old) = state.bindings.get(&binding_key(key)) {
+                touched.extend(old.blocks.iter().copied());
+            }
+        };
+        match req {
+            Request::BindPrefix { key, blocks, .. } => binding(key, blocks),
+            Request::BindChain { bindings, .. } => {
+                for item in bindings {
+                    binding(&item.key, &item.blocks);
+                }
+            }
+            Request::CommitUploadLease { binding: item, .. } => binding(&item.key, &item.blocks),
+            Request::BeginUploadLease { blocks, .. } | Request::RequireReplicas { blocks, .. } => {
+                touched.extend(blocks.iter().copied());
+            }
+            Request::RenewUploadLease { lease, .. } => {
+                if let Some(record) = state.leases.records.get(lease) {
+                    touched.extend(record.blocks.iter().copied());
+                }
+            }
+            _ => {}
+        }
+        if state.block_fences.len()
+            + touched
+                .iter()
+                .filter(|id| !state.block_fences.contains_key(id))
+                .count()
+            > MAX_BLOCK_FENCES
+        {
+            return Response::Rejected("block fence capacity exhausted".into());
+        }
+        let response = Self::apply_unfenced(state, req);
+        if !matches!(response, Response::Rejected(_)) {
+            let at = state.last_applied.map(|id| id.index).unwrap_or(0);
+            for id in touched {
+                state.block_fences.insert(id, at);
+            }
+        }
+        response
+    }
+
+    fn apply_unfenced(state: &mut MetadataState, req: &Request) -> Response {
         match req {
             Request::RenewUploadLease {
                 lease,
@@ -483,7 +552,7 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
             // binding map grows large.
             let encoded = bincode::serde::encode_to_vec(&*state, bincode::config::standard())
                 .map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let mut data = SNAPSHOT_V5.to_vec();
+            let mut data = SNAPSHOT_V6.to_vec();
             data.extend_from_slice(&encoded);
             (data, state.last_applied, state.membership.clone())
         };
@@ -611,6 +680,112 @@ mod tests {
             CacheKey::root(kalpak_core::ModelFingerprint::new("m", "t", "l"), &[1]),
             BlockId::of(b"data"),
         )
+    }
+
+    #[tokio::test]
+    async fn block_fences_track_replacement_reject_capacity_and_survive_snapshot() {
+        let (mut state, agent, key, block) = lease_setup();
+        let next = BlockId::of(b"replacement");
+        let position = |index| {
+            Some(openraft::LogId::new(
+                openraft::CommittedLeaderId::new(1, 1),
+                index,
+            ))
+        };
+        state.last_applied = position(10);
+        let bind = |blocks| Request::BindPrefix {
+            agent,
+            key: key.clone(),
+            blocks,
+            parent: None,
+        };
+        StateMachineStore::apply_one(&mut state, &bind(vec![block]));
+        assert_eq!(state.block_fences[&block], 10);
+        state.last_applied = position(11);
+        StateMachineStore::apply_one(&mut state, &bind(vec![next]));
+        assert_eq!(state.block_fences[&block], 11);
+        assert_eq!(state.block_fences[&next], 11);
+        let lease = BlockId::of(b"fenced reservation");
+        state.last_applied = position(12);
+        StateMachineStore::apply_one(
+            &mut state,
+            &Request::BeginUploadLease {
+                lease,
+                agent,
+                blocks: vec![block],
+            },
+        );
+        assert_eq!(state.block_fences[&block], 12);
+        state.last_applied = position(13);
+        assert!(matches!(
+            StateMachineStore::apply_one(
+                &mut state,
+                &Request::BeginUploadLease {
+                    lease,
+                    agent,
+                    blocks: vec![next],
+                }
+            ),
+            Response::Rejected(_)
+        ));
+        assert_eq!(state.block_fences[&block], 12);
+        assert_eq!(state.block_fences[&next], 11);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = StateMachineStore::open(dir.path().to_owned()).unwrap();
+        *store.state.write().unwrap() = state;
+        store.build_snapshot().await.unwrap();
+        drop(store);
+        let store = StateMachineStore::open(dir.path().to_owned()).unwrap();
+        let mut state = store.state.write().unwrap();
+        assert_eq!(state.block_fences[&block], 12);
+        for n in 0..MAX_BLOCK_FENCES {
+            if state.block_fences.len() == MAX_BLOCK_FENCES {
+                break;
+            }
+            state.block_fences.insert(BlockId::of(&n.to_le_bytes()), 1);
+        }
+        let unknown = BlockId::of(b"beyond fence capacity");
+        assert!(matches!(
+            StateMachineStore::apply_one(&mut state, &bind(vec![unknown])),
+            Response::Rejected(_)
+        ));
+        assert_eq!(state.bindings[&binding_key(&key)].blocks, vec![next]);
+        assert!(!state.block_fences.contains_key(&unknown));
+    }
+
+    #[test]
+    fn v5_snapshot_import_has_unknown_block_fences() {
+        let (mut state, agent, key, block) = lease_setup();
+        StateMachineStore::apply_one(
+            &mut state,
+            &Request::BindPrefix {
+                agent,
+                key: key.clone(),
+                blocks: vec![block],
+                parent: None,
+            },
+        );
+        let meta = SnapshotMeta {
+            last_log_id: state.last_applied,
+            last_membership: state.membership.clone(),
+            snapshot_id: "v5-migration".into(),
+        };
+        let old = VersionedMetadata {
+            leases: state.leases,
+            replica_requirements: state.replica_requirements,
+            agents: state.agents,
+            bindings: state.bindings,
+            children: state.children,
+            block_refs: state.block_refs,
+            last_applied: state.last_applied,
+            membership: state.membership,
+        };
+        let mut bytes = SNAPSHOT_V5.to_vec();
+        bytes.extend(bincode::serde::encode_to_vec(old, bincode::config::standard()).unwrap());
+        let imported = StateMachineStore::decode_snapshot(&meta, &bytes).unwrap();
+        assert!(imported.block_fences.is_empty());
+        assert_eq!(imported.bindings[&binding_key(&key)].blocks, vec![block]);
     }
 
     #[tokio::test]
@@ -957,7 +1132,7 @@ mod tests {
         let mut store = StateMachineStore::open(dir.path().to_owned()).unwrap();
         *store.state.write().unwrap() = state;
         let snapshot = store.build_snapshot().await.unwrap();
-        assert!(snapshot.snapshot.get_ref().starts_with(SNAPSHOT_V5));
+        assert!(snapshot.snapshot.get_ref().starts_with(SNAPSHOT_V6));
         drop(store);
         let store = StateMachineStore::open(dir.path().to_owned()).unwrap();
         assert!(store
@@ -979,7 +1154,7 @@ mod tests {
             .leases
             .cancelled
             .insert(lease, 1);
-        let mut bad = SNAPSHOT_V5.to_vec();
+        let mut bad = SNAPSHOT_V6.to_vec();
         bad.extend(
             bincode::serde::encode_to_vec(
                 &*store.state.read().unwrap(),
@@ -1228,7 +1403,7 @@ mod tests {
         let mut store = StateMachineStore::open(dir.path().to_owned()).unwrap();
         *store.state.write().unwrap() = state;
         let snapshot = store.build_snapshot().await.unwrap();
-        assert!(snapshot.snapshot.get_ref().starts_with(SNAPSHOT_V5));
+        assert!(snapshot.snapshot.get_ref().starts_with(SNAPSHOT_V6));
         drop(store);
         let store = StateMachineStore::open(dir.path().to_owned()).unwrap();
         let state = store.state.read().unwrap();

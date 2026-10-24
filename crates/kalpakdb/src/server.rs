@@ -1588,7 +1588,7 @@ async fn reclamation_plan(
         "storage_generation": s.repairs.generation,
         "local_payload_present": s.store.contains(&id),
         "unknowns": ["in_flight_writes", "legacy_provenance", "cluster_gc_watermark",
-            "raft_block_reuse_generation", "replica_health"],
+            "linearizable_release_validation", "replica_health"],
         "consistency": "local observations taken separately; may be stale or change during capture"
     })))
 }
