@@ -142,6 +142,12 @@ impl Retention {
         Ok(())
     }
 
+    pub(crate) fn evidence(&self, id: &BlockId) -> serde_json::Value {
+        let state = self.0.lock().unwrap();
+        serde_json::json!({"guarded": state.ids.contains(id),
+            "journal_sequence": state.sequence, "write_failed": state.failed})
+    }
+
     pub(crate) fn snapshot(&self) -> serde_json::Value {
         let state = self.0.lock().unwrap();
         serde_json::json!({"guarded_blocks": state.ids.len(), "journal_bytes": state.bytes,

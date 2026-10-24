@@ -372,6 +372,17 @@ as an online GC workaround. Older/offline CLI writes do not create daemon
 guards. Do not share a data directory between processes or delete retention
 metadata to reclaim capacity. There is no safe reclamation workflow yet.
 
+`GET /v1/reclamation/{block_id}` is a read-only, per-block retention diagnostic
+(requires the configured observability bearer token). It reports binding
+references, pending/committed/cancelled/expired lease counts, desired replica
+count, local guard journal sequence and indexed payload presence. Metadata
+fields share one local state-machine observation; storage and journal samples
+are separate and may race. The report always returns `authoritative: false`,
+`reclaimable: false` and `gc_enabled: false`. It does not verify payload bytes
+or replica health. In-flight writes, legacy provenance, block reuse generations
+and the cluster GC watermark remain unknown. Zero references or expired leases
+are never permission to remove data or guards.
+
 Each new guard batch adds a metadata fsync before the payload fsync; no
 throughput improvement is claimed. Backups capture a stable journal after
 segment traversal; the journal-copy lock can delay uploads. Timed

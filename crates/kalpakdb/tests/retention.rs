@@ -95,6 +95,38 @@ async fn unbound_uploads_survive_compaction_requests_and_real_restart() {
     assert_eq!(stats["upload_retention"]["guarded_blocks"], 3);
     assert_eq!(stats["upload_retention"]["gc_enabled"], false);
     assert_eq!(stats["upload_retention"]["write_failed"], false);
+    for (id, guarded, present) in [
+        (legacy, false, true),
+        (kalpak_core::BlockId::of(b"unbound-new"), true, true),
+        (kalpak_core::BlockId::of(b"absent"), false, false),
+    ] {
+        let plan: serde_json::Value = client
+            .get(format!("{base}/v1/reclamation/{id}"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(plan["authoritative"], false);
+        assert_eq!(plan["reclaimable"], false);
+        assert_eq!(plan["gc_enabled"], false);
+        assert_eq!(plan["local_guard"]["guarded"], guarded);
+        assert_eq!(plan["local_payload_present"], present);
+        assert_eq!(plan["metadata"]["binding_references"], 0);
+        assert_eq!(plan["metadata"]["leases"]["pending"], 0);
+    }
+    assert_eq!(
+        client
+            .get(format!("{base}/v1/reclamation/invalid"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
     for id in [
         legacy,
         kalpak_core::BlockId::of(b"unbound-new"),
