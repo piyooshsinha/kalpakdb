@@ -50,7 +50,10 @@ async fn read_token_guards_observability_only() {
 
     // Guarded reads: 401 without/with-wrong, 200 with the token.
     let reclamation = format!("/v1/reclamation/{}", kalpak_core::BlockId::of(b"absent"));
-    for path in ["/v1/stats", "/v1/agents/list", &reclamation] {
+    let validate = format!(
+        "{reclamation}/validate?storage_generation=test&local_generation=1&block_reference_fence=1"
+    );
+    for path in ["/v1/stats", "/v1/agents/list", &reclamation, &validate] {
         assert_eq!(get(path, None).await.unwrap().status().as_u16(), 401);
         assert_eq!(
             get(path, Some("wrong")).await.unwrap().status().as_u16(),
@@ -61,6 +64,16 @@ async fn read_token_guards_observability_only() {
             200
         );
     }
+    let malformed = format!("{reclamation}/validate?local_generation=invalid");
+    assert_eq!(get(&malformed, None).await.unwrap().status().as_u16(), 401);
+    assert_eq!(
+        get(&malformed, Some("s3cret"))
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        400
+    );
 
     // Unlike browser WebSocket upgrades, diagnostics do not accept URL tokens.
     assert_eq!(

@@ -6,6 +6,7 @@ pub mod grpc;
 mod leases;
 mod online_scrub;
 pub mod pki;
+mod reclamation;
 mod repair;
 mod retention;
 pub mod server;
